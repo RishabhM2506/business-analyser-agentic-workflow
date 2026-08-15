@@ -1,0 +1,41 @@
+# --- Python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- uv / venvs ----------------------------------------------------------
+.venv/
+venv/
+uv.lock.bak
+
+# --- Env / secrets ---------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Test / coverage / type-check caches ----------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.db
+*.sqlite3
+.pytest-local.db
+
+# --- Editors / OS ----------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Eval / trace scratch ---------------------------------------------------
+.langsmith/

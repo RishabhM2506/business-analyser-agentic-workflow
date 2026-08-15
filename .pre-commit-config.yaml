@@ -1,0 +1,29 @@
+# Fast subset of what CI runs (docs/PLAN.md §8.1, master brief Phase 2):
+# lint + format-check, plus Conventional Commits enforcement on the commit
+# message. Type-checking, tests, dependency audit, secret scanning and the
+# docker build stay CI-only — too slow for a pre-commit hook.
+#
+# Setup: `uv run pre-commit install --install-hooks && uv run pre-commit install --hook-type commit-msg`
+# (see CONTRIBUTING.md).
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.3
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        args: [--fix]
+
+  - repo: https://github.com/psf/black
+    rev: 26.5.1
+    hooks:
+      - id: black
+        name: black (format check)
+        args: [--check]
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert]
