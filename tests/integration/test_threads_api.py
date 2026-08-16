@@ -1,0 +1,295 @@
+"""Integration tests for the thread/message API (docs/PLAN.md §3.3):
+`POST /threads`, `GET /threads/{id}`, `POST /threads/{id}/messages`. Full
+HTTP stack (FastAPI + ASGI transport), `LLM_PROVIDER=mock`, a mocked
+Comtrade transport, and a real (in-memory, per-test) checkpointer — no live
+network, no live model call.
+
+`httpx.ASGITransport` does not run the ASGI `lifespan` protocol (verified
+directly against the installed `httpx==0.28.1` — `ASGITransport.
+handle_async_request` only ever builds a `"type": "http"` scope), so every
+test here explicitly drives `app.router.lifespan_context(app)` itself
+(Starlette's own public mechanism — the same one `TestClient` uses
+internally) to actually run `app/main.py`'s `lifespan`, which is what opens
+the checkpointer and compiles the graph onto `app.state.compiled_graph`.
+Without this, every thread endpoint would 500 with an `AttributeError`.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+
+import httpx
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+import app.nodes.fetch_trade as fetch_trade_module
+from app.cache.tool_cache import ToolCache
+from app.main import REQUEST_ID_HEADER, create_app
+from app.settings import Settings
+from app.tools.comtrade_client import ComtradeClient
+
+
+def _handler_with_data(request: httpx.Request) -> httpx.Response:
+    period = request.url.params["period"]
+    return httpx.Response(
+        200,
+        json={
+            "count": 1,
+            "error": "",
+            "data": [
+                {
+                    "reporterCode": 699,
+                    "partnerCode": 842,
+                    "period": period,
+                    "cmdCode": "010121",
+                    "flowCode": request.url.params["flowCode"],
+                    "primaryValue": 1000.0 + int(period),
+                    "isReported": True,
+                    "isAggregate": False,
+                }
+            ],
+        },
+    )
+
+
+def _patch_comtrade(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    handler: Callable[[httpx.Request], httpx.Response] = _handler_with_data,
+) -> None:
+    client = ComtradeClient(api_key="test-key", transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client)
+    monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: ToolCache())
+
+
+def _isolated_settings(**overrides: object) -> Settings:
+    # A fresh in-memory sqlite checkpointer per test (never shared across
+    # tests, unlike a real file path) so thread/response state can never
+    # leak between them.
+    return Settings.model_validate({"database_url": "sqlite+aiosqlite:///:memory:", **overrides})
+
+
+@asynccontextmanager
+async def _client_for(settings: Settings) -> AsyncIterator[AsyncClient]:
+    app = create_app(settings=settings)
+    async with app.router.lifespan_context(app):  # actually runs app/main.py's lifespan
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
+
+
+@pytest.mark.integration
+async def test_post_threads_returns_a_fresh_thread_id() -> None:
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post("/threads")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert len(body["thread_id"]) == 36  # UUID4 string length
+    assert REQUEST_ID_HEADER in response.headers
+
+
+@pytest.mark.integration
+async def test_post_threads_returns_distinct_ids_across_calls() -> None:
+    async with _client_for(_isolated_settings()) as client:
+        first = (await client.post("/threads")).json()["thread_id"]
+        second = (await client.post("/threads")).json()["thread_id"]
+
+    assert first != second
+
+
+@pytest.mark.integration
+async def test_post_message_happy_path_returns_schema_valid_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_comtrade(monkeypatch)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(
+            f"/threads/{thread_id}/messages",
+            json={"hs_code": "010121", "year_start": 2021, "year_end": 2022},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["thread_id"] == thread_id
+    assert body["hs_code"] == "010121"
+    assert len(body["message_id"]) > 0
+    assert len(body["item_description"]) > 0
+    assert len(body["analytical_summary"]) > 0
+    assert body["imports"]["unit"] == "USD"
+    assert body["provenance"]["source"] == "UN Comtrade (comtradeapi.un.org)"
+
+
+@pytest.mark.integration
+async def test_post_message_unknown_hs_code_returns_400_before_touching_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def _tracking_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.params["period"])
+        return _handler_with_data(request)
+
+    _patch_comtrade(monkeypatch, handler=_tracking_handler)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "000000"})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error_code"] == "INVALID_HS_CODE"
+    assert body["retryable"] is False
+    assert len(body["trace_id"]) > 0
+    assert calls == []  # rejected before the graph (and any fetch) ever ran
+
+
+@pytest.mark.integration
+async def test_post_message_shape_invalid_hs_code_returns_error_response_not_fastapi_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A body that fails `TradeQuery`'s own Pydantic field validation (not
+    a 6-digit string at all) must still come back as our `ErrorResponse`
+    schema via `handle_validation_error`, never FastAPI's default
+    `{"detail": [...]}` shape (docs/PLAN.md §3.2)."""
+    _patch_comtrade(monkeypatch)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "abc"})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error_code"] == "INVALID_QUERY"
+    assert "detail" not in body
+
+
+@pytest.mark.integration
+async def test_post_message_extra_field_rejected_as_invalid_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_comtrade(monkeypatch)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(
+            f"/threads/{thread_id}/messages",
+            json={"hs_code": "010121", "not_a_real_field": "x"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "INVALID_QUERY"
+
+
+@pytest.mark.integration
+async def test_post_message_upstream_timeout_maps_to_504(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated", request=request)
+
+    client = ComtradeClient(
+        api_key="test-key", transport=httpx.MockTransport(_timeout_handler), max_attempts=1
+    )
+    monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client)
+    monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: ToolCache())
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client_app:
+        response = await client_app.post(
+            f"/threads/{thread_id}/messages", json={"hs_code": "010121"}
+        )
+
+    assert response.status_code == 504
+    assert response.json()["error_code"] == "UPSTREAM_TIMEOUT"
+
+
+@pytest.mark.integration
+async def test_get_thread_unknown_id_returns_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_comtrade(monkeypatch)
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.get(f"/threads/{uuid.uuid4()}")
+
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "THREAD_NOT_FOUND"
+
+
+@pytest.mark.integration
+async def test_get_thread_after_message_resumes_the_same_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_comtrade(monkeypatch)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        posted = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
+        fetched = await client.get(f"/threads/{thread_id}")
+
+    assert posted.status_code == 200
+    assert fetched.status_code == 200
+    assert fetched.json() == posted.json()
+
+
+@pytest.mark.integration
+async def test_get_thread_after_error_resumes_the_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Uses an *in-graph* failure (upstream timeout), not the
+    `INVALID_HS_CODE` pre-check: that check deliberately rejects a request
+    before the graph is ever invoked (see `app/main.py`'s module docstring
+    on guardrail ordering), so it never writes any checkpoint for that
+    `thread_id` at all — `GET /threads/{id}` correctly reports
+    `THREAD_NOT_FOUND` for it (covered by
+    `test_post_message_unknown_hs_code_returns_400_before_touching_upstream`
+    above), not a resumable error. A failure that happens *inside* the
+    graph, by contrast, does write real checkpoint state before returning
+    — that's what this test proves is resumable.
+    """
+
+    def _timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated", request=request)
+
+    client_stub = ComtradeClient(
+        api_key="test-key", transport=httpx.MockTransport(_timeout_handler), max_attempts=1
+    )
+    monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client_stub)
+    monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: ToolCache())
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        posted = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
+        fetched = await client.get(f"/threads/{thread_id}")
+
+    assert posted.status_code == 504
+    assert fetched.status_code == 504
+    assert fetched.json()["error_code"] == "UPSTREAM_TIMEOUT"
+
+
+@pytest.mark.integration
+async def test_post_message_budget_exceeded_maps_to_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `app.budget.get_budget_tracker` is a module-level singleton keyed off
+    # the *global* `get_settings()`, like every other singleton factory in
+    # this codebase (`get_comtrade_client`, `get_tool_cache`) — it does not
+    # read `create_app(settings=...)`'s per-test override. Same pattern
+    # `tests/unit/test_models.py` already uses for the same reason: force a
+    # cache-clear + env override, then restore both.
+    import app.budget as budget_module
+    from app.settings import get_settings
+
+    monkeypatch.setenv("MAX_MODEL_CALLS_PER_THREAD", "0")
+    get_settings.cache_clear()
+    monkeypatch.setattr(budget_module, "_budget_tracker_singleton", None)
+    try:
+        _patch_comtrade(monkeypatch)
+        thread_id = str(uuid.uuid4())
+
+        async with _client_for(_isolated_settings()) as client:
+            response = await client.post(
+                f"/threads/{thread_id}/messages", json={"hs_code": "010121"}
+            )
+
+        assert response.status_code == 429
+        assert response.json()["error_code"] == "BUDGET_EXCEEDED"
+    finally:
+        get_settings.cache_clear()
+        monkeypatch.setattr(budget_module, "_budget_tracker_singleton", None)

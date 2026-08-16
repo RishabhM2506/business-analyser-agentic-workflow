@@ -3,19 +3,39 @@
 Field set mirrors the per-node input/output columns in docs/PLAN.md §2.2
 exactly, so each node's signature (`app/nodes/*.py`) can be read directly
 against that table.
-
-# TODO(Phase 3): wire this into `app/graph.py`'s `StateGraph(AnalysisState)`
-# once the nodes have real bodies.
 """
 
 from __future__ import annotations
 
-from typing import TypedDict
+import uuid
+from typing import Annotated, TypedDict
 
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
 from app.schemas.response import TradeAnalysisResponse, TradeTable
 from app.tools.comtrade_client import ComtradeRecord
+
+
+def _keep_first_error(existing: ErrorResponse, new: ErrorResponse) -> ErrorResponse:
+    """Reducer for the `error` channel (see its `Annotated[...]` below for
+    why one is needed at all): when `fetch_imports` and `fetch_exports`
+    — a genuine parallel fan-out, docs/PLAN.md §2.2 — both fail in the
+    same superstep (a systemic Comtrade outage fails both at once, not
+    just one flow), LangGraph's *default* per-key channel (`LastValue`)
+    rejects the second concurrent write to the same key outright
+    (`InvalidUpdateError: Can receive only one value per step`) — this was
+    reproduced live via a full graph invocation against an always-timing-out
+    transport, not a hypothetical. Marking `error` with this reducer instead
+    makes it a `BinaryOperatorAggregate` channel, which folds concurrent
+    writes through this function two at a time instead of rejecting them.
+
+    Keeping whichever was written first is an arbitrary but
+    deterministic-enough choice: only one `ErrorResponse` can ever reach the
+    user regardless (`app/main.py` returns exactly one), and every node
+    after the point of failure already no-ops via `has_error()` no matter
+    which upstream error specifically "won" the merge.
+    """
+    return existing
 
 
 class AnalysisState(TypedDict, total=False):
@@ -26,8 +46,28 @@ class AnalysisState(TypedDict, total=False):
     this dict across supersteps.
     """
 
+    # Seeded by the caller (`app/main.py`) at `.ainvoke()` time from the same
+    # UUID4 already bound as the HTTP request's `X-Request-ID`
+    # (`request_id_middleware`) — not written by any node, only read, so any
+    # `ErrorResponse` a node constructs correlates with the request's own
+    # structured logs rather than minting an independent, uncorrelated id.
+    trace_id: str
+
+    # Also seeded by the caller, same "written once, read-only" contract as
+    # `trace_id` above: `thread_id` is the `POST /threads/{id}/messages` path
+    # parameter (the LangGraph checkpointer's own thread key, so it's already
+    # available via `config["configurable"]["thread_id"]` too — duplicated
+    # into state so every node can read it the same plain way as every other
+    # input rather than half the nodes taking a second `RunnableConfig`
+    # argument); `message_id` is a fresh id minted per `POST .../messages`
+    # call. Both are read by `describe_item`/`summarize` (per-thread budget
+    # accounting, `app/budget.py`) and by `assemble_response` (the response
+    # envelope's `thread_id`/`message_id` fields, docs/PLAN.md §3.2).
+    thread_id: str
+    message_id: str
+
     query: TradeQuery
-    error: ErrorResponse
+    error: Annotated[ErrorResponse, _keep_first_error]
 
     raw_imports: list[ComtradeRecord]
     raw_exports: list[ComtradeRecord]
@@ -41,3 +81,20 @@ class AnalysisState(TypedDict, total=False):
     analytical_summary: str
 
     response: TradeAnalysisResponse
+
+
+def get_or_mint_trace_id(state: AnalysisState) -> str:
+    """`state["trace_id"]` if the caller seeded one (the normal case — see
+    the field's docstring above), else a freshly-minted UUID4 — shared by
+    every node that constructs an `ErrorResponse`, so there's exactly one
+    fallback policy instead of five slightly-different copies."""
+    return state.get("trace_id") or str(uuid.uuid4())
+
+
+def has_error(state: AnalysisState) -> bool:
+    """True iff an earlier node already wrote `error` — every node after
+    `validate_query` checks this first and no-ops if so (docs/PLAN.md §2.2:
+    v1 has no conditional edges, so every node in the fixed pipeline runs
+    regardless; a failed validation is a no-op for the rest of the
+    pipeline, not a graph-level branch)."""
+    return state.get("error") is not None

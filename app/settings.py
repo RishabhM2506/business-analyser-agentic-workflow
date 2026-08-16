@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     langsmith_api_key: str | None = None
     langsmith_project: str | None = None
     langsmith_tracing_enabled: bool = False
+    # Deploy identifier attached to every trace (docs/PLAN.md §4.1's
+    # observability.py file-tree note: "trace metadata (tenant_id,
+    # prompt_version, release SHA)"). Typically set by CI/the deploy
+    # pipeline to the built commit SHA; "unknown" is a safe default for
+    # local dev, where no such pipeline sets it, rather than a required
+    # field that would fail Settings construction for every developer who
+    # hasn't wired one up.
+    release_sha: str = "unknown"
 
     # --- Datastore (checkpointer + cache tables; docs/PLAN.md §2.2, §9) -----
     # sqlite locally by default; a postgresql+asyncpg:// URL in any deployed

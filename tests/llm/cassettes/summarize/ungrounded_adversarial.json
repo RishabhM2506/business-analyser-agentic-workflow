@@ -1,0 +1,10 @@
+{
+  "_meta": {
+    "synthetic": true,
+    "note": "SYNTHETIC adversarial cassette, deliberately ungrounded - NOT a real Gemini recording. Exists to prove the output guardrail (app.guardrails.check_numbers_grounded) catches a fabricated number even when it arrives via the cassette-replay path, not just via a hand-rolled test double. Paired with tests/llm/test_summarize.py's _table_normal() fixture; 8,888,888 does not appear anywhere in that table.",
+    "prompt_version": "summarize-v1"
+  },
+  "output": {
+    "analytical_summary": "United States led imports with a fabricated cumulative value of 8,888,888, which does not match the underlying data at all."
+  }
+}

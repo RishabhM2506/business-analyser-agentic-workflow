@@ -1,0 +1,12 @@
+{
+  "elapsedTime": "0.05 secs",
+  "count": 1,
+  "data": [
+    {
+      "period": "not-a-year",
+      "reporterCode": "not-an-int",
+      "partnerCode": 0
+    }
+  ],
+  "error": ""
+}
