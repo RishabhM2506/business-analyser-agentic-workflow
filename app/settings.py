@@ -83,6 +83,12 @@ class Settings(BaseSettings):
     # --- API edge (docs/PLAN.md §6: CORS allowlist, per-IP rate limiting) ---
     cors_allowed_origins: list[str] = Field(default_factory=list)
     rate_limit_per_minute: int = 60
+    # Request body-size ceiling, checked from the `Content-Length` header
+    # before any body parsing (finding B9/QA-02, master brief §8: "input
+    # validation and size limits at the API edge... before any model spend
+    # occurs"). 64 KiB is generous headroom — QA-02 confirmed live that the
+    # largest legitimate `TradeQuery` payload is well under 1 KB.
+    max_request_body_bytes: int = 64 * 1024
 
     # --- Structured logging ---------------------------------------------------
     log_level: str = "INFO"

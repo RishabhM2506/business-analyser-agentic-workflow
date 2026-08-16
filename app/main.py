@@ -95,6 +95,7 @@ _ERROR_STATUS_CODES: dict[str, int] = {
     "SCHEMA_VALIDATION_FAILED": 500,
     "INTERNAL_ERROR": 500,
     "THREAD_NOT_FOUND": 404,
+    "REQUEST_TOO_LARGE": 413,
 }
 
 
@@ -248,6 +249,56 @@ async def request_id_middleware(
     return response
 
 
+async def request_size_limit_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Reject any request whose declared `Content-Length` exceeds
+    `settings.max_request_body_bytes` before anything downstream reads or
+    buffers the body (finding B9/QA-02, master brief §8: "input validation
+    and size limits at the API edge... before any model spend occurs").
+    Live-reproduced without this: a 5MB field was fully accepted,
+    processed, and durably checkpointed (105MB SQLite growth from one
+    request).
+
+    A `Content-Length`-only check — never reading the body itself — is
+    deliberate and sufficient: `TradeQuery`'s largest legitimate payload is
+    well under 1KB (QA-02's own live measurement), so a generous 64KB
+    default ceiling can be enforced entirely from the header, before
+    Starlette/FastAPI ever allocates memory for an oversized body. A
+    request with no `Content-Length` header at all (e.g. chunked transfer
+    encoding, which no real client of this JSON POST-body API sends) is not
+    rejected here — that's a different, already-narrow risk this
+    header-only check isn't trying to cover.
+
+    Registered *after* `request_id_middleware` in `create_app` so it
+    actually runs *before* it: Starlette's middleware stack executes the
+    most-recently-registered `http`-type middleware first (verified
+    directly against the installed `starlette`/`fastapi`, not assumed —
+    confirmed live via a two-middleware smoke test recording call order).
+    """
+    settings: Settings = request.app.state.settings
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError:
+            declared_bytes = None
+        if declared_bytes is not None and declared_bytes > settings.max_request_body_bytes:
+            return _model_response(
+                ErrorResponse(
+                    error_code="REQUEST_TOO_LARGE",
+                    message=(
+                        "The request body exceeds the maximum allowed size of "
+                        f"{settings.max_request_body_bytes} bytes."
+                    ),
+                    retryable=False,
+                    trace_id=str(uuid.uuid4()),
+                ),
+                status_code=_status_code_for_error("REQUEST_TOO_LARGE"),
+            )
+    return await call_next(request)
+
+
 async def check_database(database_url: str) -> None:
     """Open a real connection against `database_url` and run a trivial
     query. Raises on any failure — callers decide what that means for their
@@ -307,6 +358,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.thread_locks = _ThreadLockRegistry()
 
     app.middleware("http")(request_id_middleware)
+    # Registered *after* request_id_middleware so it runs *before* it (see
+    # request_size_limit_middleware's own docstring for why that's the
+    # actual execution order) — an oversized request is rejected ahead of
+    # even the request-ID/logging layer, not just ahead of the graph
+    # (finding B9/QA-02).
+    app.middleware("http")(request_size_limit_middleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=resolved_settings.cors_allowed_origins,
