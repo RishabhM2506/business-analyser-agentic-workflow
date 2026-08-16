@@ -16,6 +16,7 @@ Without this, every thread endpoint would 500 with an `AttributeError`.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -308,6 +309,74 @@ async def test_post_message_two_successful_analyses_on_same_thread_both_succeed(
 
 
 @pytest.mark.integration
+async def test_post_message_concurrent_requests_on_same_thread_do_not_corrupt_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QA-01/B4: nothing previously serialized two `compiled_graph.ainvoke()`
+    calls on the same `thread_id` — two genuinely concurrent, successful
+    analyses on one thread raced for which run's checkpoint became "the"
+    resumable state, and QA-01 reproduced a case with zero errors involved
+    where one of the two was simply, arbitrarily lost. This test fires two
+    different, valid `hs_code` requests concurrently at the same thread and
+    asserts: both individually succeed with their own correct, internally
+    consistent result (proving the per-request response is never affected
+    by the race), and afterward `GET /threads/{id}` returns one complete,
+    uncorrupted result matching exactly one of the two requests (proving no
+    torn/interleaved state), not a 500 or a mixed/inconsistent body."""
+    _patch_comtrade(monkeypatch)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        first, second = await asyncio.gather(
+            client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"}),
+            client.post(f"/threads/{thread_id}/messages", json={"hs_code": "160100"}),
+        )
+        fetched = await client.get(f"/threads/{thread_id}")
+
+    # Each request's own response is unaffected by the other running
+    # concurrently on the same thread — both fully succeed, each internally
+    # consistent (its own hs_code matches its own message_id's result).
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = _data(first)
+    second_body = _data(second)
+    assert first_body["hs_code"] == "010121"
+    assert second_body["hs_code"] == "160100"
+    assert first_body["message_id"] != second_body["message_id"]
+
+    # GET afterward is a well-defined outcome: one complete, valid response
+    # that matches exactly one of the two requests in full (never a body
+    # that mixes fields from both, and never a corrupted/incomplete state).
+    assert fetched.status_code == 200
+    fetched_body = _data(fetched)
+    assert fetched_body in (first_body, second_body)
+
+
+@pytest.mark.integration
+async def test_get_thread_after_sequential_messages_reflects_the_latest_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QA-01/B4, the sequential half: with writes now serialized by
+    `_ThreadLockRegistry`, a thread holding multiple analyses over its life
+    (finding B2) has well-defined, deterministic `GET` semantics — the most
+    recently *completed* message, not an arbitrary pick. Purely sequential
+    (no `asyncio.gather`), so this also holds even without genuine
+    scheduler interleaving."""
+    _patch_comtrade(monkeypatch)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        first = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
+        second = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "160100"})
+        fetched = await client.get(f"/threads/{thread_id}")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert fetched.status_code == 200
+    assert _data(fetched) == _data(second)
+
+
+@pytest.mark.integration
 async def test_post_message_after_earlier_failure_on_same_thread_is_not_replayed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -336,9 +405,7 @@ async def test_post_message_after_earlier_failure_on_same_thread_is_not_replayed
 
     async with _client_for(_isolated_settings()) as client:
         failed = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
-        succeeded = await client.post(
-            f"/threads/{thread_id}/messages", json={"hs_code": "160100"}
-        )
+        succeeded = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "160100"})
         fetched = await client.get(f"/threads/{thread_id}")
 
     assert failed.status_code == 504

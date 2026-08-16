@@ -33,6 +33,7 @@ brief's "nothing reaches a model before validation"):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import time
@@ -85,6 +86,52 @@ _ERROR_STATUS_CODES: dict[str, int] = {
 
 def _status_code_for_error(error_code: str) -> int:
     return _ERROR_STATUS_CODES.get(error_code, 500)
+
+
+class _ThreadLockRegistry:
+    """One `asyncio.Lock` per LangGraph `thread_id`, created on first use and
+    dropped once nothing is waiting on it anymore (finding B4/QA-01).
+
+    Without this, nothing serializes two `compiled_graph.ainvoke(...)` calls
+    on the same `thread_id` — QA-01 reproduced this four distinct ways,
+    including a case with zero errors involved (two genuinely successful
+    concurrent runs, one arbitrarily lost from `GET /threads/{id}`) that
+    B3's `error`-reset fix alone does not touch, since it isn't about a
+    stale error at all, just two writers racing to be "the" resumable
+    checkpoint state.
+
+    A plain `dict[str, asyncio.Lock]` that never shrinks would be a slow
+    memory leak (one lock per distinct `thread_id` ever seen, for the life
+    of the process) — this tracks a reference count per `thread_id` so an
+    entry is only removed once the last concurrent waiter for it has fully
+    released the lock, never while anyone might still be relying on getting
+    back the *same* `Lock` instance a concurrent caller is already holding.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._waiters: dict[str, int] = {}
+        self._guard = asyncio.Lock()
+
+    @asynccontextmanager
+    async def acquire(self, thread_id: str) -> AsyncIterator[None]:
+        async with self._guard:
+            lock = self._locks.setdefault(thread_id, asyncio.Lock())
+            self._waiters[thread_id] = self._waiters.get(thread_id, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            async with self._guard:
+                self._waiters[thread_id] -= 1
+                if self._waiters[thread_id] <= 0:
+                    del self._waiters[thread_id]
+                    # Only drop the Lock object itself if it's still the
+                    # same one we handed out above (defensive; in practice
+                    # always true, since entries are only ever created, never
+                    # replaced, while a waiter count is outstanding).
+                    if self._locks.get(thread_id) is lock:
+                        del self._locks[thread_id]
 
 
 def _model_response(
@@ -239,6 +286,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = resolved_settings
+    # Per-app-instance, matching `app.state.settings`/`app.state.compiled_graph`
+    # rather than a process-wide singleton (unlike `get_budget_tracker()`
+    # etc.) — each test creates its own `create_app()`, and thread locks
+    # must never leak across independently-created apps (finding B4).
+    app.state.thread_locks = _ThreadLockRegistry()
 
     app.middleware("http")(request_id_middleware)
     app.add_middleware(
@@ -400,8 +452,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ),
         }
 
+        thread_locks: _ThreadLockRegistry = request.app.state.thread_locks
         try:
-            final_state: AnalysisState = await compiled_graph.ainvoke(initial_state, config=config)
+            # Held for the whole invocation (finding B4/QA-01) so a second
+            # call on the same thread_id genuinely waits rather than racing
+            # for which run's checkpoint becomes "the" resumable state.
+            # Given B2 already establishes a thread holds multiple analyses
+            # over its life, serializing writes (rather than rejecting a
+            # second message outright) is sufficient: each message's own
+            # result is still returned in *its own* HTTP response the
+            # moment its own request completes, below, regardless of
+            # ordering; only `GET /threads/{id}`'s "latest" view is affected
+            # by which request happened to run second, which is now a
+            # well-defined "most recent completed message wins," not a race.
+            async with thread_locks.acquire(thread_id):
+                final_state: AnalysisState = await compiled_graph.ainvoke(
+                    initial_state, config=config
+                )
         except Exception as exc:
             is_schema_failure = isinstance(exc, ValidationError)
             error_code = "SCHEMA_VALIDATION_FAILED" if is_schema_failure else "INTERNAL_ERROR"
