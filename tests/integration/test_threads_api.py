@@ -277,6 +277,37 @@ async def test_get_thread_after_error_resumes_the_error(monkeypatch: pytest.Monk
 
 
 @pytest.mark.integration
+async def test_post_message_two_successful_analyses_on_same_thread_both_succeed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARCH-02/B2: a thread models one user's *session* (docs/PLAN.md §2.2 —
+    created once on "Start my process," reused for every item picked
+    afterward), not one single analysis. Two different, successful
+    `hs_code` analyses on the same thread must both succeed — before the
+    budget-ceiling fix, the *first* analysis alone exactly exhausted the
+    default `max_model_calls_per_thread`, so a completely ordinary second
+    item lookup in the same session always failed with `BUDGET_EXCEEDED`.
+    This scenario had zero test coverage before this fix (confirmed:
+    no existing test in this file posts a second message to an
+    already-successful thread)."""
+    _patch_comtrade(monkeypatch)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        first = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
+        second = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "160100"})
+
+    assert first.status_code == 200
+    first_body = _data(first)
+    assert first_body["hs_code"] == "010121"
+
+    assert second.status_code == 200
+    second_body = _data(second)
+    assert second_body["hs_code"] == "160100"
+    assert second_body["message_id"] != first_body["message_id"]
+
+
+@pytest.mark.integration
 async def test_post_message_after_earlier_failure_on_same_thread_is_not_replayed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

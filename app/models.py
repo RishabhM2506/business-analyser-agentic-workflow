@@ -28,10 +28,11 @@ NodeRole = Literal["utility", "analysis"]
 T = TypeVar("T", bound=BaseModel)
 
 # Bounded retries only (master brief §7.9) — the langchain-google-genai
-# default (6) is too generous for a hard per-thread call budget
-# (docs/PLAN.md §5.5: max_model_calls_per_thread = 2); a stuck call should
-# fail fast into the budget/guardrail error path, not silently multiply
-# spend retrying internally.
+# default (6) is too generous against a finite per-thread call budget
+# (docs/PLAN.md §5.5: max_model_calls_per_thread, a per-session, not
+# per-call, ceiling); a stuck call should fail fast into the
+# budget/guardrail error path, not silently multiply spend retrying
+# internally.
 _GEMINI_MAX_RETRIES = 2
 _GEMINI_TIMEOUT_SECONDS = 20.0
 
