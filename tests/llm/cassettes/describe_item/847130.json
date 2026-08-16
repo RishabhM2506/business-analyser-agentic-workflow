@@ -1,12 +1,12 @@
 {
   "_meta": {
     "synthetic": true,
-    "note": "SYNTHETIC placeholder cassette - NOT a real Gemini recording. No real GEMINI_API_KEY was available during Phase 3 implementation (docs/OPEN-QUESTIONS.md). Re-record against a real key before relying on this for anything beyond deterministic CI replay. See tests/llm/cassette.py.",
+    "note": "SYNTHETIC placeholder cassette - NOT a real Gemini recording. No real GEMINI_API_KEY was available during Phase 3 implementation (docs/OPEN-QUESTIONS.md). Re-record against a real key before relying on this for anything beyond deterministic CI replay. See tests/llm/cassette.py. Description text rewritten in the Phase 4 fix loop (finding M2/AWR-04) to be number-free, matching prompts/describe_item.md's own 'do not mention ... any number' rule now enforced in code, not just prompt wording.",
     "hs_code": "847130",
     "section": "XVI",
     "prompt_version": "describe_item-v1"
   },
   "output": {
-    "description": "HS 847130 covers portable automatic data processing machines weighing no more than 10kg that include, at minimum, a central processing unit, a keyboard, and a display - commonly laptop and notebook computers. It falls under HS 8471, the broader heading for automatic data processing machines and related units, within Section XVI (machinery and mechanical appliances; electrical equipment). The defining criteria are portability, weight, and the specific combination of built-in components."
+    "description": "This HS sub-heading covers portable automatic data processing machines of a light weight that include, at minimum, a central processing unit, a keyboard, and a display - commonly laptop and notebook computers. It falls under the broader heading for automatic data processing machines and related units, within the machinery, mechanical appliances, and electrical equipment section. The defining criteria are portability, weight, and the specific combination of built-in components."
   }
 }

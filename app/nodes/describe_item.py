@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.budget import BudgetExceededError, get_budget_tracker
+from app.guardrails import extract_numbers
 from app.models import get_model_for_role
 from app.schemas.errors import ErrorResponse
 from app.settings import get_settings
@@ -77,4 +78,29 @@ async def describe_item(state: AnalysisState) -> dict[str, Any]:
         user_content=f"HS code: {query.hs_code}\n\n{taxonomy_text}",
         schema=DescribeItemOutput,
     )
+
+    if extract_numbers(result.description):
+        # Code-level enforcement, not prompt-wording alone (finding
+        # M2/AWR-04 — master brief §8 explicitly forbids relying on a
+        # prompt instruction as the only control). Unlike `summarize`'s
+        # output, which legitimately describes real table values,
+        # `item_description` has no legitimate reason to contain *any*
+        # number at all: prompts/describe_item.md's own "Hard rules"
+        # already instruct the model never to mention one (prices, costs,
+        # growth, or "any number"), so this check can be strict —
+        # membership-in-a-table doesn't even apply here — rather than the
+        # table-membership check `check_numbers_grounded` does for the
+        # analytical summary.
+        return {
+            "error": ErrorResponse(
+                error_code="UNGROUNDED_DESCRIPTION",
+                message=(
+                    "The generated item description could not be verified as number-free "
+                    "and was discarded rather than shown."
+                ),
+                retryable=True,
+                trace_id=get_or_mint_trace_id(state),
+            )
+        }
+
     return {"item_description": result.description}

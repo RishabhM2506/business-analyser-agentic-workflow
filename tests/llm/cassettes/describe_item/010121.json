@@ -1,12 +1,12 @@
 {
   "_meta": {
     "synthetic": true,
-    "note": "SYNTHETIC placeholder cassette - NOT a real Gemini recording. No real GEMINI_API_KEY was available during Phase 3 implementation (docs/OPEN-QUESTIONS.md). Re-record against a real key before relying on this for anything beyond deterministic CI replay. See tests/llm/cassette.py.",
+    "note": "SYNTHETIC placeholder cassette - NOT a real Gemini recording. No real GEMINI_API_KEY was available during Phase 3 implementation (docs/OPEN-QUESTIONS.md). Re-record against a real key before relying on this for anything beyond deterministic CI replay. See tests/llm/cassette.py. Description text rewritten in the Phase 4 fix loop (finding M2/AWR-04) to be number-free, matching prompts/describe_item.md's own 'do not mention ... any number' rule now enforced in code, not just prompt wording.",
     "hs_code": "010121",
     "section": "I",
     "prompt_version": "describe_item-v1"
   },
   "output": {
-    "description": "HS 010121 covers live, pure-bred breeding horses, a sub-heading within the broader category of live horses, asses, mules and hinnies (HS 0101), itself part of Section I (live animals and animal products). This category is limited to horses recognized as pure-bred for breeding purposes, distinguishing it from other live-horse trade such as non-breeding or general-purpose animals. It is a narrow, animal-husbandry-specific commodity code rather than a manufactured or processed good."
+    "description": "This HS sub-heading covers live, pure-bred breeding horses, a category within the broader heading for live horses, asses, mules and hinnies, itself part of the live animals and animal products section. It is limited to horses recognized as pure-bred for breeding purposes, distinguishing it from other live-horse trade such as non-breeding or general-purpose animals. It is a narrow, animal-husbandry-specific commodity code rather than a manufactured or processed good."
   }
 }
