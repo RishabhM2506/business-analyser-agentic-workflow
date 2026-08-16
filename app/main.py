@@ -541,6 +541,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         schema-validated (see `_model_response`)."""
         settings: Settings = request.app.state.settings
         trace_id = _current_trace_id()
+        # Finding M6/ARCH-05: `tenant_id`/`user_id` previously reached
+        # budget accounting (`app/budget.py`) and LangSmith trace metadata
+        # (`build_trace_metadata`, below) but never ordinary structured
+        # JSON request logs, contradicting the multi-tenancy seam's own
+        # 3-part contract (master brief §3: "threaded into logging, rate
+        # limits, and budget accounting"). Can't be bound in
+        # `request_id_middleware` — middleware runs before FastAPI has
+        # parsed the request body into `query: TradeQuery` at all, so
+        # `tenant_id`/`user_id` (fields *on* the body) simply don't exist
+        # yet at that point; this is the earliest point in the request
+        # they're available. Every `logger.*` call for the rest of this
+        # request (including inside `request_id_middleware`'s own
+        # "request.finished" log line, emitted after this handler returns)
+        # now carries both.
+        structlog.contextvars.bind_contextvars(tenant_id=query.tenant_id, user_id=query.user_id)
 
         if not check_hs_code_allowlisted(query.hs_code):
             return _model_response(

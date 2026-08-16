@@ -159,6 +159,45 @@ async def test_post_message_happy_path_returns_schema_valid_analysis(
 
 
 @pytest.mark.integration
+async def test_post_message_binds_tenant_and_user_id_into_log_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M6/ARCH-05: `tenant_id`/`user_id` previously reached budget
+    accounting and LangSmith trace metadata but never ordinary structured
+    request logs, contradicting the multi-tenancy seam's own stated 3-part
+    contract (master brief §3: "threaded into logging, rate limits, and
+    budget accounting"). Captures `structlog.contextvars.get_contextvars()`
+    from inside the real request handling path (via a monkeypatched
+    `check_hs_code_allowlisted`, the first thing `post_message` calls after
+    binding) rather than asserting on log output text, so this doesn't
+    depend on the configured renderer/handler."""
+    import structlog
+
+    import app.main as main_module
+
+    _patch_comtrade(monkeypatch)
+    captured: dict[str, object] = {}
+    real_check = main_module.check_hs_code_allowlisted
+
+    def _capturing_check(hs_code: str) -> bool:
+        captured.update(structlog.contextvars.get_contextvars())
+        return real_check(hs_code)
+
+    monkeypatch.setattr(main_module, "check_hs_code_allowlisted", _capturing_check)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(
+            f"/threads/{thread_id}/messages",
+            json={"hs_code": "010121", "tenant_id": "acme", "user_id": "u-42"},
+        )
+
+    assert response.status_code == 200
+    assert captured["tenant_id"] == "acme"
+    assert captured["user_id"] == "u-42"
+
+
+@pytest.mark.integration
 async def test_post_message_unknown_hs_code_returns_400_before_touching_upstream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
