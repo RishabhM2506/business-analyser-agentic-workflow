@@ -10,8 +10,10 @@ dist/
 .eggs/
 
 # --- uv / venvs ----------------------------------------------------------
-.venv/
-venv/
+# No trailing slash: matches whether .venv is a real directory or a symlink
+# (e.g. a local workaround redirecting it outside a cloud-synced folder).
+.venv
+venv
 uv.lock.bak
 
 # --- Env / secrets ---------------------------------------------------------
