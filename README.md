@@ -14,32 +14,45 @@ see the architecture doc), `uv` for dependency management.
 this repo alongside the planning repo — it isn't duplicated here so there's exactly one
 source of truth).
 
-## Status: Phase 2 (scaffolding)
+## Status: Phase 3 (implementation)
 
-This repo currently has **zero business logic**. What's real:
+The full v1 request path is real, end to end: HS-code validation, cached Comtrade fetches,
+deterministic aggregation, the two LLM nodes, the output guardrail, and the thread/message API,
+all wired together as a compiled LangGraph `StateGraph` with a real checkpointer.
 
 - `app/schemas/*.py` — the full set of data contracts (`TradeQuery`, `TradeAnalysisResponse`,
   `TradeTable`, `CountryRow`, `Provenance`, `ErrorResponse`), matching `docs/PLAN.md` §3
   exactly.
 - `app/settings.py` — typed config (Pydantic Settings), fails loudly at startup if a
   required field is missing.
-- `app/main.py` — a real FastAPI app with two working routes: `GET /` and `GET /healthz`.
-- `data/harmonized-system.csv` — the real, checked-in HS6 taxonomy (see "HS taxonomy data"
-  below).
-- Everything else (`app/graph.py`, `app/nodes/*.py`, `app/tools/comtrade_client.py`,
-  `app/knowledge/provider.py`, `app/cache/*.py`, `app/guardrails.py`, `app/budget.py`,
-  `app/observability.py`, `app/models.py`) exists with correct imports, correct type
-  signatures (mypy-strict-clean), and a body that's either `raise NotImplementedError` or a
-  minimal placeholder — enough for the rest of the codebase to import and type-check against,
-  nothing pretending to be real behavior. Each is marked `# TODO(Phase 3): ...`.
+- `app/tools/comtrade_client.py`, `app/cache/*.py`, `app/knowledge/provider.py` — the Comtrade
+  client (timeout, bounded retry+jitter, circuit breaker) and its two cache layers, and the
+  static HS-taxonomy knowledge provider.
+- `app/nodes/*.py` — every node in `docs/PLAN.md` §2.2's table: `validate_query`,
+  `fetch_imports`/`fetch_exports`, `aggregate`, `retrieve_description`, `describe_item`,
+  `summarize`.
+- `app/graph.py` — `build_graph()` assembles the fixed pipeline; `build_checkpointer()` picks
+  `AsyncSqliteSaver` or `AsyncPostgresSaver` from `DATABASE_URL`'s scheme.
+- `app/main.py` — `GET /`, `GET /healthz`, `POST /threads`, `GET /threads/{id}`,
+  `POST /threads/{id}/messages` (`docs/PLAN.md` §3.3) — all real.
+- `app/guardrails.py`, `app/budget.py`, `app/observability.py` — the input/output guardrails,
+  per-thread/per-day model-call ceilings, and LangSmith trace metadata wiring.
+- `evals/dataset.jsonl` + `evals/run_evals.py` — a 20-row seed eval set spanning 20 of the 21
+  official WCO HS sections, scored in CI (`eval-gate` job): number-grounding is blocking,
+  a taxonomy-text sanity check is warn-only. See `evals/run_evals.py`'s module docstring.
 
-### Why `/threads` and `/threads/{id}/messages` aren't registered yet
+### Thread/message API
 
-`docs/PLAN.md` §3.3 defines a thread/message API. Those routes invoke the LangGraph workflow
-in `app/graph.py`, which doesn't exist yet — `build_graph()` is a `NotImplementedError` stub.
-Rather than register routes that would always return a placeholder 501, we chose **not to
-register them at all** until Phase 3 gives them something real (even provisionally real) to
-invoke. `GET /` and `GET /healthz` are registered and fully working now.
+```
+POST /threads                    -> {"thread_id": "<uuid4>"}
+GET  /threads/{id}               -> TradeAnalysisResponse or ErrorResponse (resume-after-refresh)
+POST /threads/{id}/messages      -> body: TradeQuery-shaped selection
+                                     -> TradeAnalysisResponse (200) or ErrorResponse (4xx/5xx)
+```
+
+Every response, success or error, is a schema-validated Pydantic model serialized straight to
+JSON — never FastAPI's default validation-error shape (see `app/main.py`'s
+`handle_validation_error`) and never a partial render.
 
 ## Running locally
 
@@ -70,16 +83,18 @@ first connection — no external datastore needed to run `/healthz` successfully
 
 This is already the default in `.env.example`. Every test, and all of CI, runs against
 `app/models.py`'s `MockLLM` — zero token spend, zero API keys required to be *valid* (they
-still need to be present as strings; see above). `LLM_PROVIDER=gemini` is the switch for real
-calls, once Phase 3 implements the Gemini adapter.
+still need to be present as strings; see above). `LLM_PROVIDER=gemini` switches to the real
+`langchain-google-genai`-backed adapter (`GeminiModelClient`) for real calls — needs a real
+`GEMINI_API_KEY`.
 
 ## Testing
 
 ```bash
 uv run pytest                      # everything: unit + integration + llm
 uv run pytest -m unit              # pure-function / no-I/O tests only
-uv run pytest -m integration       # FastAPI app tests (httpx ASGI transport, no live network)
-uv run pytest -m llm               # proves the `llm` marker/CI-job wiring; trivial until Phase 3
+uv run pytest -m integration       # FastAPI app + full-graph tests (mocked Comtrade, no live network)
+uv run pytest -m llm               # cassette-replay tests for describe_item/summarize (no live call)
+uv run python evals/run_evals.py   # eval gate: number-grounding (blocking) + taxonomy sanity (warn)
 ```
 
 Markers (`unit`, `integration`, `llm`) are registered in `pyproject.toml` under
@@ -114,20 +129,21 @@ the `X-Request-ID` response header. Logs render as JSON by default (`LOG_JSON=tr
 `https://raw.githubusercontent.com/datasets/harmonized-system/main/data/harmonized-system.csv`
 (ODC-PDDL public domain, per Gate 0 findings) — ~6,900 rows, checked in as-is. It's static and
 versioned; nothing in this repo regenerates it. `app/knowledge/provider.py`'s
-`StaticKnowledgeProvider` will read it directly once implemented in Phase 3.
+`StaticKnowledgeProvider` reads it directly (`app/guardrails.py`'s `hs_code` allowlist check
+delegates to the same loader).
 
 ## Coverage
 
 The `test` CI job reports coverage (`--cov=app --cov-report=term-missing`) but does not gate
-on a threshold yet. A meaningful floor is hard to set honestly while most of `app/` is
-intentionally unreachable `NotImplementedError` stubs (see "Status" above) — several modules
-are never imported by any test at all. Revisit once Phase 3 fills those bodies in.
+on a threshold yet.
 
 ## Data retention
 
-Per `docs/PLAN.md` §6: checkpointed conversation state (once the checkpointer exists, Phase
-3) is retained for a rolling 90 days (`CHECKPOINT_RETENTION_DAYS`), enforced at that point —
-no accounts, no PII, only HS-code selections and generated prose.
+Per `docs/PLAN.md` §6: checkpointed conversation state is intended to be retained for a
+rolling 90 days (`CHECKPOINT_RETENTION_DAYS`) — no accounts, no PII, only HS-code selections
+and generated prose. The setting exists and is documented; an automated pruning job that
+actually enforces it against the checkpointer's store is not yet implemented — tracked as
+follow-up work, not silently assumed to already be running.
 
 ## Free-tier data policy
 
@@ -144,4 +160,13 @@ docker run --rm -p 8000:8000 --env-file .env business-analyser-agentic-workflow
 
 Multi-stage build (`Dockerfile`): dependencies resolve in a `builder` stage; the `runtime`
 stage ships only the resulting virtualenv + application source, running as a non-root user
-(`app`, uid 1000) on `python:3.12-slim`. No secrets are baked into any layer.
+(`app`, uid 1000) on `python:3.12-slim`, plus the `libpq5` runtime library (needed only if
+`DATABASE_URL` is switched to a `postgresql://` URL — see `app/graph.py`'s module docstring).
+No secrets are baked into any layer.
+
+## Checkpointer: SQLite vs Postgres
+
+`DATABASE_URL`'s scheme picks the checkpointer (`app.graph.build_checkpointer`):
+`sqlite+aiosqlite:///...` (the default) uses `AsyncSqliteSaver`; `postgresql+asyncpg://...`
+uses `AsyncPostgresSaver`. Both are held open for the process's lifetime (opened once in
+`app/main.py`'s `lifespan`, not per-request).

@@ -1,7 +1,9 @@
-"""Integration tests for the two routes that are real in Phase 2: `/` and
-`/healthz`. `/healthz` must genuinely check database connectivity, not
-return an unconditional 200 (master brief §2 backend specifics) — tested
-here on both the healthy and unhealthy paths.
+"""Integration tests for `/` and `/healthz`. `/healthz` must genuinely check
+database connectivity, not return an unconditional 200 (master brief §2
+backend specifics) — tested here on both the healthy and unhealthy paths.
+The thread/message API (`POST /threads`, `GET /threads/{id}`,
+`POST /threads/{id}/messages`) has its own dedicated test files:
+`tests/integration/test_threads_api.py` and `tests/integration/test_graph.py`.
 """
 
 from __future__ import annotations
