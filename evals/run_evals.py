@@ -25,15 +25,15 @@ failure blocks merge, judge-score drift warns, doesn't block"):
    oversight: this script also *calls* the real `describe_item` node (under
    `LLM_PROVIDER=mock`, so free) to prove that code path still runs
    end-to-end, but its output can't be content-checked here.
-   `app.models.MockLLM`'s `_mock_text_for` (verified/frozen — see the
-   README/task this script was written under) echoes numeric tokens from
-   its input when any are present, and `describe_item`'s input always
-   starts with the literal HS code digits (`f"HS code: {hs_code}\n\n..."`)
-   — so its mock output is *always* the numeric-echo branch, never the
-   taxonomy-text excerpt, making a content check against it fire on every
-   single row regardless of dataset quality (verified by running this
-   script during development: 100% warn rate, zero discriminating signal).
-   Checking against `taxonomy_text` directly instead is honest about what's
+   `app.models.MockLLM`'s `_mock_text_for` builds `describe_item`'s mock
+   output from a number-stripped excerpt of its own input (every
+   digit-containing token removed outright, not reformatted — finding
+   M2/AWR-04: `describe_item`'s real output is now guardrail-checked to
+   contain *zero* numbers, so the mock must guarantee that too, unlike
+   `summarize`'s mock branch, which deliberately echoes numeric tokens to
+   exercise `summarize`'s table-membership guardrail). That excerpt is not
+   a meaningful stand-in for real model quality either way — checking
+   against `taxonomy_text` directly instead is honest about what's
    actually being verified: that this dataset's own reference phrases are
    accurate against the real official source text, not a proxy for model
    description quality (a real LLM-as-judge, deferred — docs/PLAN.md §7 —

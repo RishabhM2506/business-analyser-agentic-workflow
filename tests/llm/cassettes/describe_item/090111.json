@@ -1,12 +1,12 @@
 {
   "_meta": {
     "synthetic": true,
-    "note": "SYNTHETIC placeholder cassette - NOT a real Gemini recording. No real GEMINI_API_KEY was available during Phase 3 implementation (docs/OPEN-QUESTIONS.md). Re-record against a real key before relying on this for anything beyond deterministic CI replay. See tests/llm/cassette.py.",
+    "note": "SYNTHETIC placeholder cassette - NOT a real Gemini recording. No real GEMINI_API_KEY was available during Phase 3 implementation (docs/OPEN-QUESTIONS.md). Re-record against a real key before relying on this for anything beyond deterministic CI replay. See tests/llm/cassette.py. Description text rewritten in the Phase 4 fix loop (finding M2/AWR-04) to be number-free, matching prompts/describe_item.md's own 'do not mention ... any number' rule now enforced in code, not just prompt wording.",
     "hs_code": "090111",
     "section": "II",
     "prompt_version": "describe_item-v1"
   },
   "output": {
-    "description": "HS 090111 covers coffee that has not been roasted or decaffeinated, i.e. raw green coffee beans in their unprocessed state. It sits within HS 0901, the broader heading for coffee in all its roasted/decaffeinated variants along with coffee husks, skins, and coffee substitutes, itself part of Section II (vegetable products). This code represents coffee at its earliest tradeable stage, before any roasting or caffeine-removal processing is applied."
+    "description": "This HS sub-heading covers coffee that has not been roasted or decaffeinated, meaning raw green coffee beans in their unprocessed state. It sits within the broader heading for coffee in all its roasted and decaffeinated variants along with coffee husks, skins, and coffee substitutes, itself part of the vegetable products section. This code represents coffee at its earliest tradeable stage, before any roasting or caffeine-removal processing is applied."
   }
 }

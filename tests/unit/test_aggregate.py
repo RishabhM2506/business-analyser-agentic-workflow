@@ -95,6 +95,57 @@ def test_find_excluded_partner_codes_sorted_and_deduplicated() -> None:
     assert find_excluded_partner_codes(records) == ["0", "490"]
 
 
+@pytest.mark.unit
+def test_strip_aggregate_partners_removes_the_reporters_own_code() -> None:
+    """M20/PBO-02: India (the fixed reporter, `INDIA_REPORTER_CODE = "699"`)
+    live-reproduced on HS 851713 as one of its own top-10 import "trading
+    partners," unexplained — a country cannot be its own bilateral partner.
+    `data/comtrade-partner-areas.csv` correctly marks "699" as NOT a
+    generic aggregate code (`is_aggregate_code=false`, it's a real
+    country), so `is_aggregate_partner_code` alone never caught this."""
+    from app.tools.comtrade_client import INDIA_REPORTER_CODE
+
+    records = [
+        _record(partner_code=INDIA_REPORTER_CODE, partner_country="India", year=2023, value=500.0),
+        _record(partner_code="842", partner_country="USA", year=2023, value=300.0),
+    ]
+    kept = strip_aggregate_partners(records)
+    assert [r.partner_code for r in kept] == ["842"]
+
+
+@pytest.mark.unit
+def test_find_excluded_partner_codes_includes_the_reporters_own_code() -> None:
+    from app.tools.comtrade_client import INDIA_REPORTER_CODE
+
+    records = [
+        _record(partner_code=INDIA_REPORTER_CODE, partner_country="India", year=2023, value=500.0),
+        _record(partner_code="0", partner_country="World", year=2023, value=1000.0),
+        _record(partner_code="842", partner_country="USA", year=2023, value=300.0),
+    ]
+    assert find_excluded_partner_codes(records) == ["0", INDIA_REPORTER_CODE]
+
+
+@pytest.mark.unit
+def test_build_trade_table_strips_reporter_self_reference_before_ranking() -> None:
+    """End-to-end regression at the same level PBO-02 reproduced it: the
+    reporter's own code must never reach the ranked rows, even after the
+    full aggregate pipeline (rank + pivot + completeness flagging)."""
+    from app.tools.comtrade_client import INDIA_REPORTER_CODE
+
+    records = [
+        _record(
+            partner_code=INDIA_REPORTER_CODE,
+            partner_country="India",
+            year=2023,
+            value=999_999.0,  # would rank #1 if not stripped
+        ),
+        _record(partner_code="842", partner_country="USA", year=2023, value=300.0),
+    ]
+    table = build_trade_table(records, years=[2023])
+    assert [r.partner_country for r in table.rows] == ["USA"]
+    assert INDIA_REPORTER_CODE in table.excluded_partner_codes
+
+
 # --- rank_top_partners ---------------------------------------------------------
 
 

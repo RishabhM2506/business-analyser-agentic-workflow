@@ -23,6 +23,19 @@ class Provenance(BaseModel):
     period_type: Literal["calendar_year"]  # explicit: NOT Indian fiscal year — Gate 0 finding
     currency: Literal["USD"]
     prompt_version: str
+    # Finding M22/PBO-04 (schema half): the product never stated anywhere
+    # that this is India's trade data specifically, even though the entire
+    # system is hard-coded to India as the fixed reporter
+    # (`INDIA_REPORTER_CODE`, app/tools/comtrade_client.py). The only way
+    # "India" could previously reach the user was incidentally, inside
+    # unconstrained model prose, or — worse — confusingly, as an unexplained
+    # partner-table row (M20/PBO-02). A `Literal["India"]` (not a plain
+    # `str`) matches the existing pattern for `source`/`period_type`/
+    # `currency`: a schema-enforced fact about this deployment, not
+    # something any node computes or a model could contradict. Frontend
+    # rendering of this field is out of scope here — this is the contract
+    # half only.
+    reporter_country: Literal["India"]
 
 
 class CountryRow(BaseModel):
