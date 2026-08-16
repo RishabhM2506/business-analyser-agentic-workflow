@@ -5,27 +5,108 @@ a fixture record/replay mode so `tests/integration/` never makes a live
 network call (docs/PLAN.md §7). Read-only, external (docs/PLAN.md §1.1) —
 this is the only tool v1 has.
 
-# TODO(Phase 3): implement the real HTTP calls (httpx.AsyncClient), the
-# tenacity-based bounded+jittered retry policy, a circuit breaker, and the
-# fixture record/replay mode, against the verified UN Comtrade API shape.
+Verified live against the real UN Comtrade API on 2026-08-16 (no API key
+exists yet — see `docs/OPEN-QUESTIONS.md` — so verification used the
+no-auth "preview" endpoint, which returns the same record shape):
+
+    GET https://comtradeapi.un.org/public/v1/preview/C/A/HS
+        ?reporterCode=699&period=2022&cmdCode=010121&flowCode=M
+
+    {"elapsedTime": "...", "count": 3, "error": "", "data": [
+      {"...", "reporterCode": 699, "flowCode": "M", "partnerCode": 0,
+       "cmdCode": "010121", "period": "2022", "primaryValue": 1992455.942,
+       "cifvalue": 1992455.942, "fobvalue": null, "isReported": false,
+       "isAggregate": true, "legacyEstimationFlag": 0, ...},
+      {"...", "partnerCode": 826, "primaryValue": 1861448.346,
+       "isReported": true, "isAggregate": false, ...},
+      {"...", "partnerCode": 36, "primaryValue": 131007.596,
+       "isReported": true, "isAggregate": false, ...}
+    ]}
+
+Confirms the field list `docs/PHASE0-FINDINGS.md` carried over from earlier
+research (`reporterCode`, `partnerCode`, `cmdCode`, `flowCode`, `period`,
+`primaryValue`/`cifvalue`/`fobvalue`, `isReported`, `isAggregate`,
+`legacyEstimationFlag`) is still accurate. Two things learned only from this
+second, Phase-3 round of live verification and NOT present in Phase 0's
+notes:
+
+1. Omitting `partnerCode` returns the full partner breakdown for that
+   (reporter, period, cmdCode, flowCode) in ONE call — including the
+   `partnerCode=0` ("World") aggregate row alongside every reporting
+   partner. A live query returned 258 partner rows for one HS6/year/flow.
+   `fetch_flow` below relies on this: one HTTP call per year, not one call
+   per (year, partner).
+2. A comma-separated multi-year `period` (e.g. `"2019,2020,2021"`) was
+   rejected with HTTP 400 on this endpoint in a live test, even though it is
+   documented as valid on the general Comtrade API surface — so this client
+   loops one year per call rather than requesting a year range in one shot.
+3. The preview endpoint rate-limits aggressively: a live probe hit HTTP 429
+   after only two rapid successive calls. This is direct, empirical
+   justification for the circuit breaker below, not a hypothetical risk.
+4. Trade-flow records carry `partnerDesc: null` on every row (not populated
+   on this path) — human-readable partner names are resolved locally
+   instead, from a checked-in reference table (see `resolve_partner_country`
+   below), fetched live the same day from
+   `comtradeapi.un.org/files/v1/app/reference/partnerAreas.json`.
+
+**Unverified / inferred, logged here and in the final implementation report**
+(never fabricated, per the operating contract): the authenticated production
+path (`AUTHENTICATED_PATH` below, `Ocp-Apim-Subscription-Key` header) is
+real and documented (the official `comtradeapicall` Python client's README,
+and the standard Azure API-Management subscription-key convention that
+`comtradeapi.un.org` uses), but no real `COMTRADE_API_KEY` exists yet to
+independently confirm its response shape end-to-end. It is assumed
+schema-identical to the verified preview shape above (same underlying UN
+Comtrade dataset, gated differently — this is how UN Comtrade's own docs
+describe the preview/full distinction). `ComtradeClient` defaults to the
+verified preview path; `base_url`/the path constants are there to retarget
+once a real key exists — re-verify the first live authenticated call before
+trusting it in production.
+
+Reporter is fixed to India (`INDIA_REPORTER_CODE`, Comtrade code 699) — this
+whole project is an India-focused trade-data assistant throughout
+`docs/PHASE0-FINDINGS.md` and `docs/PLAN.md` (DGCIS/tradestat framing, ITC-HS
+comparisons, Indian-fiscal-year-vs-calendar-year caveat), and `TradeQuery`
+(the frozen v1 schema, `app/schemas/query.py`) deliberately has no
+reporter/country field — reporter is a fixed constant, not a per-request
+parameter.
 """
 
 from __future__ import annotations
 
+import csv
+import logging
+import time
+from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential_jitter
+
+logger = logging.getLogger(__name__)
+
+# --- Verified upstream constants (see module docstring for evidence) -------
+INDIA_REPORTER_CODE = "699"
+DEFAULT_BASE_URL = "https://comtradeapi.un.org"
+PREVIEW_PATH = "/public/v1/preview/C/A/HS"
+AUTHENTICATED_PATH = "/data/v1/get/C/A/HS"  # unverified live — see module docstring
+_SUBSCRIPTION_KEY_HEADER = "Ocp-Apim-Subscription-Key"
+
+_PARTNER_AREAS_CSV = Path(__file__).resolve().parents[2] / "data" / "comtrade-partner-areas.csv"
+
+_FLOW_CODES: dict[Literal["import", "export"], str] = {"import": "M", "export": "X"}
 
 
 class ComtradeRecord(BaseModel):
     """Normalized shape of a single UN Comtrade trade-flow record.
 
     This is our own client's normalized output, not a verbatim copy of the
-    upstream UN Comtrade response schema — the exact upstream field mapping
-    (`reporterCode`, `partnerCode`, `cifvalue`/`fobvalue`, `isReported`, ...)
-    is unverified against live API responses (per the "never fabricate"
-    rule) and is deferred to Phase 3 implementation against real responses.
+    upstream UN Comtrade response schema (that's `_RawComtradeRecord`,
+    below) — the exact upstream field mapping is now verified live (see
+    module docstring); `aggregate.py` consumes this normalized shape, not
+    upstream field names.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -39,28 +120,228 @@ class ComtradeRecord(BaseModel):
     is_provisional: bool
 
 
+class _RawComtradeRecord(BaseModel):
+    """Verbatim (subset of) the upstream UN Comtrade record shape, verified
+    live 2026-08-16 (see module docstring). `extra="ignore"`: upstream has
+    ~40 fields total; we only need the ones that feed `ComtradeRecord` plus
+    the completeness flags, and upstream is free to add fields over time
+    without breaking us."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    reporterCode: int
+    partnerCode: int
+    period: str
+    cmdCode: str
+    flowCode: str
+    primaryValue: float | None = None
+    cifvalue: float | None = None
+    fobvalue: float | None = None
+    isReported: bool
+    isAggregate: bool
+
+
+class _ComtradeEnvelope(BaseModel):
+    """Verbatim top-level response envelope, verified live 2026-08-16:
+    `{"elapsedTime": "...", "count": N, "data": [...], "error": ""}`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    count: int
+    data: list[_RawComtradeRecord]
+    error: str = ""
+
+
 class ComtradeClientError(Exception):
     """Base exception for all `ComtradeClient` failures (timeout, upstream
     error, circuit open)."""
+
+
+class ComtradeTimeoutError(ComtradeClientError):
+    """The request did not complete within `timeout_seconds`, even after
+    bounded retries. Maps to `ErrorResponse(error_code="UPSTREAM_TIMEOUT")`."""
+
+
+class ComtradeUpstreamError(ComtradeClientError):
+    """Upstream returned a non-2xx response, or a 2xx envelope with a
+    populated `error` field.
+
+    `retryable` distinguishes the two cases that share this exception type
+    but must NOT share retry behavior: a 429/5xx (or an `error`-field
+    response) is transient and worth retrying, but a 4xx other than 429
+    means *our own request* was malformed — retrying it verbatim cannot
+    succeed and would just burn retry budget (master brief §7.9: "bounded
+    retries only"). This is a plain `bool` attribute rather than two
+    exception classes so the retry predicate can inspect it without a second
+    `isinstance` branch, and so both cases still map to the same
+    `ErrorResponse(error_code="UPSTREAM_...")` family at the node layer.
+    """
+
+    def __init__(
+        self, message: str, *, status_code: int | None = None, retryable: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+class ComtradeSchemaValidationError(ComtradeClientError):
+    """The response body was not valid JSON, or did not match the verified
+    `_ComtradeEnvelope`/`_RawComtradeRecord` schema."""
+
+
+class ComtradeCircuitOpenError(ComtradeClientError):
+    """The circuit breaker is open (too many recent consecutive failures) —
+    failing fast without making a network call."""
+
+
+@lru_cache(maxsize=1)
+def _load_partner_names() -> dict[str, str]:
+    """Load the checked-in partner-code -> country/area-name reference
+    table (`data/comtrade-partner-areas.csv`), needed because live trade-flow
+    responses carry `partnerDesc: null` on every record (verified live,
+    module docstring point 4) — vendored the same way, and the same day, as
+    the HS taxonomy CSV (`docs/PHASE0-FINDINGS.md` §3's "static, versioned,
+    checked-in dataset" pattern), from
+    `comtradeapi.un.org/files/v1/app/reference/partnerAreas.json`.
+    """
+    names: dict[str, str] = {}
+    with _PARTNER_AREAS_CSV.open(encoding="utf-8", newline="") as fh:
+        for row in csv.DictReader(fh):
+            names[row["partner_code"]] = row["partner_desc"]
+    return names
+
+
+def resolve_partner_country(partner_code: str) -> str:
+    """Best-effort `partner_code` -> human-readable name lookup. Never
+    raises: an unmapped code (e.g. a future reference-table addition we
+    haven't refreshed yet) falls back to a labeled placeholder instead of
+    crashing the fetch — missing metadata is not the same failure class as
+    missing trade data, and must not take down the whole request."""
+    name = _load_partner_names().get(partner_code)
+    if name is None:
+        logger.warning("comtrade.unknown_partner_code partner_code=%s", partner_code)
+        return f"Unknown partner ({partner_code})"
+    return name
+
+
+def is_aggregate_partner_code(partner_code: str) -> bool:
+    """True iff `partner_code` is a non-country catch-all ("World", an ",
+    nes" regional bucket, "Bunkers", "Free Zones", "Special Categories" —
+    `docs/PHASE0-FINDINGS.md` §4/§5, `docs/PLAN.md` §6) that must be
+    stripped before top-10 partner-country ranking. Data-driven from the
+    same checked-in reference table, not a hand-maintained denylist prone to
+    drift — see `data/comtrade-partner-areas.csv`'s `is_aggregate_code`
+    column: true iff the code is `0` ("World"), `837`/`838`/`839`
+    ("Bunkers"/"Free Zones"/"Special Categories"), or the reference name
+    ends in ", nes" ("not elsewhere specified" — a regional catch-all
+    bucket, e.g. "Other Asia, nes")."""
+    names = _load_partner_names()
+    if partner_code not in names:
+        # Unknown to our reference table: treat conservatively as NOT an
+        # aggregate (i.e. keep it in ranking) rather than silently dropping
+        # a real, if newly-added, partner country.
+        return False
+    return _load_partner_aggregate_flags().get(partner_code, False)
+
+
+@lru_cache(maxsize=1)
+def _load_partner_aggregate_flags() -> dict[str, bool]:
+    flags: dict[str, bool] = {}
+    with _PARTNER_AREAS_CSV.open(encoding="utf-8", newline="") as fh:
+        for row in csv.DictReader(fh):
+            flags[row["partner_code"]] = row["is_aggregate_code"].strip().lower() == "true"
+    return flags
+
+
+class _CircuitBreaker:
+    """Minimal closed -> open -> half-open circuit breaker, scoped to one
+    `ComtradeClient` instance (and, via the process-wide singleton in
+    `get_comtrade_client`, effectively scoped to the whole running process —
+    the correct scope: it protects the app from hammering a struggling
+    upstream on behalf of any request, not just one).
+
+    Closed: calls proceed normally. After `failure_threshold` consecutive
+    failures: opens, and every call fails fast (`ComtradeCircuitOpenError`,
+    no network call) until `reset_timeout_seconds` has elapsed. Then:
+    half-open — the next call is allowed through as a trial; success closes
+    the circuit, failure re-opens it (with a fresh cooldown window).
+    """
+
+    def __init__(self, *, failure_threshold: int = 5, reset_timeout_seconds: float = 30.0) -> None:
+        self._failure_threshold = failure_threshold
+        self._reset_timeout_seconds = reset_timeout_seconds
+        self._consecutive_failures = 0
+        self._opened_at: float | None = None
+
+    def before_call(self) -> None:
+        if self._opened_at is None:
+            return
+        if (time.monotonic() - self._opened_at) >= self._reset_timeout_seconds:
+            return  # half-open: let one trial call through
+        raise ComtradeCircuitOpenError(
+            f"UN Comtrade circuit open after {self._consecutive_failures} consecutive "
+            f"failures; retry after a {self._reset_timeout_seconds}s cooldown"
+        )
+
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._opened_at = None
+
+    def record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._failure_threshold:
+            self._opened_at = time.monotonic()
+
+    @property
+    def is_open(self) -> bool:
+        return self._opened_at is not None
 
 
 class ComtradeClient:
     """Read-only client for the UN Comtrade API (comtradeapi.un.org).
 
     Owns: request timeout, bounded retry with jitter, a circuit breaker, and
-    (in `tests/integration/`) fixture-based record/replay.
+    (via the `transport` seam) fixture-based record/replay for tests —
+    `tests/integration/test_comtrade_client.py` injects `httpx.MockTransport`
+    so the exact same request-building/parsing/validation code path runs in
+    tests as in production, without ever touching the network.
     """
 
     def __init__(
         self,
         *,
         api_key: str,
-        base_url: str = "https://comtradeapi.un.org",
+        base_url: str = DEFAULT_BASE_URL,
         timeout_seconds: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+        max_attempts: int = 3,
+        circuit_breaker: _CircuitBreaker | None = None,
     ) -> None:
         self._api_key = api_key
-        self._base_url = base_url
-        self._timeout = httpx.Timeout(timeout_seconds)
+        self._max_attempts = max_attempts
+        self._circuit_breaker = circuit_breaker or _CircuitBreaker()
+        # Sent on every request, including preview-endpoint ones (harmless
+        # no-op there — confirmed live: preview calls succeed with zero auth
+        # headers) so the one code path already carries the header the
+        # authenticated endpoint requires, "threaded through for when a real
+        # key exists" per the brief.
+        headers = {_SUBSCRIPTION_KEY_HEADER: api_key} if api_key else {}
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            timeout=httpx.Timeout(timeout_seconds),
+            transport=transport,
+            headers=headers,
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> ComtradeClient:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
 
     async def fetch_flow(
         self,
@@ -70,5 +351,144 @@ class ComtradeClient:
         year_start: int,
         year_end: int,
     ) -> list[ComtradeRecord]:
-        """Fetch one trade-flow direction for an HS6 code across a year range."""
-        raise NotImplementedError  # TODO(Phase 3): implement against the verified Comtrade API.
+        """Fetch one trade-flow direction for an HS6 code across an
+        inclusive year range — India as reporter, every reporting partner
+        country/area for each year (docs/PLAN.md §2.2's `fetch_imports`/
+        `fetch_exports` nodes call this once each, in parallel).
+
+        One HTTP request per year (module docstring points 1-2): omitting
+        `partnerCode` returns the full partner breakdown for that year in a
+        single call, but a multi-year `period` was rejected live — so this
+        loops years, not partners.
+        """
+        if year_start > year_end:
+            raise ValueError(f"year_start ({year_start}) must be <= year_end ({year_end})")
+        flow_code = _FLOW_CODES[flow]
+        records: list[ComtradeRecord] = []
+        for year in range(year_start, year_end + 1):
+            records.extend(
+                await self._fetch_year(hs_code=hs_code, flow=flow, flow_code=flow_code, year=year)
+            )
+        return records
+
+    async def _fetch_year(
+        self, *, hs_code: str, flow: Literal["import", "export"], flow_code: str, year: int
+    ) -> list[ComtradeRecord]:
+        self._circuit_breaker.before_call()
+        params = {
+            "reporterCode": INDIA_REPORTER_CODE,
+            "period": str(year),
+            "cmdCode": hs_code,
+            "flowCode": flow_code,
+        }
+        try:
+            envelope = await self._get_with_retry(params)
+        except ComtradeClientError:
+            self._circuit_breaker.record_failure()
+            raise
+        self._circuit_breaker.record_success()
+        return [self._normalize(raw, hs_code=hs_code, flow=flow) for raw in envelope.data]
+
+    async def _get_with_retry(self, params: dict[str, str]) -> _ComtradeEnvelope:
+        """Bounded retry with jitter (master brief §7.9: "bounded retries
+        only... cap them"). Retries only timeouts and retryable upstream
+        statuses (429/5xx) — a 4xx other than 429 means our own request is
+        malformed and retrying it verbatim cannot help, so it is raised
+        straight through instead of burning retry budget."""
+
+        def _is_retryable(exc: BaseException) -> bool:
+            if isinstance(exc, ComtradeTimeoutError):
+                return True
+            if isinstance(exc, ComtradeUpstreamError):
+                return exc.retryable
+            return False
+
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(self._max_attempts),
+            wait=wait_exponential_jitter(initial=0.5, max=8.0),
+            retry=retry_if_exception(_is_retryable),
+            reraise=True,
+        )
+        result: _ComtradeEnvelope = await retrying(self._get_once, params)
+        return result
+
+    async def _get_once(self, params: dict[str, str]) -> _ComtradeEnvelope:
+        try:
+            response = await self._client.get(PREVIEW_PATH, params=params)
+        except httpx.TimeoutException as exc:
+            raise ComtradeTimeoutError(f"UN Comtrade request timed out: {exc}") from exc
+        except httpx.TransportError as exc:
+            raise ComtradeUpstreamError(f"UN Comtrade transport error: {exc}") from exc
+
+        if response.status_code == 429 or response.status_code >= 500:
+            raise ComtradeUpstreamError(
+                f"UN Comtrade returned retryable status {response.status_code}",
+                status_code=response.status_code,
+                retryable=True,
+            )
+        if response.status_code >= 400:
+            raise ComtradeUpstreamError(
+                f"UN Comtrade returned client error {response.status_code}: {response.text[:200]}",
+                status_code=response.status_code,
+                retryable=False,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ComtradeSchemaValidationError(
+                f"UN Comtrade response was not valid JSON: {exc}"
+            ) from exc
+        try:
+            envelope = _ComtradeEnvelope.model_validate(payload)
+        except ValidationError as exc:
+            raise ComtradeSchemaValidationError(
+                f"UN Comtrade response failed schema validation: {exc}"
+            ) from exc
+        if envelope.error:
+            # A populated `error` field on an otherwise-2xx envelope is an
+            # upstream-reported condition of unknown permanence (never
+            # observed on a live call during verification — see
+            # tests/fixtures/comtrade/README.md); treated as retryable, same
+            # as a 5xx, still bounded by max_attempts either way.
+            raise ComtradeUpstreamError(
+                f"UN Comtrade reported an error: {envelope.error}", retryable=True
+            )
+        return envelope
+
+    @staticmethod
+    def _normalize(
+        raw: _RawComtradeRecord, *, hs_code: str, flow: Literal["import", "export"]
+    ) -> ComtradeRecord:
+        # primaryValue is populated on every verified live record regardless
+        # of flow direction; cifvalue/fobvalue are the documented
+        # flow-specific fallbacks if a future response ever omits it.
+        value = raw.primaryValue
+        if value is None:
+            value = raw.cifvalue if flow == "import" else raw.fobvalue
+        return ComtradeRecord(
+            hs_code=hs_code,
+            flow=flow,
+            partner_code=str(raw.partnerCode),
+            partner_country=resolve_partner_country(str(raw.partnerCode)),
+            year=int(raw.period),
+            value=value,
+            is_provisional=not raw.isReported,
+        )
+
+
+@lru_cache(maxsize=1)
+def get_comtrade_client() -> ComtradeClient:
+    """Process-wide singleton (mirrors `app.settings.get_settings()`'s
+    pattern) — one pooled `httpx.AsyncClient` and one shared circuit breaker
+    reused across requests within this instance (docs/PLAN.md §1.2: v1 runs
+    one instance, no cross-replica cache/breaker state needed).
+
+    Tests never call this directly for real network behavior: they either
+    construct `ComtradeClient(transport=httpx.MockTransport(...))` directly,
+    or monkeypatch this factory where it's imported in `app.nodes.fetch_trade`.
+    """
+    from app.settings import get_settings
+
+    settings = get_settings()
+    return ComtradeClient(api_key=settings.comtrade_api_key)

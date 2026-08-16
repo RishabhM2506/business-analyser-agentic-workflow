@@ -1,0 +1,6 @@
+{
+  "elapsedTime": "0.05 secs",
+  "count": 0,
+  "data": [],
+  "error": "Synthetic fixture (not a live capture — see tests/fixtures/comtrade/README.md): exercises ComtradeClient's handling of a populated `error` field on an otherwise-2xx envelope."
+}

@@ -1,0 +1,311 @@
+partner_code,partner_desc,is_aggregate_code
+0,World,true
+4,Afghanistan,false
+8,Albania,false
+10,Antarctica,false
+12,Algeria,false
+16,American Samoa,false
+20,Andorra,false
+24,Angola,false
+28,Antigua and Barbuda,false
+31,Azerbaijan,false
+32,Argentina,false
+36,Australia,false
+40,Austria,false
+44,Bahamas,false
+48,Bahrain,false
+50,Bangladesh,false
+51,Armenia,false
+52,Barbados,false
+56,Belgium,false
+58,Belgium-Luxembourg (...1998),false
+60,Bermuda,false
+64,Bhutan,false
+68,Bolivia (Plurinational State of),false
+70,Bosnia Herzegovina,false
+72,Botswana,false
+74,Bouvet Island,false
+76,Brazil,false
+80,Br. Antarctic Terr.,false
+84,Belize,false
+86,Br. Indian Ocean Terr.,false
+90,Solomon Isds,false
+92,Br. Virgin Isds,false
+96,Brunei Darussalam,false
+100,Bulgaria,false
+104,Myanmar,false
+108,Burundi,false
+112,Belarus,false
+116,Cambodia,false
+120,Cameroon,false
+124,Canada,false
+129,"Caribbean, nes",true
+132,Cabo Verde,false
+136,Cayman Isds,false
+140,Central African Rep.,false
+144,Sri Lanka,false
+148,Chad,false
+152,Chile,false
+156,China,false
+158,"Taiwan, Province of China",false
+162,Christmas Isds,false
+166,Cocos Isds,false
+170,Colombia,false
+174,Comoros,false
+175,Mayotte (Overseas France),false
+178,Congo,false
+180,Dem. Rep. of the Congo,false
+184,Cook Isds,false
+188,Costa Rica,false
+191,Croatia,false
+192,Cuba,false
+196,Cyprus,false
+200,Czechoslovakia (...1992),false
+203,Czechia,false
+204,Benin,false
+208,Denmark,false
+212,Dominica,false
+214,Dominican Rep.,false
+218,Ecuador,false
+221,"Eastern Europe, nes",true
+222,El Salvador,false
+226,Equatorial Guinea,false
+230,Ethiopia (...1992),false
+231,Ethiopia,false
+232,Eritrea,false
+233,Estonia,false
+234,Faroe Isds,false
+238,Falkland Isds (Malvinas),false
+239,South Georgia and the South Sandwich Islands,false
+242,Fiji,false
+246,Finland,false
+248,Åland Islands,false
+250,Metropolitan France,false
+251,France,false
+254,French Guiana (Overseas France),false
+258,French Polynesia,false
+260,Fr. South Antarctic Terr.,false
+262,Djibouti,false
+266,Gabon,false
+268,Georgia,false
+270,Gambia,false
+275,State of Palestine,false
+276,Germany,false
+278,Dem. Rep. of Germany (...1990),false
+280,Fed. Rep. of Germany (...1990),false
+288,Ghana,false
+290,"Northern Africa, nes",true
+292,Gibraltar,false
+296,Kiribati,false
+300,Greece,false
+304,Greenland,false
+308,Grenada,false
+312,Guadeloupe (Overseas France),false
+316,Guam,false
+320,Guatemala,false
+324,Guinea,false
+328,Guyana,false
+332,Haiti,false
+334,Heard Island and McDonald Islands,false
+336,Holy See (Vatican City State),false
+340,Honduras,false
+344,"China, Hong Kong SAR",false
+348,Hungary,false
+352,Iceland,false
+356,India (...1974),false
+360,Indonesia,false
+364,Iran,false
+368,Iraq,false
+372,Ireland,false
+376,Israel,false
+380,Italy,false
+384,Côte d'Ivoire,false
+388,Jamaica,false
+392,Japan,false
+398,Kazakhstan,false
+400,Jordan,false
+404,Kenya,false
+408,Dem. People's Rep. of Korea,false
+410,Rep. of Korea,false
+412,Kosovo,false
+414,Kuwait,false
+417,Kyrgyzstan,false
+418,Lao People's Dem. Rep.,false
+422,Lebanon,false
+426,Lesotho,false
+428,Latvia,false
+430,Liberia,false
+434,Libya,false
+438,Liechtenstein,false
+440,Lithuania,false
+442,Luxembourg,false
+446,"China, Macao SAR",false
+450,Madagascar,false
+454,Malawi,false
+457,Sarawak,false
+458,Malaysia,false
+459,Peninsula Malaysia (...1963),false
+461,Sabah (...1963),false
+462,Maldives,false
+466,Mali,false
+470,Malta,false
+471,"CACM, nes",true
+472,"Africa CAMEU region, nes",true
+473,"LAIA, nes",true
+474,Martinique (Overseas France),false
+478,Mauritania,false
+480,Mauritius,false
+484,Mexico,false
+488,Midway Islands,false
+490,"Other Asia, nes",true
+492,"Europe EU, nes",true
+496,Mongolia,false
+498,Rep. of Moldova,false
+499,Montenegro,false
+500,Montserrat,false
+504,Morocco,false
+508,Mozambique,false
+512,Oman,false
+516,Namibia,false
+520,Nauru,false
+524,Nepal,false
+527,"Oceania, nes",true
+528,Netherlands,false
+530,Netherlands Antilles (...2010),false
+531,Curaçao,false
+532,Netherlands Antilles and Aruba (...1985),false
+533,Aruba,false
+534,Saint Maarten,false
+535,Bonaire,false
+536,Neutral Zone,false
+540,New Caledonia,false
+548,Vanuatu,false
+554,New Zealand,false
+558,Nicaragua,false
+562,Niger,false
+566,Nigeria,false
+568,"Other Europe, nes",true
+570,Niue,false
+574,Norfolk Isds,false
+577,"Other Africa, nes",true
+578,"Norway, excluding Svalbard and Jan Mayen",false
+579,Norway,false
+580,N. Mariana Isds,false
+581,United States Minor Outlying Islands,false
+582,Pacific Isds (...1991),false
+583,FS Micronesia,false
+584,Marshall Isds,false
+585,Palau,false
+586,Pakistan,false
+588,East and West Pakistan (...1971),false
+590,"Panama, excl.Canal Zone (...1977)",false
+591,Panama,false
+592,Panama-Canal-Zone (...1977),false
+598,Papua New Guinea,false
+600,Paraguay,false
+604,Peru,false
+608,Philippines,false
+612,Pitcairn,false
+616,Poland,false
+620,Portugal,false
+624,Guinea-Bissau,false
+626,Timor-Leste,false
+630,Puerto Rico,false
+634,Qatar,false
+636,"Rest of America, nes",true
+637,"North America and Central America, nes",true
+638,Réunion (Overseas France),false
+642,Romania,false
+643,Russian Federation,false
+646,Rwanda,false
+647,Ryukyu Isd,false
+652,Saint Barthélemy,false
+654,Saint Helena,false
+658,"Saint Kitts, Nevis and Anguilla (...1980)",false
+659,Saint Kitts and Nevis,false
+660,Anguilla,false
+662,Saint Lucia,false
+663,Saint Martin (French part),false
+666,Saint Pierre and Miquelon,false
+670,Saint Vincent and the Grenadines,false
+674,San Marino,false
+678,Sao Tome and Principe,false
+682,Saudi Arabia,false
+686,Senegal,false
+688,Serbia,false
+690,Seychelles,false
+694,Sierra Leone,false
+697,"Europe EFTA, nes",true
+698,"Sikkim, Protectorate of India (...1974)",false
+699,India,false
+702,Singapore,false
+703,Slovakia,false
+704,Viet Nam,false
+705,Slovenia,false
+706,Somalia,false
+710,South Africa,false
+711,Southern African Customs Union (...1999),false
+716,Zimbabwe,false
+717,Rhodesia Nyas (...1964),false
+720,Dem. Yemen (...1990),false
+724,Spain,false
+728,South Sudan,false
+729,Sudan,false
+732,Western Sahara,false
+736,Sudan (...2011),false
+740,Suriname,false
+744,Svalbard and Jan Mayen Islands,false
+748,Eswatini,false
+752,Sweden,false
+756,Switzerland,false
+757,Switzerland,false
+760,Syria,false
+762,Tajikistan,false
+764,Thailand,false
+768,Togo,false
+772,Tokelau,false
+776,Tonga,false
+780,Trinidad and Tobago,false
+784,United Arab Emirates,false
+788,Tunisia,false
+792,Türkiye,false
+795,Turkmenistan,false
+796,Turks and Caicos Isds,false
+798,Tuvalu,false
+800,Uganda,false
+804,Ukraine,false
+807,North Macedonia,false
+810,USSR (...1990),false
+818,Egypt,false
+826,United Kingdom,false
+830,Channel Islands,false
+831,Guernsey,false
+832,Jersey,false
+833,Isle of Man,false
+834,United Rep. of Tanzania,false
+835,Tanganyika (...1964),false
+836,Zanzibar and Pemba Isd (...1964),false
+837,Bunkers,true
+838,Free Zones,true
+839,Special Categories,true
+840,United States of America,false
+841,USA and Puerto Rico (...1980),false
+842,USA,false
+849,US Misc. Pacific Isds,false
+850,US Virgin Isds (...1980),false
+854,Burkina Faso,false
+858,Uruguay,false
+860,Uzbekistan,false
+862,Venezuela,false
+866,Dem. Rep. of Vietnam (...1974),false
+868,Rep. of Vietnam (...1974),false
+872,Wake Island,false
+876,Wallis and Futuna Isds,false
+879,"Western Asia, nes",true
+882,Samoa,false
+886,Arab Rep. of Yemen (...1990),false
+887,Yemen,false
+890,Yugoslavia (...1991),false
+891,Serbia and Montenegro (...2005),false
+894,Zambia,false
+899,"Areas, nes",true
