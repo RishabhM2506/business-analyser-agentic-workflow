@@ -259,6 +259,43 @@ async def test_post_message_extra_field_rejected_as_invalid_query(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "query_overrides",
+    [
+        {"year_start": 2025, "year_end": 2019},  # inverted range
+        {"year_start": 1950, "year_end": 2024},  # wider than the max span
+        {"year_start": -100, "year_end": -95},  # negative years
+    ],
+)
+async def test_post_message_invalid_year_range_returns_400_before_touching_upstream(
+    monkeypatch: pytest.MonkeyPatch, query_overrides: dict[str, int]
+) -> None:
+    """M10/QA-04: an inverted range previously silently 200d with an
+    empty-but-valid table, and a wide range triggered a proportionally
+    unbounded number of sequential upstream calls (QA-04 counted 150 real
+    HTTP calls for one 75-year-range request). All three cases here must
+    now be rejected as INVALID_QUERY before ever reaching the graph."""
+    calls: list[str] = []
+
+    def _tracking_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.params["period"])
+        return _handler_with_data(request)
+
+    _patch_comtrade(monkeypatch, handler=_tracking_handler)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(
+            f"/threads/{thread_id}/messages",
+            json={"hs_code": "010121", **query_overrides},
+        )
+
+    assert response.status_code == 400
+    assert _data(response)["error_code"] == "INVALID_QUERY"
+    assert calls == []  # rejected before any upstream fetch was ever attempted
+
+
+@pytest.mark.integration
 async def test_post_message_output_parser_exception_maps_to_schema_validation_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -76,6 +76,74 @@ def test_trade_query_accepts_free_text_fields_at_max_length(field: str) -> None:
     assert getattr(query, field) == "x" * 128
 
 
+# --- M10/QA-04: year_start/year_end bounds and ordering -----------------------
+# QA-04's three live reproductions against the unvalidated schema, each now
+# rejected instead of silently 200ing (inverted range) or triggering an
+# unbounded number of sequential upstream calls (wide range - QA-04 counted
+# 150 real HTTP calls for one 75-year-range request).
+
+
+@pytest.mark.unit
+def test_trade_query_rejects_inverted_year_range() -> None:
+    with pytest.raises(ValidationError):
+        TradeQuery(hs_code="010121", year_start=2025, year_end=2019)
+
+
+@pytest.mark.unit
+def test_trade_query_rejects_year_range_wider_than_the_max_span() -> None:
+    # QA-04's live reproduction: year_start=1950, year_end=2024 (75 years)
+    # triggered 150 real sequential upstream calls for one request.
+    with pytest.raises(ValidationError):
+        TradeQuery(hs_code="010121", year_start=1950, year_end=2024)
+
+
+@pytest.mark.unit
+def test_trade_query_accepts_year_range_exactly_at_the_max_span() -> None:
+    from app.schemas.query import MAX_YEAR_SPAN
+
+    year_end = 2023
+    year_start = year_end - MAX_YEAR_SPAN + 1
+    query = TradeQuery(hs_code="010121", year_start=year_start, year_end=year_end)
+    assert query.year_start == year_start
+
+
+@pytest.mark.unit
+def test_trade_query_rejects_negative_years() -> None:
+    with pytest.raises(ValidationError):
+        TradeQuery(hs_code="010121", year_start=-100, year_end=-95)
+
+
+@pytest.mark.unit
+def test_trade_query_rejects_year_before_earliest_supported_year() -> None:
+    from app.schemas.query import EARLIEST_SUPPORTED_YEAR
+
+    with pytest.raises(ValidationError):
+        TradeQuery(hs_code="010121", year_start=EARLIEST_SUPPORTED_YEAR - 1)
+
+
+@pytest.mark.unit
+def test_trade_query_rejects_absurdly_future_year() -> None:
+    with pytest.raises(ValidationError):
+        TradeQuery(hs_code="010121", year_end=datetime.now(UTC).year + 50)
+
+
+@pytest.mark.unit
+def test_trade_query_accepts_an_ordinary_recent_year_range() -> None:
+    query = TradeQuery(hs_code="010121", year_start=2019, year_end=2023)
+    assert query.year_start == 2019
+    assert query.year_end == 2023
+
+
+@pytest.mark.unit
+def test_trade_query_single_year_field_alone_is_not_range_checked() -> None:
+    # Only year_start or only year_end provided (the other left to default
+    # via app.nodes.validate_query.resolve_year_range) - the ordering/span
+    # model_validator only fires once both are concretely known, so a
+    # single, individually-valid year must not be rejected here.
+    assert TradeQuery(hs_code="010121", year_start=2019).year_start == 2019
+    assert TradeQuery(hs_code="010121", year_end=2023).year_end == 2023
+
+
 def _sample_trade_table() -> TradeTable:
     return TradeTable(
         unit="USD",
