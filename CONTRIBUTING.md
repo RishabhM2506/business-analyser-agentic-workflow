@@ -1,7 +1,11 @@
 # Contributing
 
-This is a private repository (see `LICENSE`). This document covers the mechanics of
-contributing, for whoever has access.
+This repository is public on GitHub (GitHub blocks branch protection on private repos without a
+paid plan, and this project uses branch protection — a deliberate, accepted trade-off, not an
+oversight). It is not open-source: see `LICENSE` — all rights reserved, no license is granted to
+external contributors. No secrets are ever committed regardless of visibility (enforced by
+`.gitignore`/`.dockerignore` and secret-scanning CI on every push). This document covers the
+mechanics of contributing, for whoever has access.
 
 ## Commit convention
 
