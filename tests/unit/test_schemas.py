@@ -57,6 +57,25 @@ def test_trade_query_rejects_unknown_fields() -> None:
         TradeQuery.model_validate({"hs_code": "010121", "unexpected_field": "x"})
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("field", ["partner_region", "tenant_id", "user_id"])
+def test_trade_query_rejects_free_text_fields_over_max_length(field: str) -> None:
+    """B9/QA-02: a within-the-request-body-size-limit but still-abusive
+    single field must be rejected by Pydantic itself, not just the ASGI-
+    level body-size middleware (`app/main.py`'s
+    `request_size_limit_middleware`) - the two controls are named together
+    in the master brief and neither alone closes the gap."""
+    with pytest.raises(ValidationError):
+        TradeQuery(hs_code="010121", **{field: "x" * 129})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("field", ["partner_region", "tenant_id", "user_id"])
+def test_trade_query_accepts_free_text_fields_at_max_length(field: str) -> None:
+    query = TradeQuery(hs_code="010121", **{field: "x" * 128})
+    assert getattr(query, field) == "x" * 128
+
+
 def _sample_trade_table() -> TradeTable:
     return TradeTable(
         unit="USD",

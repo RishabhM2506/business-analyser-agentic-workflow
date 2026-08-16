@@ -525,6 +525,48 @@ async def test_post_message_different_hs_code_does_not_hit_response_cache(
 
 
 @pytest.mark.integration
+async def test_post_message_oversized_body_rejected_with_413(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B9/QA-02: no request body-size limit existed anywhere in the stack -
+    QA-02 live-reproduced a 5MB field being fully accepted, processed, and
+    durably checkpointed (105MB SQLite growth from one request).
+    `request_size_limit_middleware` (app/main.py) now rejects this before
+    the body is ever parsed into `TradeQuery` at all - well before the
+    Comtrade transport is even reachable, so `_patch_comtrade` isn't needed
+    here."""
+    thread_id = str(uuid.uuid4())
+    # Comfortably over the default 64KB ceiling (app/settings.py's
+    # max_request_body_bytes) - httpx computes a real Content-Length from
+    # this actual body, so the middleware's header-only check is exercised
+    # for real, not simulated.
+    oversized_payload = {"hs_code": "010121", "partner_region": "A" * (100 * 1024)}
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(f"/threads/{thread_id}/messages", json=oversized_payload)
+
+    assert response.status_code == 413
+    body = _data(response)
+    assert body["error_code"] == "REQUEST_TOO_LARGE"
+    assert body["retryable"] is False
+
+
+@pytest.mark.integration
+async def test_post_message_body_within_limit_is_not_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanity check paired with the oversized-body test above: an ordinary,
+    well-within-limit request must not be caught by the new middleware."""
+    _patch_comtrade(monkeypatch)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
+
+    assert response.status_code == 200
+
+
+@pytest.mark.integration
 async def test_post_message_budget_exceeded_maps_to_429(monkeypatch: pytest.MonkeyPatch) -> None:
     # `app.budget.get_budget_tracker` is a module-level singleton keyed off
     # the *global* `get_settings()`, like every other singleton factory in
