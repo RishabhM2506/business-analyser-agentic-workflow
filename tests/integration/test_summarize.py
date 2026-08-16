@@ -12,6 +12,7 @@ import pytest
 from pydantic import BaseModel
 
 import app.nodes.summarize as summarize_module
+from app.budget import BudgetTracker
 from app.models import MockLLM
 from app.nodes.summarize import SummarizeOutput, summarize
 from app.schemas.errors import ErrorResponse
@@ -20,6 +21,17 @@ from app.schemas.response import CountryRow, TradeTable
 from app.state import AnalysisState
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def _patch_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Fresh, generous-ceiling tracker per test (isolated from the
+    # process-wide singleton) — these tests cover `summarize`'s own
+    # behavior, not budget enforcement (see `tests/unit/test_budget.py`).
+    monkeypatch.setattr(
+        summarize_module,
+        "get_budget_tracker",
+        lambda: BudgetTracker(max_calls_per_thread=100, max_calls_per_day=100),
+    )
 
 
 def _table() -> TradeTable:
@@ -71,10 +83,12 @@ class _GroundedModelClient:
 @pytest.mark.integration
 async def test_summarize_writes_analytical_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(summarize_module, "get_model_for_role", lambda role, provider: MockLLM())
+    _patch_budget(monkeypatch)
     state: AnalysisState = {
         "query": TradeQuery(hs_code="010121"),
         "imports_table": _table(),
         "exports_table": _table(),
+        "thread_id": "t-summarize-1",
     }
 
     result = await summarize(state)
@@ -88,10 +102,12 @@ async def test_summarize_grounded_output_passes_through(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         summarize_module, "get_model_for_role", lambda role, provider: _GroundedModelClient()
     )
+    _patch_budget(monkeypatch)
     state: AnalysisState = {
         "query": TradeQuery(hs_code="010121"),
         "imports_table": _table(),
         "exports_table": _table(),
+        "thread_id": "t-summarize-2",
     }
 
     result = await summarize(state)
@@ -106,10 +122,12 @@ async def test_summarize_fabricated_number_is_caught_by_output_guardrail(
     monkeypatch.setattr(
         summarize_module, "get_model_for_role", lambda role, provider: _FabricatingModelClient()
     )
+    _patch_budget(monkeypatch)
     state: AnalysisState = {
         "query": TradeQuery(hs_code="010121"),
         "imports_table": _table(),
         "exports_table": _table(),
+        "thread_id": "t-summarize-3",
         "trace_id": "t-99",
     }
 
@@ -125,6 +143,7 @@ async def test_summarize_fabricated_number_is_caught_by_output_guardrail(
 @pytest.mark.integration
 async def test_summarize_short_circuits_on_existing_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(summarize_module, "get_model_for_role", lambda role, provider: MockLLM())
+    _patch_budget(monkeypatch)
     state: AnalysisState = {
         "error": ErrorResponse(error_code="X", message="x", retryable=False, trace_id="t")
     }
@@ -136,8 +155,55 @@ async def test_summarize_defensive_noop_when_state_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(summarize_module, "get_model_for_role", lambda role, provider: MockLLM())
+    _patch_budget(monkeypatch)
     assert await summarize({}) == {}
     assert await summarize({"query": TradeQuery(hs_code="010121")}) == {}
+    # tables present but no thread_id: still a defensive no-op (see
+    # `app/state.py`'s `thread_id` field docstring).
+    assert (
+        await summarize(
+            {
+                "query": TradeQuery(hs_code="010121"),
+                "imports_table": _table(),
+                "exports_table": _table(),
+            }
+        )
+        == {}
+    )
+
+
+@pytest.mark.integration
+async def test_summarize_budget_exceeded_short_circuits_without_calling_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def _tracking_mock_llm(role: str, provider: str) -> MockLLM:
+        nonlocal called
+        called = True
+        return MockLLM()
+
+    monkeypatch.setattr(summarize_module, "get_model_for_role", _tracking_mock_llm)
+    monkeypatch.setattr(
+        summarize_module,
+        "get_budget_tracker",
+        lambda: BudgetTracker(max_calls_per_thread=0, max_calls_per_day=100),
+    )
+    state: AnalysisState = {
+        "query": TradeQuery(hs_code="010121"),
+        "imports_table": _table(),
+        "exports_table": _table(),
+        "thread_id": "t-summarize-budget",
+        "trace_id": "t-77",
+    }
+
+    result = await summarize(state)
+
+    assert called is False
+    assert "analytical_summary" not in result
+    error = result["error"]
+    assert error.error_code == "BUDGET_EXCEEDED"
+    assert error.trace_id == "t-77"
 
 
 @pytest.mark.integration

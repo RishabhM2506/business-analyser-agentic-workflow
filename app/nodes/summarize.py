@@ -11,6 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.budget import BudgetExceededError, get_budget_tracker
 from app.guardrails import check_numbers_grounded
 from app.models import get_model_for_role
 from app.schemas.errors import ErrorResponse
@@ -92,8 +93,23 @@ async def summarize(state: AnalysisState) -> dict[str, Any]:
     query = state.get("query")
     imports_table = state.get("imports_table")
     exports_table = state.get("exports_table")
-    if query is None or imports_table is None or exports_table is None:
+    thread_id = state.get("thread_id")
+    if query is None or imports_table is None or exports_table is None or thread_id is None:
         return {}
+
+    try:
+        await get_budget_tracker().check_and_increment(
+            thread_id=thread_id, tenant_id=query.tenant_id
+        )
+    except BudgetExceededError:
+        return {
+            "error": ErrorResponse(
+                error_code="BUDGET_EXCEEDED",
+                message="The model-call budget for this thread or day has been reached.",
+                retryable=True,
+                trace_id=get_or_mint_trace_id(state),
+            )
+        }
 
     settings = get_settings()
     client = get_model_for_role("analysis", provider=settings.llm_provider)

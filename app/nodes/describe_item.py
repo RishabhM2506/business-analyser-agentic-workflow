@@ -10,9 +10,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.budget import BudgetExceededError, get_budget_tracker
 from app.models import get_model_for_role
+from app.schemas.errors import ErrorResponse
 from app.settings import get_settings
-from app.state import AnalysisState, has_error
+from app.state import AnalysisState, get_or_mint_trace_id, has_error
 
 PROMPT_VERSION = "describe_item-v1"
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "describe_item.md"
@@ -47,8 +49,26 @@ async def describe_item(state: AnalysisState) -> dict[str, Any]:
         return {}
     query = state.get("query")
     taxonomy_text = state.get("taxonomy_text")
-    if query is None or taxonomy_text is None:
+    thread_id = state.get("thread_id")
+    if query is None or taxonomy_text is None or thread_id is None:
         return {}
+
+    try:
+        await get_budget_tracker().check_and_increment(
+            thread_id=thread_id, tenant_id=query.tenant_id
+        )
+    except BudgetExceededError:
+        # Checked immediately before the call it would fund, not after
+        # (docs/PLAN.md §5.5: fails closed) — no model spend happens on
+        # this branch.
+        return {
+            "error": ErrorResponse(
+                error_code="BUDGET_EXCEEDED",
+                message="The model-call budget for this thread or day has been reached.",
+                retryable=True,
+                trace_id=get_or_mint_trace_id(state),
+            )
+        }
 
     settings = get_settings()
     client = get_model_for_role("utility", provider=settings.llm_provider)

@@ -11,6 +11,7 @@ import pytest
 from tests.llm.cassette import CASSETTES_DIR, CassetteModelClient
 
 import app.nodes.describe_item as describe_item_module
+from app.budget import BudgetTracker
 from app.knowledge.provider import build_taxonomy_text
 from app.nodes.describe_item import describe_item
 from app.schemas.query import TradeQuery
@@ -26,10 +27,22 @@ async def test_describe_item_replays_cassette_for_real_hs6_codes(
 ) -> None:
     cassette = CassetteModelClient(_DESCRIBE_ITEM_CASSETTES / f"{hs_code}.json")
     monkeypatch.setattr(describe_item_module, "get_model_for_role", lambda role, provider: cassette)
+    # Fresh, generous-ceiling tracker per parametrized case (isolated from
+    # the process-wide singleton) — this test proves cassette replay, not
+    # budget enforcement.
+    monkeypatch.setattr(
+        describe_item_module,
+        "get_budget_tracker",
+        lambda: BudgetTracker(max_calls_per_thread=100, max_calls_per_day=100),
+    )
 
     taxonomy_text = build_taxonomy_text(hs_code)
     assert taxonomy_text is not None  # all three are real checked-in HS6 codes
-    state: AnalysisState = {"query": TradeQuery(hs_code=hs_code), "taxonomy_text": taxonomy_text}
+    state: AnalysisState = {
+        "query": TradeQuery(hs_code=hs_code),
+        "taxonomy_text": taxonomy_text,
+        "thread_id": f"llm-describe-{hs_code}",
+    }
 
     result = await describe_item(state)
 
