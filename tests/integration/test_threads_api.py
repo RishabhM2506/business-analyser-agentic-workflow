@@ -602,6 +602,42 @@ async def test_post_message_body_within_limit_is_not_rejected(
 
 
 @pytest.mark.integration
+async def test_post_message_rate_limited_client_gets_429_before_touching_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M5/AWR-07/ARCH-04: rate limiting was fully unimplemented despite
+    being an explicit, named, non-negotiable requirement (master brief §8:
+    "rate limiting per IP/tenant before any model spend occurs") and despite
+    `.env.example` presenting `RATE_LIMIT_PER_MINUTE` as if it were live.
+    A client over its per-minute ceiling must be rejected with 429 before
+    the request reaches the hs_code allowlist check, the response cache, or
+    the graph at all."""
+    calls: list[str] = []
+
+    def _tracking_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.params["period"])
+        return _handler_with_data(request)
+
+    _patch_comtrade(monkeypatch, handler=_tracking_handler)
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings(rate_limit_per_minute=1)) as client:
+        first = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
+        calls_after_first = len(calls)
+        # A *different* thread_id, from the same client - the rate limit is
+        # per client (IP), not per thread, so this must still be rejected.
+        second = await client.post(f"/threads/{uuid.uuid4()}/messages", json={"hs_code": "010121"})
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    body = _data(second)
+    assert body["error_code"] == "RATE_LIMITED"
+    assert body["retryable"] is True
+    # The rejected second request never reached the Comtrade fetch at all.
+    assert len(calls) == calls_after_first
+
+
+@pytest.mark.integration
 async def test_post_message_budget_exceeded_maps_to_429(monkeypatch: pytest.MonkeyPatch) -> None:
     # `app.budget.get_budget_tracker` is a module-level singleton keyed off
     # the *global* `get_settings()`, like every other singleton factory in

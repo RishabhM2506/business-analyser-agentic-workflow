@@ -11,6 +11,13 @@ docs/PLAN.md §3.3).
 
 Guardrail ordering (docs/PLAN.md §1.1's Gateway -> Guard -> Graph, master
 brief's "nothing reaches a model before validation"):
+0. Three ASGI middlewares run ahead of route dispatch entirely, in this
+   order (outermost first — see each one's own docstring for why
+   registration order in `create_app` produces this): `rate_limit_middleware`
+   (finding M5/AWR-07/ARCH-04) -> `request_size_limit_middleware` (finding
+   B9/QA-02) -> `request_id_middleware`. A rate-limited or oversized
+   request never reaches FastAPI's own body parsing, `TradeQuery`
+   validation, or a single line of the numbered guardrails below.
 1. FastAPI parses the request body into `TradeQuery` (or a malformed body
    is turned into an `ErrorResponse` by `handle_validation_error` below,
    never FastAPI's default `{"detail": [...]}` shape — docs/PLAN.md §3.2:
@@ -68,6 +75,7 @@ from app.graph import COMBINED_PROMPT_VERSION, build_checkpointer, build_graph
 from app.guardrails import check_hs_code_allowlisted
 from app.nodes.validate_query import resolve_year_range
 from app.observability import build_trace_metadata, configure_langsmith_tracing
+from app.rate_limit import RateLimiter
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
 from app.schemas.response import TradeAnalysisResponse
@@ -97,6 +105,7 @@ _ERROR_STATUS_CODES: dict[str, int] = {
     "INTERNAL_ERROR": 500,
     "THREAD_NOT_FOUND": 404,
     "REQUEST_TOO_LARGE": 413,
+    "RATE_LIMITED": 429,
 }
 
 
@@ -300,6 +309,47 @@ async def request_size_limit_middleware(
     return await call_next(request)
 
 
+async def rate_limit_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Reject a request with 429 if the client IP has exceeded
+    `settings.rate_limit_per_minute` (finding M5/AWR-07/ARCH-04: rate
+    limiting was fully unimplemented despite being an explicit, named,
+    non-negotiable requirement — master brief §8: "rate limiting per
+    IP/tenant before any model spend occurs" — and despite `.env.example`
+    presenting `RATE_LIMIT_PER_MINUTE` as if it were already live).
+
+    Registered *after* `request_id_middleware`/`request_size_limit_middleware`
+    in `create_app`, which — same registration-order behavior documented on
+    `request_size_limit_middleware` above — means it actually runs *before*
+    both of them: a client already over its ceiling is rejected before the
+    request-ID/logging layer even sees it, and well before
+    `check_hs_code_allowlisted`, the response cache, or the graph.
+
+    Client IP is read from `request.client.host` — the direct ASGI peer
+    address. v1 has no documented reverse-proxy/CDN in front of it
+    (docs/PLAN.md's own architecture diagram draws the FastAPI edge as the
+    first hop), so trusting `request.client.host` directly is correct for
+    this deployment shape; parsing `X-Forwarded-For` unconditionally would
+    itself be a spoofing vector without a trusted-proxy allowlist this v1
+    doesn't have, so that's deliberately not attempted here.
+    """
+    rate_limiter: RateLimiter = request.app.state.rate_limiter
+    client_ip = request.client.host if request.client is not None else "unknown"
+    allowed = await rate_limiter.check_and_consume(client_ip)
+    if not allowed:
+        return _model_response(
+            ErrorResponse(
+                error_code="RATE_LIMITED",
+                message="Too many requests. Please slow down and try again shortly.",
+                retryable=True,
+                trace_id=str(uuid.uuid4()),
+            ),
+            status_code=_status_code_for_error("RATE_LIMITED"),
+        )
+    return await call_next(request)
+
+
 async def check_database(database_url: str) -> None:
     """Open a real connection against `database_url` and run a trivial
     query. Raises on any failure — callers decide what that means for their
@@ -355,8 +405,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Per-app-instance, matching `app.state.settings`/`app.state.compiled_graph`
     # rather than a process-wide singleton (unlike `get_budget_tracker()`
     # etc.) — each test creates its own `create_app()`, and thread locks
-    # must never leak across independently-created apps (finding B4).
+    # must never leak across independently-created apps (finding B4). The
+    # rate limiter (finding M5) is per-app-instance for the identical
+    # reason: a process-wide singleton would leak rate-limit state across
+    # every test in the suite that creates its own app.
     app.state.thread_locks = _ThreadLockRegistry()
+    app.state.rate_limiter = RateLimiter(
+        requests_per_minute=resolved_settings.rate_limit_per_minute
+    )
 
     app.middleware("http")(request_id_middleware)
     # Registered *after* request_id_middleware so it runs *before* it (see
@@ -365,6 +421,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # even the request-ID/logging layer, not just ahead of the graph
     # (finding B9/QA-02).
     app.middleware("http")(request_size_limit_middleware)
+    # Registered last of the three, so it runs first of all — a client
+    # already over its rate ceiling is rejected before anything else in
+    # this stack does any work at all (finding M5/AWR-07/ARCH-04).
+    app.middleware("http")(rate_limit_middleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=resolved_settings.cors_allowed_origins,
