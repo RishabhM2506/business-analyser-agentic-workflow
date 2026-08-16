@@ -20,28 +20,55 @@ from typing import Any
 
 from app.schemas.response import CountryRow, TradeTable
 from app.state import AnalysisState, has_error
-from app.tools.comtrade_client import ComtradeRecord, is_aggregate_partner_code
+from app.tools.comtrade_client import (
+    INDIA_REPORTER_CODE,
+    ComtradeRecord,
+    is_aggregate_partner_code,
+)
 
 TOP_N_PARTNERS = 10
 
 
+def _is_excluded_partner_code(partner_code: str) -> bool:
+    """True iff `partner_code` must be stripped before top-10 ranking:
+    either a non-country aggregate/catch-all code (`is_aggregate_partner_code`
+    — "World", an ", nes" regional bucket, "Bunkers", "Free Zones", "Special
+    Categories") or the reporter's own code (finding M20/PBO-02).
+
+    The fixed reporter, India (`INDIA_REPORTER_CODE`), can never
+    legitimately be its own bilateral trading partner — but Comtrade
+    sometimes carries reporter=partner rows anyway (e.g. re-imports or
+    returned-goods categories; live-reproduced on HS 851713, where India
+    appeared as one of its own top-10 import "partners," unexplained). Left
+    unfiltered, that row is exactly the kind of unexplained, ownership-
+    eroding artifact that makes a sharp user distrust every other number in
+    the table on sight. `is_aggregate_partner_code` doesn't (and
+    semantically shouldn't) cover this case on its own — India's code isn't
+    a "non-country catch-all," it's a real country that just can't
+    legitimately appear here — so this composes both checks rather than
+    changing that function's own meaning."""
+    return is_aggregate_partner_code(partner_code) or partner_code == INDIA_REPORTER_CODE
+
+
 def strip_aggregate_partners(records: list[ComtradeRecord]) -> list[ComtradeRecord]:
-    """Drop records whose `partner_code` is a non-country catch-all ("World",
-    an ", nes" regional bucket, "Bunkers", "Free Zones", "Special
-    Categories" — see `app.tools.comtrade_client.is_aggregate_partner_code`)
-    before ranking. `docs/PLAN.md` §6: "the model never sees, and therefore
-    cannot mis-transcribe or invent, a ranking decision" — this is also why
-    it happens here, deterministically, rather than being left for a prompt
-    instruction to the model."""
-    return [r for r in records if not is_aggregate_partner_code(r.partner_code)]
+    """Drop records whose `partner_code` must never appear as a ranked
+    trading partner — a non-country catch-all ("World", an ", nes" regional
+    bucket, "Bunkers", "Free Zones", "Special Categories" — see
+    `app.tools.comtrade_client.is_aggregate_partner_code`) or the reporter's
+    own code (finding M20/PBO-02) — before ranking. `docs/PLAN.md` §6: "the
+    model never sees, and therefore cannot mis-transcribe or invent, a
+    ranking decision" — this is also why it happens here, deterministically,
+    rather than being left for a prompt instruction to the model."""
+    return [r for r in records if not _is_excluded_partner_code(r.partner_code)]
 
 
 def find_excluded_partner_codes(records: list[ComtradeRecord]) -> list[str]:
-    """The distinct aggregate/catch-all partner codes actually present in
+    """The distinct excluded partner codes (aggregate/catch-all, or the
+    reporter's own — see `_is_excluded_partner_code`) actually present in
     `records` (before stripping) — transparency about what was excluded
     from *this* result specifically, not a generic static reference list
     (`TradeTable.excluded_partner_codes`, docs/PLAN.md §3.2)."""
-    return sorted({r.partner_code for r in records if is_aggregate_partner_code(r.partner_code)})
+    return sorted({r.partner_code for r in records if _is_excluded_partner_code(r.partner_code)})
 
 
 def _cumulative_value(values_by_year: dict[int, float | None]) -> float:
