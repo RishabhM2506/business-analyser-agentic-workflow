@@ -25,9 +25,12 @@ import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import app.nodes.describe_item as describe_item_module
 import app.nodes.fetch_trade as fetch_trade_module
+import app.nodes.summarize as summarize_module
 from app.cache.tool_cache import ToolCache
 from app.main import REQUEST_ID_HEADER, create_app
+from app.models import MockLLM
 from app.settings import Settings
 from app.tools.comtrade_client import ComtradeClient
 
@@ -63,6 +66,24 @@ def _patch_comtrade(
     client = ComtradeClient(api_key="test-key", transport=httpx.MockTransport(handler))
     monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client)
     monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: ToolCache())
+
+
+@pytest.fixture(autouse=True)
+def _isolated_response_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The application response cache (finding B8/AWR-01, `app/main.py`'s
+    `post_message`) is a real process-wide singleton, the same pattern as
+    `app.budget.get_budget_tracker` — but unlike the tool cache/Comtrade
+    client (each test already injects its own via `_patch_comtrade`), no
+    test here patches `get_response_cache` individually, and many tests in
+    this file reuse the same `hs_code` (e.g. "010121"). Without resetting
+    the singleton before every test, an EARLIER test populating the cache
+    could silently serve its cached response to a LATER, unrelated test
+    that happens to request the same `(hs_code, year_range)` — a real,
+    easy-to-hit test-isolation bug, not a hypothetical one, now that the
+    cache is actually wired up."""
+    import app.cache.response_cache as response_cache_module
+
+    monkeypatch.setattr(response_cache_module, "_response_cache_singleton", None)
 
 
 def _isolated_settings(**overrides: object) -> Settings:
@@ -423,6 +444,84 @@ async def test_post_message_after_earlier_failure_on_same_thread_is_not_replayed
     # not the earlier failure.
     assert fetched.status_code == 200
     assert _data(fetched)["hs_code"] == "160100"
+
+
+@pytest.mark.integration
+async def test_post_message_same_hs_code_and_year_range_hits_response_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B8/AWR-01: the response cache (`app/cache/response_cache.py`) was
+    fully implemented but never called from any request path, so every
+    repeat request for an already-analyzed `(hs_code, year_range)` re-ran
+    both model calls - falsifying docs/PLAN.md §5.2's bounded-lifetime-spend
+    claim (spend scaled with request volume, not distinct-code count).
+    Posting the same query twice (different threads, so this isn't just
+    re-exercising the per-thread budget) must call the model client exactly
+    once, total - the second request is served entirely from cache."""
+    _patch_comtrade(monkeypatch)
+
+    call_count = 0
+
+    def _counting_get_model_for_role(role: str, provider: str) -> MockLLM:
+        nonlocal call_count
+        call_count += 1
+        return MockLLM()
+
+    monkeypatch.setattr(describe_item_module, "get_model_for_role", _counting_get_model_for_role)
+    monkeypatch.setattr(summarize_module, "get_model_for_role", _counting_get_model_for_role)
+
+    query = {"hs_code": "010121", "year_start": 2021, "year_end": 2022}
+    async with _client_for(_isolated_settings()) as client:
+        first = await client.post(f"/threads/{uuid.uuid4()}/messages", json=query)
+        second = await client.post(f"/threads/{uuid.uuid4()}/messages", json=query)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    # Exactly the 2 calls (describe_item + summarize) the FIRST request
+    # made - the second request adds zero, since it's a cache hit.
+    assert call_count == 2
+
+    first_body = _data(first)
+    second_body = _data(second)
+    # A cache hit still returns identity fields for the *current* request's
+    # own thread, not a stale replay of the first request's.
+    assert second_body["thread_id"] != first_body["thread_id"]
+    assert second_body["message_id"] != first_body["message_id"]
+    # But the actual analysis content - the part the cache exists to reuse
+    # - is identical.
+    assert second_body["item_description"] == first_body["item_description"]
+    assert second_body["analytical_summary"] == first_body["analytical_summary"]
+    assert second_body["imports"] == first_body["imports"]
+    assert second_body["exports"] == first_body["exports"]
+
+
+@pytest.mark.integration
+async def test_post_message_different_hs_code_does_not_hit_response_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The response cache key includes `hs_code` - a genuinely different
+    code must never be served another code's cached analysis, and must
+    still call the model."""
+    _patch_comtrade(monkeypatch)
+
+    call_count = 0
+
+    def _counting_get_model_for_role(role: str, provider: str) -> MockLLM:
+        nonlocal call_count
+        call_count += 1
+        return MockLLM()
+
+    monkeypatch.setattr(describe_item_module, "get_model_for_role", _counting_get_model_for_role)
+    monkeypatch.setattr(summarize_module, "get_model_for_role", _counting_get_model_for_role)
+
+    async with _client_for(_isolated_settings()) as client:
+        first = await client.post(f"/threads/{uuid.uuid4()}/messages", json={"hs_code": "010121"})
+        second = await client.post(f"/threads/{uuid.uuid4()}/messages", json={"hs_code": "160100"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert call_count == 4  # 2 model calls per request, neither served from cache
+    assert _data(second)["hs_code"] == "160100"
 
 
 @pytest.mark.integration

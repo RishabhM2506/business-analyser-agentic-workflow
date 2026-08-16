@@ -21,7 +21,18 @@ brief's "nothing reaches a model before validation"):
    it: this is cheap (an in-process, `lru_cache`d CSV lookup) and means an
    adversarial/invalid code is rejected before a checkpoint write or any
    graph superstep, not just before a model call.
-3. The model-call budget is checked inside the two model-call nodes
+3. The application response cache (`app/cache/response_cache.py`,
+   docs/PLAN.md §5.4 level 2) is checked next, still before the graph runs
+   at all — a hit skips the graph (and therefore both model calls)
+   entirely (finding B8/AWR-01: this cache was fully implemented but never
+   wired into any request path before, so lifetime model spend scaled with
+   request volume rather than being bounded by distinct-code count as
+   docs/PLAN.md §5.2 claims). A cache hit is served directly, with only
+   `thread_id`/`message_id` substituted for the current request — it does
+   *not* write a checkpoint for this `thread_id`/message (see
+   `post_message`'s own comment at the cache-hit branch for the resulting,
+   deliberate `GET /threads/{id}` scope boundary).
+4. The model-call budget is checked inside the two model-call nodes
    themselves (`describe_item`/`summarize`, `app/budget.py`), immediately
    before each call — not redundantly pre-checked here. A pre-check here
    would have to either skip incrementing (pointless) or increment for a
@@ -51,8 +62,10 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app.cache.response_cache import filter_hash, get_response_cache
 from app.graph import COMBINED_PROMPT_VERSION, build_checkpointer, build_graph
 from app.guardrails import check_hs_code_allowlisted
+from app.nodes.validate_query import resolve_year_range
 from app.observability import build_trace_metadata, configure_langsmith_tracing
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
@@ -422,6 +435,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=400,
             )
 
+        # Resolved the same way `validate_query` resolves it in-graph (same
+        # function, called a second time here — cheap and side-effect-free)
+        # so the cache key's `year_range` component reflects concrete years
+        # even when the caller left `year_start`/`year_end` as `None`
+        # (finding B8/AWR-01).
+        year_range = resolve_year_range(query)
+        response_cache = get_response_cache()
+        cached_response = await response_cache.get(
+            hs_code=query.hs_code,
+            year_range=year_range,
+            filter_hash=filter_hash(query),
+            prompt_version=COMBINED_PROMPT_VERSION,
+        )
+        if cached_response is not None:
+            # Served without ever invoking the graph — zero additional
+            # model spend for a repeat of an already-analyzed
+            # (hs_code, year_range, filters, prompt_version) combination,
+            # which is the whole point of this cache (docs/PLAN.md §5.2).
+            # `thread_id`/`message_id` are per-request identity, not part
+            # of "the analysis" itself, so they're substituted for the
+            # *current* request rather than replayed from whichever
+            # request originally populated this cache entry.
+            #
+            # Deliberate scope boundary: this does NOT write a checkpoint
+            # for `thread_id` — a cache hit on a brand new thread's first
+            # message means `GET /threads/{id}` afterward won't resolve
+            # this specific message (it'll 404 THREAD_NOT_FOUND, or reflect
+            # this thread's own last *real* graph invocation, if any). The
+            # response the client actually receives from this POST is
+            # still correct and complete; only the separate resume-after-
+            # refresh path is out of scope for a cache hit. Narrower in
+            # scope than the model-spend problem this cache exists to
+            # solve, so accepted rather than adding a synthetic checkpoint
+            # write here (which would need to fabricate every intermediate
+            # state field a real graph run produces).
+            served = cached_response.model_copy(
+                update={"thread_id": thread_id, "message_id": str(uuid.uuid4())}
+            )
+            return _model_response(served, status_code=200)
+
         compiled_graph = request.app.state.compiled_graph
         initial_state: AnalysisState = {
             "trace_id": trace_id,
@@ -492,6 +545,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         response_payload = final_state.get("response")
         if response_payload is not None:
+            # Populate the cache with exactly what `assemble_response`
+            # produced for *this* request (own thread_id/message_id and
+            # all) — a future cache hit substitutes its own request's
+            # thread_id/message_id at read time (see the cache-check branch
+            # above), so caching the as-is object here is correct, not a
+            # shortcut. Best-effort: a cache-population failure must never
+            # turn an otherwise-successful analysis into an error response.
+            try:
+                await response_cache.set(
+                    hs_code=query.hs_code,
+                    year_range=year_range,
+                    filter_hash=filter_hash(query),
+                    prompt_version=COMBINED_PROMPT_VERSION,
+                    response=response_payload,
+                )
+            except Exception:
+                logger.exception("thread.message.response_cache_set_failed", thread_id=thread_id)
             return _model_response(response_payload, status_code=200)
 
         # Defensive: `assemble_response` (app/graph.py) always writes either
