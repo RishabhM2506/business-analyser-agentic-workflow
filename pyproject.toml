@@ -119,3 +119,12 @@ branch = true
 
 [tool.coverage.report]
 skip_empty = true
+# Finding M14 (Phase 4 review, ARCH-08): "unit tests with a coverage floor"
+# is an explicit master-brief §Phase 2 CI requirement that was never wired
+# up — its absence is the concrete, direct reason the fully-dead
+# app/cache/response_cache.py (finding B8) shipped unnoticed at 0% coverage
+# for an entire review cycle. 90% is set a few points below the real,
+# measured figure at the time this was added (95%) - enough to fail loudly
+# on a genuinely large uncovered addition (exactly B8's shape) without being
+# so tight it breaks on every small, legitimately-hard-to-cover line.
+fail_under = 90

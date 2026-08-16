@@ -63,7 +63,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --frozen --group dev
-      - run: uv run pytest -m "unit or integration" --cov=app --cov-report=term-missing
+      - run: uv run pytest -m "unit or integration" --cov=app --cov-report=term-missing --cov-fail-under=90
 
   llm:
     name: llm (pytest, cassette-replay)
