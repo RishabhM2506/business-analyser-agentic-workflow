@@ -34,6 +34,7 @@ def _response(*, thread_id: str = "t-1", message_id: str = "m-1") -> TradeAnalys
             period_type="calendar_year",
             currency="USD",
             prompt_version="v1",
+            reporter_country="India",
         ),
     )
 

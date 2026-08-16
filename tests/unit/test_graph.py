@@ -82,6 +82,7 @@ def test_assemble_response_builds_full_response_from_complete_state() -> None:
     assert response.provenance.period_type == "calendar_year"
     assert response.provenance.currency == "USD"
     assert response.provenance.prompt_version == COMBINED_PROMPT_VERSION
+    assert response.provenance.reporter_country == "India"  # finding M22/PBO-04
 
 
 @pytest.mark.unit

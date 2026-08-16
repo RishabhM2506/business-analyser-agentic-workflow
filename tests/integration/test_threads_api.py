@@ -156,6 +156,7 @@ async def test_post_message_happy_path_returns_schema_valid_analysis(
     assert len(body["analytical_summary"]) > 0
     assert body["imports"]["unit"] == "USD"
     assert body["provenance"]["source"] == "UN Comtrade (comtradeapi.un.org)"
+    assert body["provenance"]["reporter_country"] == "India"  # finding M22/PBO-04
 
 
 @pytest.mark.integration

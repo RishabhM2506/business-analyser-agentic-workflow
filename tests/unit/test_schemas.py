@@ -187,6 +187,7 @@ def test_trade_analysis_response_round_trip() -> None:
             period_type="calendar_year",
             currency="USD",
             prompt_version="v0-scaffold",
+            reporter_country="India",
         ),
     )
     restored = TradeAnalysisResponse.model_validate_json(response.model_dump_json())
@@ -202,6 +203,7 @@ def test_provenance_rejects_wrong_source_literal() -> None:
             period_type="calendar_year",
             currency="USD",
             prompt_version="v0-scaffold",
+            reporter_country="India",
         )
 
 
