@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Provenance(BaseModel):
@@ -58,6 +58,19 @@ class TradeTable(BaseModel):
     unit: Literal["USD"]
     years: list[int]
     years_finalized: list[int]  # subset of `years` NOT flagged provisional by Comtrade
+    # Finding M21/PBO-03: a year absent from `years_finalized` was previously
+    # presented identically to the user whether it was genuinely
+    # still-settling (some records exist, at least one marked provisional)
+    # or structurally had zero records at all (commonly because this HS6
+    # code did not exist in that year's HS nomenclature edition — see
+    # `app.nodes.aggregate.flag_years_no_data`). This field isolates the
+    # zero-records case so the frontend can use accurate, non-promissory
+    # copy ("no data recorded") instead of "not yet finalized" for a year
+    # that may never have data. Always disjoint from `years_finalized`.
+    # Defaulted (not required like its sibling) since this is a newer,
+    # purely additive field — every real construction path
+    # (`build_trade_table`) sets it explicitly regardless.
+    years_no_data: list[int] = Field(default_factory=list)
     excluded_partner_codes: list[str]  # transparency: aggregate/"nes" codes stripped
     rows: list[CountryRow]  # top 10
 
