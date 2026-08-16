@@ -32,6 +32,21 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # --- runtime -------------------------------------------------------------------
 FROM python:3.12-slim AS runtime
 
+# libpq5: the runtime shared library `psycopg` (pulled in transitively by
+# `langgraph-checkpoint-postgres`, app/graph.py's PostgresSaver path) needs
+# to actually open a Postgres connection. Verified directly against this
+# same base image (`python:3.12-slim`): a bare `pip install psycopg &&
+# python -c "import psycopg"` fails with "libpq library not found" without
+# it. `libpq5` (not `libpq-dev`) is the small, runtime-only package — no
+# compiler, no headers, consistent with "slim base" (docs/PLAN.md §4.1).
+# app/graph.py imports `psycopg` lazily specifically so a sqlite-only
+# deployment (the default) never needs this at all; this line is what makes
+# the documented Postgres-in-production path (docs/PLAN.md §2.2) actually
+# work when DATABASE_URL is switched to a postgresql:// URL.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --system --gid 1000 app \
     && useradd --system --uid 1000 --gid app --no-create-home app
 
