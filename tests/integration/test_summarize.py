@@ -23,16 +23,21 @@ T = TypeVar("T", bound=BaseModel)
 
 
 def _table() -> TradeTable:
+    # Five years, matching the real system's fixed methodology (master brief
+    # §2.1: always a 5-year window) — a 3-year fixture would make
+    # `len(table.years)` legitimately 3, not 5, and a summary saying
+    # "5-year cumulative" would then (correctly, given only 3 years of
+    # input) fail the output guardrail's number-grounding check.
     return TradeTable(
         unit="USD",
-        years=[2021, 2022, 2023],
-        years_finalized=[2021, 2022, 2023],
+        years=[2019, 2020, 2021, 2022, 2023],
+        years_finalized=[2019, 2020, 2021, 2022, 2023],
         excluded_partner_codes=["0"],
         rows=[
             CountryRow(
                 partner_country="USA",
                 partner_code="842",
-                values_by_year={2021: 100.0, 2022: 150.0, 2023: 200.0},
+                values_by_year={2019: 0.0, 2020: 50.0, 2021: 100.0, 2022: 150.0, 2023: 150.0},
                 cumulative_5yr=450.0,
                 rank=1,
             )
@@ -49,7 +54,9 @@ class _FabricatingModelClient:
     async def generate_structured(
         self, *, system_prompt: str, user_content: str, schema: type[T]
     ) -> T:
-        return schema.model_validate({"analytical_summary": "USA imported a record 99,999,999 units."})
+        return schema.model_validate(
+            {"analytical_summary": "USA imported a record 99,999,999 units."}
+        )
 
 
 class _GroundedModelClient:
@@ -135,5 +142,5 @@ async def test_summarize_defensive_noop_when_state_incomplete(
 
 @pytest.mark.integration
 def test_summarize_output_schema_rejects_empty_string() -> None:
-    with pytest.raises(Exception):  # noqa: B017, PT011 — pydantic ValidationError
+    with pytest.raises(Exception):  # noqa: B017 — pydantic ValidationError
         SummarizeOutput(analytical_summary="")

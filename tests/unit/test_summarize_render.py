@@ -12,12 +12,12 @@ from app.schemas.response import CountryRow, TradeTable
 
 
 def _table(**overrides: object) -> TradeTable:
-    defaults: dict[str, object] = dict(
-        unit="USD",
-        years=[2021, 2022, 2023],
-        years_finalized=[2021, 2022],
-        excluded_partner_codes=["0"],
-        rows=[
+    defaults: dict[str, object] = {
+        "unit": "USD",
+        "years": [2021, 2022, 2023],
+        "years_finalized": [2021, 2022],
+        "excluded_partner_codes": ["0"],
+        "rows": [
             CountryRow(
                 partner_country="USA",
                 partner_code="842",
@@ -26,7 +26,7 @@ def _table(**overrides: object) -> TradeTable:
                 rank=1,
             )
         ],
-    )
+    }
     defaults.update(overrides)
     return TradeTable(**defaults)  # type: ignore[arg-type]
 

@@ -103,7 +103,7 @@ def _mock_text_for(user_content: str) -> str:
     return f"[MockLLM deterministic output] {excerpt}".strip()
 
 
-def _build_mock_instance(schema: type[T], *, user_content: str) -> T:
+def _build_mock_instance[U: BaseModel](schema: type[U], *, user_content: str) -> U:
     """Build a schema-valid canned instance generically from `schema`'s own
     fields — works for any single-or-multi-`str`-field structured-output
     schema without `MockLLM` needing to import `describe_item`'s or

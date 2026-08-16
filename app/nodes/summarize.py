@@ -55,9 +55,11 @@ def render_table(label: str, table: TradeTable) -> str:
     lines = [f"{label} (USD, top {len(table.rows)} partner countries):"]
     for row in table.rows:
         year_values = ", ".join(
-            f"{year}: {row.values_by_year[year]:,.0f}"
-            if row.values_by_year[year] is not None
-            else f"{year}: no data"
+            (
+                f"{year}: {row.values_by_year[year]:,.0f}"
+                if row.values_by_year[year] is not None
+                else f"{year}: no data"
+            )
             for year in table.years
         )
         lines.append(
@@ -106,7 +108,9 @@ async def summarize(state: AnalysisState) -> dict[str, Any]:
         schema=SummarizeOutput,
     )
 
-    if not check_numbers_grounded(result.analytical_summary, imports_table, exports_table):
+    if not check_numbers_grounded(
+        result.analytical_summary, imports_table, exports_table, hs_code=query.hs_code
+    ):
         # The concrete v1 instance of "the LLM never produces a number"
         # (master brief §2.2) — a defined error fallback, never a silent
         # partial render (docs/PLAN.md §3.2).

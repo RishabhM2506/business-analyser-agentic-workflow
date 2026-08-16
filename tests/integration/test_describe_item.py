@@ -18,7 +18,9 @@ from app.state import AnalysisState
 
 @pytest.mark.integration
 async def test_describe_item_writes_item_description(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(describe_item_module, "get_model_for_role", lambda role, provider: MockLLM())
+    monkeypatch.setattr(
+        describe_item_module, "get_model_for_role", lambda role, provider: MockLLM()
+    )
     state: AnalysisState = {
         "query": TradeQuery(hs_code="010121"),
         "taxonomy_text": "HS 010121: Horses; live, pure-bred breeding animals",
@@ -35,7 +37,9 @@ async def test_describe_item_writes_item_description(monkeypatch: pytest.MonkeyP
 async def test_describe_item_short_circuits_on_existing_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(describe_item_module, "get_model_for_role", lambda role, provider: MockLLM())
+    monkeypatch.setattr(
+        describe_item_module, "get_model_for_role", lambda role, provider: MockLLM()
+    )
     state: AnalysisState = {
         "error": ErrorResponse(error_code="X", message="x", retryable=False, trace_id="t")
     }
@@ -46,6 +50,8 @@ async def test_describe_item_short_circuits_on_existing_error(
 async def test_describe_item_defensive_noop_when_state_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(describe_item_module, "get_model_for_role", lambda role, provider: MockLLM())
+    monkeypatch.setattr(
+        describe_item_module, "get_model_for_role", lambda role, provider: MockLLM()
+    )
     assert await describe_item({}) == {}
     assert await describe_item({"query": TradeQuery(hs_code="010121")}) == {}  # no taxonomy_text

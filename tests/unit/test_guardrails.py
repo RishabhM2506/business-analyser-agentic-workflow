@@ -178,6 +178,44 @@ def test_find_ungrounded_numbers_returns_only_offenders() -> None:
     assert find_ungrounded_numbers(prose, table) == [77777.0]
 
 
+# --- check_numbers_grounded: hs_code grounding ------------------------------
+# `summarize.py` puts "HS code 010121" in the model's own prompt, and a
+# leading-zero HS code reads back as a plain number once float-parsed
+# ("010121" -> 10121.0) - regression coverage for the bug where a summary
+# legitimately mentioning the code it's analyzing was rejected as ungrounded
+# on every single run (mock and real), because 10121 was never in
+# `_flatten_table_numbers`'s output.
+
+
+@pytest.mark.unit
+def test_hs_code_number_is_grounded_when_supplied() -> None:
+    table = _table()
+    prose = "For HS code 010121, imports totaled 490.0."
+    assert check_numbers_grounded(prose, table, hs_code="010121") is True
+    assert check_numbers_grounded(prose, table, hs_code=None) is False
+
+
+@pytest.mark.unit
+def test_hs_code_grounding_does_not_widen_to_unrelated_numbers() -> None:
+    # Grounding "10121" must not accidentally also ground some other
+    # fabricated number that happens to be nearby in value.
+    table = _table()
+    prose = "For HS code 010121, imports somehow reached 10122."
+    assert check_numbers_grounded(prose, table, hs_code="010121") is False
+    assert find_ungrounded_numbers(prose, table, hs_code="010121") == [10122.0]
+
+
+@pytest.mark.unit
+def test_hs_code_grounding_ignores_non_numeric_or_absent_code() -> None:
+    table = _table()
+    # A malformed/absent hs_code must not raise - just contributes nothing
+    # extra to the grounded set (validated separately by
+    # `check_hs_code_allowlisted` before this ever runs in the real graph).
+    prose = "Trade grew between 2019 and 2023."
+    assert check_numbers_grounded(prose, table, hs_code="not-a-code") is True
+    assert check_numbers_grounded(prose, table, hs_code="") is True
+
+
 # --- check_hs_code_allowlisted ------------------------------------------------
 
 

@@ -8,13 +8,13 @@ of this test layer (master brief §6).
 from __future__ import annotations
 
 import pytest
+from tests.llm.cassette import CASSETTES_DIR, CassetteModelClient
 
 import app.nodes.describe_item as describe_item_module
 from app.knowledge.provider import build_taxonomy_text
 from app.nodes.describe_item import describe_item
 from app.schemas.query import TradeQuery
 from app.state import AnalysisState
-from tests.llm.cassette import CASSETTES_DIR, CassetteModelClient
 
 _DESCRIBE_ITEM_CASSETTES = CASSETTES_DIR / "describe_item"
 

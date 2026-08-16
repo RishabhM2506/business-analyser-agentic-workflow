@@ -16,6 +16,7 @@ judge involved in either check.
 
 from __future__ import annotations
 
+import contextlib
 import re
 
 from app.knowledge.provider import is_known_hs6_code
@@ -52,7 +53,7 @@ def extract_numbers(text: str) -> list[float]:
     return [float(match.replace(",", "")) for match in _NUMBER_PATTERN.findall(text)]
 
 
-def _flatten_table_numbers(*tables: TradeTable) -> set[int]:
+def _flatten_table_numbers(*tables: TradeTable, hs_code: str | None = None) -> set[int]:
     """Every number that legitimately belongs in prose about `tables`,
     rounded to the nearest whole unit for tolerant comparison (a model
     copying "1,992,456" for a table value of 1992455.942 must not fail the
@@ -68,8 +69,19 @@ def _flatten_table_numbers(*tables: TradeTable) -> set[int]:
     the table was built, true by construction, not data the model could
     fabricate incorrectly, so treating them as "not grounded" would make
     the guardrail reject essentially every legitimate summary.
+
+    `hs_code` is grounded the same way, for the same reason: `summarize.py`
+    puts "HS code 010121" in the model's own prompt, and `extract_numbers`
+    has no way to tell that numeral apart from a fabricated trade figure
+    (leading zeros are stripped by float parsing, so "010121" reads back as
+    the plain number 10121). Without this, a summary that legitimately
+    references the code it's analyzing — "for HS code 010121, imports..." —
+    would be rejected as ungrounded on every single run, mock or real.
     """
     grounded: set[int] = set()
+    if hs_code is not None:
+        with contextlib.suppress(ValueError):
+            grounded.add(round(float(hs_code)))
     for table in tables:
         grounded.update(table.years)
         grounded.add(len(table.years))
@@ -83,20 +95,22 @@ def _flatten_table_numbers(*tables: TradeTable) -> set[int]:
     return grounded
 
 
-def check_numbers_grounded(prose: str, *tables: TradeTable) -> bool:
+def check_numbers_grounded(prose: str, *tables: TradeTable, hs_code: str | None = None) -> bool:
     """Return True iff every number in `prose` is present in `tables`
     (docs/PLAN.md §6, master brief §2.2/§8) — the deterministic,
     non-negotiable "the LLM never produces a number" check. No LLM judge:
     a plain extraction + set-membership comparison, tolerant only of
     whole-unit rounding (see `_flatten_table_numbers`)."""
-    grounded = _flatten_table_numbers(*tables)
+    grounded = _flatten_table_numbers(*tables, hs_code=hs_code)
     return all(round(number) in grounded for number in extract_numbers(prose))
 
 
-def find_ungrounded_numbers(prose: str, *tables: TradeTable) -> list[float]:
+def find_ungrounded_numbers(
+    prose: str, *tables: TradeTable, hs_code: str | None = None
+) -> list[float]:
     """Like `check_numbers_grounded`, but returns the offending numbers
     instead of a bool — used for actionable error messages/logging when the
     guardrail trips (docs/PLAN.md §3.2: errors are user-safe but should
     still be diagnosable server-side)."""
-    grounded = _flatten_table_numbers(*tables)
+    grounded = _flatten_table_numbers(*tables, hs_code=hs_code)
     return [number for number in extract_numbers(prose) if round(number) not in grounded]
