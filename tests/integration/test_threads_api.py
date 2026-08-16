@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
+from langchain_core.exceptions import OutputParserException
 
 import app.nodes.describe_item as describe_item_module
 import app.nodes.fetch_trade as fetch_trade_module
@@ -216,6 +217,40 @@ async def test_post_message_extra_field_rejected_as_invalid_query(
 
     assert response.status_code == 400
     assert _data(response)["error_code"] == "INVALID_QUERY"
+
+
+@pytest.mark.integration
+async def test_post_message_output_parser_exception_maps_to_schema_validation_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M4/AWR-06: a real Gemini structured-output failure raises
+    `langchain_core.exceptions.OutputParserException`, not
+    `pydantic.ValidationError` (verified directly against the installed
+    `langchain-core` source — see app/main.py's exception-handling
+    comment). The documented `SCHEMA_VALIDATION_FAILED` path was
+    unreachable for the one failure mode `with_structured_output` exists
+    to guard against, and fell through to generic `INTERNAL_ERROR` /
+    `retryable=True` instead."""
+    _patch_comtrade(monkeypatch)
+
+    class _BrokenModelClient:
+        async def generate_structured(
+            self, *, system_prompt: str, user_content: str, schema: type[object]
+        ) -> object:
+            raise OutputParserException("simulated structured-output parse failure")
+
+    monkeypatch.setattr(
+        describe_item_module, "get_model_for_role", lambda role, provider: _BrokenModelClient()
+    )
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
+
+    assert response.status_code == 500
+    body = _data(response)
+    assert body["error_code"] == "SCHEMA_VALIDATION_FAILED"
+    assert body["retryable"] is False
 
 
 @pytest.mark.integration

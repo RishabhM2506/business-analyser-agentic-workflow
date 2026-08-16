@@ -58,6 +58,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from langchain_core.exceptions import OutputParserException
 from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -581,7 +582,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     initial_state, config=config
                 )
         except Exception as exc:
-            is_schema_failure = isinstance(exc, ValidationError)
+            # `OutputParserException` (finding M4/AWR-06), not
+            # `pydantic.ValidationError`, is what a real Gemini structured-
+            # output failure actually raises: `with_structured_output`
+            # (`app/models.py`'s `GeminiModelClient`) builds a
+            # `PydanticOutputParser`, whose `_parse_obj` explicitly catches
+            # `pydantic.ValidationError` and re-raises it as
+            # `OutputParserException` — verified directly against the
+            # installed `langchain-core` source (not assumed), including
+            # confirming `OutputParserException`'s MRO does NOT include
+            # `pydantic.ValidationError`, so the old `isinstance(exc,
+            # ValidationError)` check could never match it. `ValidationError`
+            # is still checked too (defensive: a bug elsewhere constructing
+            # one of our own Pydantic models with bad data should classify
+            # the same way, not fall through to a generic INTERNAL_ERROR).
+            is_schema_failure = isinstance(exc, ValidationError | OutputParserException)
             error_code = "SCHEMA_VALIDATION_FAILED" if is_schema_failure else "INTERNAL_ERROR"
             logger.exception(
                 "thread.message.graph_invoke_failed", thread_id=thread_id, error_code=error_code
