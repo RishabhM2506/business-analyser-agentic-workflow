@@ -15,6 +15,7 @@ from app.nodes.aggregate import (
     build_trade_table,
     find_excluded_partner_codes,
     flag_years_finalized,
+    flag_years_no_data,
     rank_top_partners,
     strip_aggregate_partners,
 )
@@ -302,6 +303,65 @@ def test_flag_years_finalized_handles_mixed_years_independently() -> None:
     assert flag_years_finalized(records, years=[2021, 2022, 2023]) == [2021, 2023]
 
 
+# --- flag_years_no_data (finding M21/PBO-03) -----------------------------------
+
+
+@pytest.mark.unit
+def test_flag_years_no_data_true_for_year_with_zero_records() -> None:
+    # The exact PBO-03 shape: an HS6 code that structurally cannot have
+    # records for a year (e.g. it postdates the code's own nomenclature
+    # creation) looks identical, at this layer, to "nothing reported yet" -
+    # both are zero retained records for the year.
+    assert flag_years_no_data([], years=[2021]) == [2021]
+
+
+@pytest.mark.unit
+def test_flag_years_no_data_false_when_any_record_present_even_if_provisional() -> None:
+    # A year with at least one record is "provisional", never "no data" -
+    # these two states must never overlap.
+    records = [
+        _record(
+            partner_code="842", partner_country="USA", year=2022, value=100.0, is_provisional=True
+        )
+    ]
+    assert flag_years_no_data(records, years=[2022]) == []
+
+
+@pytest.mark.unit
+def test_flag_years_no_data_false_when_fully_finalized() -> None:
+    records = [
+        _record(
+            partner_code="842", partner_country="USA", year=2022, value=100.0, is_provisional=False
+        )
+    ]
+    assert flag_years_no_data(records, years=[2022]) == []
+
+
+@pytest.mark.unit
+def test_flag_years_no_data_disjoint_from_flag_years_finalized() -> None:
+    # 2021: zero records (no data). 2022: one provisional record (genuinely
+    # provisional). 2023: fully finalized. All three must land in exactly
+    # one bucket, never zero and never two.
+    records = [
+        _record(
+            partner_code="842", partner_country="USA", year=2022, value=100.0, is_provisional=True
+        ),
+        _record(
+            partner_code="842", partner_country="USA", year=2023, value=100.0, is_provisional=False
+        ),
+    ]
+    years = [2021, 2022, 2023]
+    no_data = flag_years_no_data(records, years=years)
+    finalized = flag_years_finalized(records, years=years)
+    assert no_data == [2021]
+    assert finalized == [2023]
+    assert set(no_data) & set(finalized) == set()
+    # The genuinely-provisional year (2022) lands in neither bucket - it's
+    # exactly the complement the UI still renders as "provisional".
+    provisional = [y for y in years if y not in no_data and y not in finalized]
+    assert provisional == [2022]
+
+
 # --- build_trade_table (end-to-end pure pipeline) -----------------------------
 
 
@@ -330,6 +390,7 @@ def test_build_trade_table_full_pipeline() -> None:
     assert table.years == [2021, 2022]
     assert table.excluded_partner_codes == ["0"]
     assert table.years_finalized == [2021]  # 2022 has UK's provisional record
+    assert table.years_no_data == []  # both years have real records
     assert [r.partner_country for r in table.rows] == ["USA", "UK"]
     assert table.rows[0].cumulative_5yr == pytest.approx(250.0)
     assert table.rows[0].rank == 1
@@ -337,10 +398,25 @@ def test_build_trade_table_full_pipeline() -> None:
 
 
 @pytest.mark.unit
+def test_build_trade_table_flags_zero_record_years_as_no_data_not_provisional() -> None:
+    """M21/PBO-03 end-to-end: a year with zero retained partner records
+    (e.g. an HS6 code that didn't exist in the HS nomenclature yet) must
+    land in `years_no_data`, not just fall into the `years_finalized`
+    complement undifferentiated."""
+    records = [
+        _record(partner_code="842", partner_country="USA", year=2022, value=100.0),
+    ]
+    table = build_trade_table(records, years=[2021, 2022])
+    assert table.years_finalized == [2022]
+    assert table.years_no_data == [2021]
+
+
+@pytest.mark.unit
 def test_build_trade_table_empty_records_produces_empty_but_valid_table() -> None:
     table = build_trade_table([], years=YEARS)
     assert table.rows == []
     assert table.years_finalized == []
+    assert table.years_no_data == YEARS  # every year has zero records
     assert table.excluded_partner_codes == []
     assert table.years == YEARS
 

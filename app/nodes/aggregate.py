@@ -149,6 +149,33 @@ def flag_years_finalized(records: list[ComtradeRecord], *, years: list[int]) -> 
     ]
 
 
+def flag_years_no_data(records: list[ComtradeRecord], *, years: list[int]) -> list[int]:
+    """Which of `years` have ZERO retained (non-aggregate-code) partner
+    records at all — the subset of "not finalized" years that means
+    something structurally different from "still settling" (finding
+    M21/PBO-03, live-reproduced on HS 851713: every partner showed `null`
+    for 2021, consistent with the HS 2022 nomenclature revision carving out
+    that exact 6-digit code only from 2022 onward, not a reporting delay).
+
+    `flag_years_finalized`'s own complement conflates two cases: a year
+    with *some* records where at least one isn't finalized yet (genuinely
+    provisional — "check back later" is honest advice) and a year with *no*
+    records for any partner at all (commonly because this exact HS6
+    classification code did not exist in that year's edition of the HS
+    nomenclature; less commonly, because nothing has been reported for it
+    yet). Calling the former "provisional — not yet finalized" is accurate;
+    calling the latter that is actively misleading, since there is
+    frequently nothing to finalize, ever. This function isolates that
+    second case so the UI can use different, non-promissory language for
+    it. Disjoint from `flag_years_finalized` by construction: a year here
+    has zero records, a year there requires at least one.
+    """
+    by_year: dict[int, list[ComtradeRecord]] = defaultdict(list)
+    for record in records:
+        by_year[record.year].append(record)
+    return [year for year in years if not by_year[year]]
+
+
 def build_trade_table(
     records: list[ComtradeRecord], *, years: list[int], top_n: int = TOP_N_PARTNERS
 ) -> TradeTable:
@@ -160,10 +187,12 @@ def build_trade_table(
     country_records = strip_aggregate_partners(records)
     rows = rank_top_partners(country_records, years=years, top_n=top_n)
     years_finalized = flag_years_finalized(country_records, years=years)
+    years_no_data = flag_years_no_data(country_records, years=years)
     return TradeTable(
         unit="USD",
         years=years,
         years_finalized=years_finalized,
+        years_no_data=years_no_data,
         excluded_partner_codes=excluded_partner_codes,
         rows=rows,
     )
