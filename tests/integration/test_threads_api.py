@@ -71,6 +71,17 @@ def _isolated_settings(**overrides: object) -> Settings:
     return Settings.model_validate({"database_url": "sqlite+aiosqlite:///:memory:", **overrides})
 
 
+def _data(response: httpx.Response) -> dict[str, object]:
+    """Unwrap the `{"type": "final", "data": ...}` response envelope
+    (docs/PLAN.md §3.3, finding B1/ARCH-01) that every `TradeAnalysisResponse`
+    /`ErrorResponse` is now sent inside — asserts the discriminator while
+    it's at it, so every call site gets that check for free instead of each
+    test re-asserting it individually."""
+    body = response.json()
+    assert body["type"] == "final"
+    return body["data"]  # type: ignore[no-any-return]
+
+
 @asynccontextmanager
 async def _client_for(settings: Settings) -> AsyncIterator[AsyncClient]:
     app = create_app(settings=settings)
@@ -114,7 +125,7 @@ async def test_post_message_happy_path_returns_schema_valid_analysis(
         )
 
     assert response.status_code == 200
-    body = response.json()
+    body = _data(response)
     assert body["thread_id"] == thread_id
     assert body["hs_code"] == "010121"
     assert len(body["message_id"]) > 0
@@ -141,7 +152,7 @@ async def test_post_message_unknown_hs_code_returns_400_before_touching_upstream
         response = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "000000"})
 
     assert response.status_code == 400
-    body = response.json()
+    body = _data(response)
     assert body["error_code"] == "INVALID_HS_CODE"
     assert body["retryable"] is False
     assert len(body["trace_id"]) > 0
@@ -163,7 +174,7 @@ async def test_post_message_shape_invalid_hs_code_returns_error_response_not_fas
         response = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "abc"})
 
     assert response.status_code == 400
-    body = response.json()
+    body = _data(response)
     assert body["error_code"] == "INVALID_QUERY"
     assert "detail" not in body
 
@@ -182,7 +193,7 @@ async def test_post_message_extra_field_rejected_as_invalid_query(
         )
 
     assert response.status_code == 400
-    assert response.json()["error_code"] == "INVALID_QUERY"
+    assert _data(response)["error_code"] == "INVALID_QUERY"
 
 
 @pytest.mark.integration
@@ -203,7 +214,7 @@ async def test_post_message_upstream_timeout_maps_to_504(monkeypatch: pytest.Mon
         )
 
     assert response.status_code == 504
-    assert response.json()["error_code"] == "UPSTREAM_TIMEOUT"
+    assert _data(response)["error_code"] == "UPSTREAM_TIMEOUT"
 
 
 @pytest.mark.integration
@@ -213,7 +224,7 @@ async def test_get_thread_unknown_id_returns_404(monkeypatch: pytest.MonkeyPatch
         response = await client.get(f"/threads/{uuid.uuid4()}")
 
     assert response.status_code == 404
-    assert response.json()["error_code"] == "THREAD_NOT_FOUND"
+    assert _data(response)["error_code"] == "THREAD_NOT_FOUND"
 
 
 @pytest.mark.integration
@@ -262,7 +273,7 @@ async def test_get_thread_after_error_resumes_the_error(monkeypatch: pytest.Monk
 
     assert posted.status_code == 504
     assert fetched.status_code == 504
-    assert fetched.json()["error_code"] == "UPSTREAM_TIMEOUT"
+    assert _data(fetched)["error_code"] == "UPSTREAM_TIMEOUT"
 
 
 @pytest.mark.integration
@@ -289,7 +300,7 @@ async def test_post_message_budget_exceeded_maps_to_429(monkeypatch: pytest.Monk
             )
 
         assert response.status_code == 429
-        assert response.json()["error_code"] == "BUDGET_EXCEEDED"
+        assert _data(response)["error_code"] == "BUDGET_EXCEEDED"
     finally:
         get_settings.cache_clear()
         monkeypatch.setattr(budget_module, "_budget_tracker_singleton", None)

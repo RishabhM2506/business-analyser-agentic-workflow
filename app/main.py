@@ -94,8 +94,20 @@ def _model_response(
     validation (already guaranteed by `model` being a real Pydantic
     instance, not a hand-built dict) and the status-code mapping can never
     drift apart across the three thread endpoints (docs/PLAN.md §3.2: never
-    a silent partial render)."""
-    return JSONResponse(status_code=status_code, content=model.model_dump(mode="json"))
+    a silent partial render).
+
+    Wrapped in the `{"type": "final", "data": ...}` envelope docs/PLAN.md
+    §3.3 documents ("the wire format is an envelope with a `type: 'final'`
+    discriminator so a future `type: 'delta'` streaming chunk is additive,
+    not breaking") — ARCH-01/B1: this was specified but never implemented,
+    which broke every real analysis request against the frontend's own
+    (already-built, streaming-ready) envelope consumer. `data` carries
+    exactly what used to be the bare top-level body, so `TradeAnalysisResponse`
+    and `ErrorResponse` themselves are unchanged."""
+    return JSONResponse(
+        status_code=status_code,
+        content={"type": "final", "data": model.model_dump(mode="json")},
+    )
 
 
 def _current_trace_id() -> str:
