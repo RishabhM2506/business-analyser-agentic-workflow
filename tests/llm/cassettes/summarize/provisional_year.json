@@ -1,0 +1,10 @@
+{
+  "_meta": {
+    "synthetic": true,
+    "note": "SYNTHETIC placeholder cassette - NOT a real Gemini recording. No real GEMINI_API_KEY was available during Phase 3 implementation (docs/OPEN-QUESTIONS.md). Paired with tests/llm/test_summarize.py's _table_provisional() fixture - every number below must be a member of that table's flattened values. Re-record against a real key before relying on this for anything beyond deterministic CI replay.",
+    "prompt_version": "summarize-v1"
+  },
+  "output": {
+    "analytical_summary": "China was the only listed partner, with a 5-year cumulative value of 1,100,000. Data for 2022 is missing for this partner. The year 2023 is flagged as provisional and not yet finalized, so the most recent figure of 350,000 may still be revised."
+  }
+}

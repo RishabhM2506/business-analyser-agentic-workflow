@@ -1,0 +1,10 @@
+{
+  "_meta": {
+    "synthetic": true,
+    "note": "SYNTHETIC placeholder cassette - NOT a real Gemini recording. No real GEMINI_API_KEY was available during Phase 3 implementation (docs/OPEN-QUESTIONS.md). Paired with tests/llm/test_summarize.py's _table_normal() fixture - every number below must be a member of that table's flattened values for the output-guardrail-integration test to mean anything. Re-record against a real key before relying on this for anything beyond deterministic CI replay.",
+    "prompt_version": "summarize-v1"
+  },
+  "output": {
+    "analytical_summary": "United States led imports with a 5-year cumulative value of 6,350,000, well ahead of Germany's 2,110,000, indicating imports are fairly concentrated in the top partner. Both partners show a generally rising trend across the years: United States grew from 1,000,000 in 2019 to 1,600,000 in 2023, while Germany moved from 400,000 in 2019 to 450,000 in 2023. All five years shown are fully finalized."
+  }
+}
