@@ -17,21 +17,24 @@ documentation alone (`docs.langchain.com`'s current integration page for
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, Protocol, TypeVar
 
 from pydantic import BaseModel
 
 from app.guardrails import extract_numbers
+from app.nodes.aggregate import TOP_N_PARTNERS
 
 NodeRole = Literal["utility", "analysis"]
 
 T = TypeVar("T", bound=BaseModel)
 
 # Bounded retries only (master brief §7.9) — the langchain-google-genai
-# default (6) is too generous for a hard per-thread call budget
-# (docs/PLAN.md §5.5: max_model_calls_per_thread = 2); a stuck call should
-# fail fast into the budget/guardrail error path, not silently multiply
-# spend retrying internally.
+# default (6) is too generous against a finite per-thread call budget
+# (docs/PLAN.md §5.5: max_model_calls_per_thread, a per-session, not
+# per-call, ceiling); a stuck call should fail fast into the
+# budget/guardrail error path, not silently multiply spend retrying
+# internally.
 _GEMINI_MAX_RETRIES = 2
 _GEMINI_TIMEOUT_SECONDS = 20.0
 
@@ -81,23 +84,62 @@ class GeminiModelClient:
         return result
 
 
-def _mock_text_for(user_content: str) -> str:
+_WORD_WITH_DIGIT_PATTERN = re.compile(r"\d")
+
+
+def _strip_numeric_words(text: str) -> str:
+    """`text` with every whitespace-delimited token containing a digit
+    removed entirely (not just reformatted) — used to build mock output
+    that is provably number-free by construction, not just "unlikely to
+    contain one" (finding M2/AWR-04 — `describe_item`'s output guardrail
+    now rejects *any* number at all)."""
+    return " ".join(word for word in text.split() if not _WORD_WITH_DIGIT_PATTERN.search(word))
+
+
+def _mock_text_for(user_content: str, *, field_name: str) -> str:
     """Deterministic, schema-agnostic placeholder text for `MockLLM`.
 
-    Never invents a number: if `user_content` contains any (which, for
-    `summarize`, is the compact rendered trade table — see
-    `app/nodes/summarize.py`), a few are echoed verbatim via
-    `app.guardrails.extract_numbers` — the exact same extraction the output
-    guardrail uses — so the mock output is grounded *by construction* and a
-    full graph run under `LLM_PROVIDER=mock` exercises the guardrail
-    meaningfully instead of trivially passing it by never mentioning a
-    number at all. `describe_item`'s mock output isn't guardrail-checked,
-    so this same helper works for both roles without needing to know which
-    one called it (no import of either node module -> no circular import).
+    `field_name` determines whether numeric echoing is safe to do at all:
+
+    - `describe_item`'s `description` field is now guardrail-checked for
+      *any* number, full stop (finding M2/AWR-04, `app/nodes/describe_item.py`)
+      — its `user_content` always contains the hs_code's own digits (`f"HS
+      code: {hs_code}..."`), so this branch must guarantee zero digits reach
+      the output, not just "usually" avoid them. `_strip_numeric_words`
+      removes every digit-containing token outright rather than trying to
+      reformat around individual numbers.
+    - Every other field (currently just `summarize`'s `analytical_summary`)
+      keeps the original intent: if `user_content` contains any number (for
+      `summarize`, the compact rendered trade table — `app/nodes/summarize.py`),
+      a few are echoed verbatim via `app.guardrails.extract_numbers` — the
+      exact same extraction the output guardrail uses — so the mock output
+      is grounded *by construction* and a full graph run under
+      `LLM_PROVIDER=mock` exercises that guardrail meaningfully instead of
+      trivially passing it by never mentioning a number at all. Numbers in
+      the narrow `1..TOP_N_PARTNERS` range are skipped when choosing which
+      ones to echo (falling back to them only if nothing else is available):
+      finding B7/AWR-02 narrowed when a bare small integer counts as
+      grounded to a narrow allowlist of *structural* phrasing ("top 3",
+      "rank 3", "3 years") — this mock's own generic "including values: X,
+      Y, Z" framing doesn't supply any of that context, so a coincidentally
+      small echoed number (e.g. equal to a table's row count — which can
+      legitimately be 0 for an empty result — or a row's rank, both always
+      in `0..TOP_N_PARTNERS`) is no longer reliably grounded the way an
+      echoed year or dollar value always unconditionally is.
+
+    Driven by the output schema's own field name (see `_build_mock_instance`
+    below) rather than importing `describe_item`/`summarize` directly, which
+    would create a circular import (both import `app.models`).
     """
+    if field_name == "description":
+        excerpt = " ".join(_strip_numeric_words(user_content).split()[:20])
+        body = excerpt or "a general trade classification"
+        return f"[MockLLM deterministic output] {body}".strip()
+
     numbers = extract_numbers(user_content)
     if numbers:
-        sample = ", ".join(str(n) for n in numbers[:3])
+        unambiguous = [n for n in numbers if not (n == round(n) and 0 <= n <= TOP_N_PARTNERS)]
+        sample = ", ".join(str(n) for n in (unambiguous or numbers)[:3])
         return f"[MockLLM deterministic output] Reflects provided data, including values: {sample}."
     excerpt = " ".join(user_content.split()[:20])
     return f"[MockLLM deterministic output] {excerpt}".strip()
@@ -112,7 +154,7 @@ def _build_mock_instance[U: BaseModel](schema: type[U], *, user_content: str) ->
     field_values: dict[str, Any] = {}
     for name, field in schema.model_fields.items():
         if field.annotation is str:
-            field_values[name] = _mock_text_for(user_content)
+            field_values[name] = _mock_text_for(user_content, field_name=name)
         else:
             raise NotImplementedError(
                 f"MockLLM has no generic mock strategy for {schema.__name__}.{name}: "

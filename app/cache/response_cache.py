@@ -18,13 +18,57 @@ refinalization (docs/PLAN.md §11) without a code deploy.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from app.schemas.query import TradeQuery
 from app.schemas.response import TradeAnalysisResponse
 
 RESPONSE_TTL_SECONDS = 24 * 60 * 60  # 24h safety-net TTL; see module docstring
+
+
+def filter_hash(query: TradeQuery) -> str:
+    """Stable hash of the `TradeQuery` fields that affect the analysis but
+    aren't already their own separate cache-key component (finding
+    B8/AWR-01 — this function didn't exist anywhere before).
+
+    Deliberately excludes:
+    - `hs_code` — already the cache key's first component.
+    - `year_start`/`year_end` — the caller resolves these (see
+      `app.nodes.validate_query.resolve_year_range`) into the key's
+      separate `year_range` component *before* calling this, so two
+      requests that resolve to the identical concrete year range (e.g. one
+      passing explicit years, another passing `None`/`None` on the same
+      day) still hit the same cache entry rather than being kept apart by
+      hashing the raw, pre-resolution fields here.
+    - `tenant_id`/`user_id` — identity, never affect what analysis comes
+      back for a given `hs_code`/year range/filter combination.
+
+    Includes every field that actually changes the analysis:
+    `flow`/`partner_region`/`value_or_volume` — the reserved-for-future
+    filters (`app/schemas/query.py`) that don't affect v1's fixed pipeline
+    output *yet*, but must already be part of the key so that the moment
+    any of them becomes live (docs/PLAN.md §3 roadmap), a differently-
+    filtered request can never silently be served another request's cached
+    result.
+
+    `json.dumps(..., sort_keys=True)` rather than naive string
+    concatenation: a free-form field like `partner_region` could otherwise
+    contain a delimiter character and collide with a differently-shaped
+    combination of fields.
+    """
+    canonical = json.dumps(
+        {
+            "flow": query.flow,
+            "partner_region": query.partner_region,
+            "value_or_volume": query.value_or_volume,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass

@@ -16,7 +16,9 @@ from app.schemas.response import TradeAnalysisResponse, TradeTable
 from app.tools.comtrade_client import ComtradeRecord
 
 
-def _keep_first_error(existing: ErrorResponse, new: ErrorResponse) -> ErrorResponse:
+def _keep_first_error(
+    existing: ErrorResponse | None, new: ErrorResponse | None
+) -> ErrorResponse | None:
     """Reducer for the `error` channel (see its `Annotated[...]` below for
     why one is needed at all): when `fetch_imports` and `fetch_exports`
     — a genuine parallel fan-out, docs/PLAN.md §2.2 — both fail in the
@@ -29,12 +31,38 @@ def _keep_first_error(existing: ErrorResponse, new: ErrorResponse) -> ErrorRespo
     makes it a `BinaryOperatorAggregate` channel, which folds concurrent
     writes through this function two at a time instead of rejecting them.
 
-    Keeping whichever was written first is an arbitrary but
+    Keeping whichever real error was written first is an arbitrary but
     deterministic-enough choice: only one `ErrorResponse` can ever reach the
     user regardless (`app/main.py` returns exactly one), and every node
     after the point of failure already no-ops via `has_error()` no matter
     which upstream error specifically "won" the merge.
+
+    A `new` value of `None` is a deliberate **reset** signal, not "no
+    update," and is honored unconditionally, even over a real `existing`
+    error (PBO-01/QA-01, finding B3): `app/main.py`'s `post_message` seeds
+    `initial_state["error"] = None` on *every* invocation, specifically so a
+    fresh request's first superstep can clear whatever `error` was
+    checkpointed by a *previous* run on this same `thread_id`. Without this,
+    a `BinaryOperatorAggregate` channel simply keeps whatever was last
+    written forever — nothing in the fixed v1 pipeline otherwise ever writes
+    `error` on a run that succeeds, so the *old* run's error would silently
+    outlive it, and every node would no-op via `has_error()` on every
+    subsequent message regardless of that message's own `hs_code` (live-
+    reproduced: identical `trace_id`, 27ms response = no real call made).
+    Safe to honor unconditionally because a `None` write can only ever be
+    this one seed value at superstep 0 — no node in this codebase ever
+    returns `{"error": None}` — so it can never race against or clobber a
+    real failure reported later in the *same* run (verified directly
+    against the installed `langgraph`'s `BinaryOperatorAggregate.update`:
+    the very first write to a never-before-set channel bypasses this
+    reducer entirely, and every write after that goes through it in order,
+    so a `None` seed followed by a real node error in a later superstep of
+    the same run still correctly ends up with that real error, not `None`).
     """
+    if new is None:
+        return None
+    if existing is None:
+        return new
     return existing
 
 
@@ -67,7 +95,11 @@ class AnalysisState(TypedDict, total=False):
     message_id: str
 
     query: TradeQuery
-    error: Annotated[ErrorResponse, _keep_first_error]
+    # `ErrorResponse | None` (not just `ErrorResponse`): `app/main.py` seeds
+    # this explicitly to `None` on every invocation as a reset signal (see
+    # `_keep_first_error`'s docstring above, finding B3) — the type must
+    # actually admit that value, not just tolerate it as an absent key.
+    error: Annotated[ErrorResponse | None, _keep_first_error]
 
     raw_imports: list[ComtradeRecord]
     raw_exports: list[ComtradeRecord]

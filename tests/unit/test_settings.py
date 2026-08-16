@@ -23,7 +23,10 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "k-gemini")
     settings = Settings()
     assert settings.llm_provider == "mock"
-    assert settings.max_model_calls_per_thread == 2
+    # A per-session, not per-analysis, ceiling (docs/PLAN.md §5.5, finding
+    # B2/ARCH-02) - 20 supports ~10 full analyses per session, not just the
+    # first one.
+    assert settings.max_model_calls_per_thread == 20
     assert settings.max_model_calls_per_day == 500
     assert settings.recursion_limit == 15
     assert settings.checkpoint_retention_days == 90

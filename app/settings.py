@@ -66,12 +66,29 @@ class Settings(BaseSettings):
 
     # --- Cost & recursion ceilings, fail closed (docs/PLAN.md §5.5) ---------
     max_model_calls_per_day: int = 500
-    max_model_calls_per_thread: int = 2
+    # A ceiling per *session*, not per single analysis (docs/PLAN.md §5.5,
+    # finding B2/ARCH-02): a thread is created once on "Start my process"
+    # and reused for every item a user looks at in that session, and one
+    # completed analysis costs exactly 2 model calls (describe_item +
+    # summarize). The original value of 2 was exactly the happy-path cost
+    # of the *first* analysis, leaving zero headroom for a second analysis
+    # on the same thread (BUDGET_EXCEEDED on every user's second item, every
+    # time) and zero retry headroom within even the first analysis (a
+    # guardrail rejection or a transient failure permanently exhausted the
+    # thread). 20 supports roughly 10 full analyses per session plus real
+    # retry headroom.
+    max_model_calls_per_thread: int = 20
     recursion_limit: int = 15
 
     # --- API edge (docs/PLAN.md §6: CORS allowlist, per-IP rate limiting) ---
     cors_allowed_origins: list[str] = Field(default_factory=list)
     rate_limit_per_minute: int = 60
+    # Request body-size ceiling, checked from the `Content-Length` header
+    # before any body parsing (finding B9/QA-02, master brief §8: "input
+    # validation and size limits at the API edge... before any model spend
+    # occurs"). 64 KiB is generous headroom — QA-02 confirmed live that the
+    # largest legitimate `TradeQuery` payload is well under 1 KB.
+    max_request_body_bytes: int = 64 * 1024
 
     # --- Structured logging ---------------------------------------------------
     log_level: str = "INFO"

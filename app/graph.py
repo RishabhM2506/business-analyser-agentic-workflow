@@ -214,6 +214,11 @@ def assemble_response(state: AnalysisState) -> dict[str, Any]:
             period_type="calendar_year",
             currency="USD",
             prompt_version=COMBINED_PROMPT_VERSION,
+            # Finding M22/PBO-04: matches the fixed reporter every fetch in
+            # this system actually uses (`INDIA_REPORTER_CODE`,
+            # app/tools/comtrade_client.py) — stated explicitly rather than
+            # left for the user to infer.
+            reporter_country="India",
         ),
     )
     return {"response": response}

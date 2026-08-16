@@ -26,6 +26,7 @@ from app.tools.comtrade_client import (
     ComtradeRecord,
     ComtradeSchemaValidationError,
     ComtradeTimeoutError,
+    ComtradeUpstreamError,
     get_comtrade_client,
 )
 
@@ -35,6 +36,15 @@ from app.tools.comtrade_client import (
 # of sync with a live upstream shape change: retrying the identical request
 # will keep failing until code changes, so it is NOT user-retryable, unlike
 # a timeout or a temporarily-open circuit breaker.
+#
+# `ComtradeUpstreamError` is deliberately NOT a key here (finding M9/QA-03):
+# unlike every other exception type, it already carries its own
+# correctly-computed `.retryable` (a 429/5xx is transient, a 4xx other than
+# 429 means *our own request* was malformed and can never succeed on
+# retry — see that class's own docstring in comtrade_client.py). A static
+# dict entry could only ever encode one fixed value, which would discard
+# that distinction — `_map_error` below special-cases it instead of
+# putting it in this dict.
 _ERROR_MAPPING: dict[type[ComtradeClientError], tuple[str, bool]] = {
     ComtradeTimeoutError: ("UPSTREAM_TIMEOUT", True),
     ComtradeCircuitOpenError: ("UPSTREAM_UNAVAILABLE", True),
@@ -44,6 +54,17 @@ _DEFAULT_ERROR_CODE_AND_RETRYABLE = ("UPSTREAM_ERROR", True)
 
 
 def _map_error(exc: ComtradeClientError) -> tuple[str, bool]:
+    # Checked first, ahead of the dict/default fallback (finding M9/QA-03):
+    # before this fix, `ComtradeUpstreamError` was never a key in
+    # `_ERROR_MAPPING`, so every instance fell through to
+    # `_DEFAULT_ERROR_CODE_AND_RETRYABLE = ("UPSTREAM_ERROR", True)` —
+    # discarding the exception's own correctly-computed `.retryable`, so a
+    # 400/404 (our own malformed request, can never succeed on retry) or a
+    # DNS/transport failure was reported to the caller as `retryable=True`
+    # anyway, live-verified against the real node function for exactly
+    # those cases.
+    if isinstance(exc, ComtradeUpstreamError):
+        return "UPSTREAM_ERROR", exc.retryable
     for exc_type, mapping in _ERROR_MAPPING.items():
         if isinstance(exc, exc_type):
             return mapping

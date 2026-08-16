@@ -45,14 +45,19 @@ all wired together as a compiled LangGraph `StateGraph` with a real checkpointer
 
 ```
 POST /threads                    -> {"thread_id": "<uuid4>"}
-GET  /threads/{id}               -> TradeAnalysisResponse or ErrorResponse (resume-after-refresh)
+GET  /threads/{id}               -> {"type": "final", "data": TradeAnalysisResponse | ErrorResponse}
 POST /threads/{id}/messages      -> body: TradeQuery-shaped selection
-                                     -> TradeAnalysisResponse (200) or ErrorResponse (4xx/5xx)
+                                     -> {"type": "final", "data": TradeAnalysisResponse | ErrorResponse}
+                                        (200 for a response, 4xx/5xx for an error)
 ```
 
 Every response, success or error, is a schema-validated Pydantic model serialized straight to
 JSON — never FastAPI's default validation-error shape (see `app/main.py`'s
-`handle_validation_error`) and never a partial render.
+`handle_validation_error`) and never a partial render. `GET`/`POST .../messages` responses are
+wrapped in a `type`/`data` envelope (`docs/PLAN.md` §3.3): `type` is always `"final"` in v1, a
+discriminator reserved so a future `type: "delta"` streaming chunk is additive, not breaking.
+`POST /threads` itself isn't part of that contract — it never returns a `TradeAnalysisResponse`/
+`ErrorResponse`, just a bare `{"thread_id": ...}`.
 
 ## Running locally
 
