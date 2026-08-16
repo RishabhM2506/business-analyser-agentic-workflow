@@ -277,6 +277,57 @@ async def test_get_thread_after_error_resumes_the_error(monkeypatch: pytest.Monk
 
 
 @pytest.mark.integration
+async def test_post_message_after_earlier_failure_on_same_thread_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PBO-01/QA-01, finding B3: a thread that failed once must not stay
+    permanently poisoned. Live-reproduced by PBO-01: after one message on a
+    thread failed, posting a second, *different* `hs_code` to that same
+    thread came back with the identical error, identical `trace_id`, in
+    27ms — proof no real work happened, just a replay of the stale
+    `AnalysisState.error` left behind by the first call. This test posts a
+    failing message, then a different, succeeding one, on the same thread,
+    and asserts the second genuinely ran (a real, matching
+    `TradeAnalysisResponse`) rather than reflecting the first call's error.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["cmdCode"] == "010121":
+            raise httpx.ReadTimeout("simulated upstream failure", request=request)
+        return _handler_with_data(request)
+
+    client_stub = ComtradeClient(
+        api_key="test-key", transport=httpx.MockTransport(_handler), max_attempts=1
+    )
+    monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client_stub)
+    monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: ToolCache())
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        failed = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
+        succeeded = await client.post(
+            f"/threads/{thread_id}/messages", json={"hs_code": "160100"}
+        )
+        fetched = await client.get(f"/threads/{thread_id}")
+
+    assert failed.status_code == 504
+    assert _data(failed)["error_code"] == "UPSTREAM_TIMEOUT"
+
+    # The critical assertion: the second, different hs_code actually ran (a
+    # real TradeAnalysisResponse for 160100) instead of replaying the first
+    # request's stale, unrelated error.
+    assert succeeded.status_code == 200
+    succeeded_body = _data(succeeded)
+    assert succeeded_body["hs_code"] == "160100"
+    assert "error_code" not in succeeded_body
+
+    # The thread's resumable state reflects the latest completed message,
+    # not the earlier failure.
+    assert fetched.status_code == 200
+    assert _data(fetched)["hs_code"] == "160100"
+
+
+@pytest.mark.integration
 async def test_post_message_budget_exceeded_maps_to_429(monkeypatch: pytest.MonkeyPatch) -> None:
     # `app.budget.get_budget_tracker` is a module-level singleton keyed off
     # the *global* `get_settings()`, like every other singleton factory in

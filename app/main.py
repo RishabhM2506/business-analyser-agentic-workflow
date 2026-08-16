@@ -379,6 +379,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # `year_end` and re-checks the allowlist (see that node's own
             # docstring for exactly why that split exists).
             "query": query,
+            # Explicit reset, every invocation (PBO-01/QA-01, finding B3):
+            # without this, a `thread_id` that failed once stays poisoned
+            # forever — `error`'s `_keep_first_error` reducer (app/state.py)
+            # otherwise has no way to distinguish "no error yet" from "the
+            # previous, unrelated message on this thread failed," and every
+            # node no-ops via `has_error()` regardless of *this* request's
+            # own `hs_code`. See `_keep_first_error`'s docstring for exactly
+            # why `None` is safe to honor unconditionally here.
+            "error": None,
         }
         config: dict[str, Any] = {
             "configurable": {"thread_id": thread_id},
