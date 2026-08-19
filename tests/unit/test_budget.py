@@ -49,13 +49,54 @@ async def test_check_and_increment_raises_when_day_ceiling_would_be_exceeded() -
 
 @pytest.mark.unit
 async def test_day_ceiling_is_scoped_per_tenant() -> None:
-    tracker = BudgetTracker(max_calls_per_thread=100, max_calls_per_day=1)
+    # max_calls_per_day=2 here (not 1): the tenant-scoped counter and the
+    # C1 global backstop (below) share this one ceiling value, so this
+    # needs headroom for tenant-a (1) + tenant-b (1) = 2 real calls to both
+    # succeed without the *global* check tripping first and masking what
+    # this test is actually verifying (that tenant-a and tenant-b each
+    # have their own independent per-tenant counter).
+    tracker = BudgetTracker(max_calls_per_thread=100, max_calls_per_day=2)
     await tracker.check_and_increment(thread_id="t-1", tenant_id="tenant-a")
     # A different tenant has its own, independent daily counter.
     await tracker.check_and_increment(thread_id="t-2", tenant_id="tenant-b")
 
     with pytest.raises(BudgetExceededError):
         await tracker.check_and_increment(thread_id="t-3", tenant_id="tenant-a")
+
+
+@pytest.mark.unit
+async def test_global_day_ceiling_cannot_be_bypassed_by_rotating_tenant_id() -> None:
+    """Finding C1 (architect review, 2026-08-20): tenant_id is a free-form,
+    client-supplied string on an unauthenticated endpoint. Before this
+    fix, an adversarial client defeated the day ceiling for free by
+    minting a fresh tenant_id per request -- each fresh key started its
+    own counter at zero. Reproduces the review's own repro sketch: many
+    distinct tenants, each making exactly one call, must still trip the
+    ceiling once the deployment-wide total is reached."""
+    tracker = BudgetTracker(max_calls_per_thread=100, max_calls_per_day=3)
+    await tracker.check_and_increment(thread_id="t-1", tenant_id="tenant-0")
+    await tracker.check_and_increment(thread_id="t-2", tenant_id="tenant-1")
+    await tracker.check_and_increment(thread_id="t-3", tenant_id="tenant-2")
+
+    # A 4th distinct, never-before-seen tenant_id still gets blocked --
+    # the per-tenant counter alone would show 0/3 for this brand-new
+    # tenant and allow it; the global backstop is what actually stops it.
+    with pytest.raises(BudgetExceededError):
+        await tracker.check_and_increment(thread_id="t-4", tenant_id="tenant-3")
+
+
+@pytest.mark.unit
+async def test_global_day_ceiling_resets_on_a_new_day() -> None:
+    days = iter(
+        [datetime(2026, 8, 16, 23, 59, tzinfo=UTC), datetime(2026, 8, 17, 0, 1, tzinfo=UTC)]
+    )
+    tracker = BudgetTracker(
+        max_calls_per_thread=100, max_calls_per_day=1, now_fn=lambda: next(days)
+    )
+    await tracker.check_and_increment(thread_id="t-1", tenant_id="tenant-a")  # 2026-08-16: 1/1
+    # A brand-new tenant, but a new day too -- the global counter must
+    # reset with the date, exactly like the per-tenant one already does.
+    await tracker.check_and_increment(thread_id="t-2", tenant_id="tenant-b")  # 2026-08-17: fresh
 
 
 @pytest.mark.unit

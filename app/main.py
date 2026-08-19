@@ -104,6 +104,7 @@ _ERROR_STATUS_CODES: dict[str, int] = {
     "SCHEMA_VALIDATION_FAILED": 500,
     "INTERNAL_ERROR": 500,
     "THREAD_NOT_FOUND": 404,
+    "THREAD_INCOMPLETE": 404,
     "REQUEST_TOO_LARGE": 413,
     "RATE_LIMITED": 429,
 }
@@ -262,23 +263,33 @@ async def request_id_middleware(
 async def request_size_limit_middleware(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
-    """Reject any request whose declared `Content-Length` exceeds
-    `settings.max_request_body_bytes` before anything downstream reads or
-    buffers the body (finding B9/QA-02, master brief §8: "input validation
-    and size limits at the API edge... before any model spend occurs").
-    Live-reproduced without this: a 5MB field was fully accepted,
-    processed, and durably checkpointed (105MB SQLite growth from one
-    request).
+    """Reject any request whose body exceeds `settings.max_request_body_bytes`
+    before anything downstream reads or buffers it for real (finding
+    B9/QA-02, master brief §8: "input validation and size limits at the
+    API edge... before any model spend occurs"). Live-reproduced without
+    this: a 5MB field was fully accepted, processed, and durably
+    checkpointed (105MB SQLite growth from one request).
 
-    A `Content-Length`-only check — never reading the body itself — is
-    deliberate and sufficient: `TradeQuery`'s largest legitimate payload is
-    well under 1KB (QA-02's own live measurement), so a generous 64KB
-    default ceiling can be enforced entirely from the header, before
-    Starlette/FastAPI ever allocates memory for an oversized body. A
-    request with no `Content-Length` header at all (e.g. chunked transfer
-    encoding, which no real client of this JSON POST-body API sends) is not
-    rejected here — that's a different, already-narrow risk this
-    header-only check isn't trying to cover.
+    Two layers, not one:
+    1. A `Content-Length` fast-path — rejects an obviously-oversized
+       declared request instantly, without touching the stream at all.
+    2. Finding H1 (architect review, 2026-08-20): a request with **no**
+       `Content-Length` header (chunked transfer encoding, or any client
+       simply omitting it) skipped layer 1 entirely — live-reproducible via
+       `curl -H "Transfer-Encoding: chunked"`, which Uvicorn/h11 happily
+       accepts, and which FastAPI's body parsing then buffers fully into
+       memory with no size check ever running, defeating the whole point of
+       this middleware for exactly the adversarial case it exists to catch
+       (an honest client always sends a correct `Content-Length`). Layer 2
+       reads the body manually through `request.stream()`, counting bytes
+       as they arrive, and aborts the instant the running total exceeds the
+       ceiling — before the rest of a large/slow body is even read, not
+       after buffering it. `request._body` is set to what was actually
+       read on the accept path so `Request.body()` (what FastAPI's own
+       `TradeQuery` parsing calls internally) returns the cached bytes
+       instead of re-consuming the now-exhausted ASGI receive channel —
+       verified against the installed `starlette` version's own
+       `Request.body()`/`Request.stream()` source, not assumed.
 
     Registered *after* `request_id_middleware` in `create_app` so it
     actually runs *before* it: Starlette's middleware stack executes the
@@ -287,6 +298,21 @@ async def request_size_limit_middleware(
     confirmed live via a two-middleware smoke test recording call order).
     """
     settings: Settings = request.app.state.settings
+
+    def _too_large_response() -> Response:
+        return _model_response(
+            ErrorResponse(
+                error_code="REQUEST_TOO_LARGE",
+                message=(
+                    "The request body exceeds the maximum allowed size of "
+                    f"{settings.max_request_body_bytes} bytes."
+                ),
+                retryable=False,
+                trace_id=str(uuid.uuid4()),
+            ),
+            status_code=_status_code_for_error("REQUEST_TOO_LARGE"),
+        )
+
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -294,18 +320,17 @@ async def request_size_limit_middleware(
         except ValueError:
             declared_bytes = None
         if declared_bytes is not None and declared_bytes > settings.max_request_body_bytes:
-            return _model_response(
-                ErrorResponse(
-                    error_code="REQUEST_TOO_LARGE",
-                    message=(
-                        "The request body exceeds the maximum allowed size of "
-                        f"{settings.max_request_body_bytes} bytes."
-                    ),
-                    retryable=False,
-                    trace_id=str(uuid.uuid4()),
-                ),
-                status_code=_status_code_for_error("REQUEST_TOO_LARGE"),
-            )
+            return _too_large_response()
+
+    chunks: list[bytes] = []
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > settings.max_request_body_bytes:
+            return _too_large_response()
+        chunks.append(chunk)
+    request._body = b"".join(chunks)  # mirrors Request.body()'s own cache — see docstring
+
     return await call_next(request)
 
 
@@ -522,7 +547,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # to resume into, but also not "no such thread": distinguished from
         # the truly-unknown-thread case above via `THREAD_INCOMPLETE`, not
         # reused as the same 404 code, so a client/observer can tell them
-        # apart in logs/metrics even though both currently render as 404.
+        # apart in logs/metrics even though both currently render as 404
+        # today. Routed through `_status_code_for_error` like every other
+        # error (finding M3, architect review 2026-08-20: this previously
+        # hardcoded `status_code=404` inline instead, silently bypassing
+        # the map this module's own docstring claims is exhaustive).
         return _model_response(
             ErrorResponse(
                 error_code="THREAD_INCOMPLETE",
@@ -530,7 +559,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 retryable=True,
                 trace_id=_current_trace_id(),
             ),
-            status_code=404,
+            status_code=_status_code_for_error("THREAD_INCOMPLETE"),
         )
 
     @app.post("/threads/{thread_id}/messages")

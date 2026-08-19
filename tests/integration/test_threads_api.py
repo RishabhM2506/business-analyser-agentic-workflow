@@ -664,6 +664,51 @@ async def test_post_message_oversized_body_rejected_with_413(
 
 
 @pytest.mark.integration
+async def test_post_message_oversized_body_rejected_even_without_content_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding H1 (architect review, 2026-08-20): the size-limit check
+    above only ever inspected the `Content-Length` header - a request with
+    no declared length at all (real-world equivalent: chunked transfer
+    encoding, which no real client of this JSON API sends but an
+    adversarial one certainly can) skipped it entirely and was fully
+    buffered into memory before Pydantic's own field-length validation
+    finally caught anything, defeating the whole point of an *edge* size
+    check. Passing an async generator as `content=` makes httpx stream the
+    body without computing a `Content-Length` up front - the same shape a
+    chunked-encoded request presents to the ASGI layer (no declared length,
+    delivered across multiple `http.request` messages) - so this exercises
+    `request_size_limit_middleware`'s stream-reading fallback for real, not
+    the header fast-path the test above already covers."""
+    thread_id = str(uuid.uuid4())
+    oversized_payload = b'{"hs_code": "010121", "partner_region": "' + b"A" * (100 * 1024) + b'"}'
+
+    async def _chunked_body() -> AsyncIterator[bytes]:
+        # Deliver in small pieces so the middleware's running-total check is
+        # genuinely exercised across multiple receive messages, not just a
+        # single oversized chunk.
+        chunk_size = 1024
+        for i in range(0, len(oversized_payload), chunk_size):
+            yield oversized_payload[i : i + chunk_size]
+
+    async with _client_for(_isolated_settings()) as client:
+        built_headers = client.build_request(
+            "POST", f"/threads/{thread_id}/messages", content=_chunked_body()
+        ).headers
+        assert "content-length" not in {k.lower() for k in built_headers}
+        response = await client.post(
+            f"/threads/{thread_id}/messages",
+            content=_chunked_body(),
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    body = _data(response)
+    assert body["error_code"] == "REQUEST_TOO_LARGE"
+    assert body["retryable"] is False
+
+
+@pytest.mark.integration
 async def test_post_message_body_within_limit_is_not_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
