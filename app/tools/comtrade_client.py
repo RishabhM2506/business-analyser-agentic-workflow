@@ -79,7 +79,7 @@ import logging
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -97,6 +97,30 @@ _SUBSCRIPTION_KEY_HEADER = "Ocp-Apim-Subscription-Key"
 _PARTNER_AREAS_CSV = Path(__file__).resolve().parents[2] / "data" / "comtrade-partner-areas.csv"
 
 _FLOW_CODES: dict[Literal["import", "export"], str] = {"import": "M", "export": "X"}
+
+
+class TradeDataProvider(Protocol):
+    """Minimal interface every trade-value data source must satisfy —
+    deliberately narrow so swapping the source (a paid registered-key
+    Comtrade tier, a different official statistics provider, or eventually
+    a shipment-level commercial provider) is a new adapter, not a new
+    interface. Mirrors `app.models.ModelClient`'s Protocol shape/rationale
+    exactly — same pattern, same reason: node code (`app/nodes/fetch_trade.py`)
+    depends on this Protocol, never on `ComtradeClient` concretely.
+
+    Named and scoped per the project's 2026-08-20 roadmap decision
+    (`docs/PLAN.md` "Trade-data-source flexibility"): UN Comtrade remains
+    the sole real implementation for now — this Protocol exists so a future
+    provider swap touches one new adapter file, not every call site."""
+
+    async def fetch_flow(
+        self,
+        *,
+        hs_code: str,
+        flow: Literal["import", "export"],
+        year_start: int,
+        year_end: int,
+    ) -> list[ComtradeRecord]: ...
 
 
 class ComtradeRecord(BaseModel):
