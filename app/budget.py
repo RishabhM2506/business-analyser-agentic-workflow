@@ -35,8 +35,8 @@ class BudgetExceededError(Exception):
 
 
 class BudgetTracker:
-    """Tracks model-call counts per thread and per (tenant, day) against
-    configured ceilings (`settings.max_model_calls_per_thread`,
+    """Tracks model-call counts per thread, per (tenant, day), and per day
+    globally, against configured ceilings (`settings.max_model_calls_per_thread`,
     `settings.max_model_calls_per_day`).
 
     Per-day counters are scoped by `tenant_id` (not global) so the
@@ -44,6 +44,20 @@ class BudgetTracker:
     request to `tenant_id="default"` (master brief §3: tenant_id is
     "threaded into... budget accounting" from day one, not bolted on when
     real multi-tenancy ships).
+
+    Finding C1 (architect review, 2026-08-20, filed once real Gemini/Comtrade
+    keys went live): `thread_id`/`tenant_id` are both free-form, client-
+    supplied strings on an unauthenticated endpoint (`docs/PLAN.md`'s
+    already-accepted "no auth in v1" decision) — an adversarial client
+    defeats the tenant-scoped day ceiling for free by minting a fresh
+    `tenant_id` per request, since each fresh key starts its own counter at
+    zero. The tenant-scoped ceiling stays (real value once real
+    multi-tenancy ships), but it can no longer be the *only* day-level
+    control: `_global_day_calls` enforces the same `max_calls_per_day`
+    figure again, keyed on the date alone, so rotating identities no longer
+    resets the effective ceiling. Zero behavior change for an honest client
+    (v1 has exactly one real tenant, "default" — both checks trip at the
+    same count); closes the bypass for an adversarial one.
     """
 
     def __init__(
@@ -58,21 +72,22 @@ class BudgetTracker:
         self._now_fn = now_fn
         self._thread_calls: dict[str, int] = {}
         self._day_calls: dict[tuple[str, date], int] = {}
+        self._global_day_calls: dict[date, int] = {}
         self._lock = asyncio.Lock()
 
     async def check_and_increment(self, *, thread_id: str, tenant_id: str) -> None:
-        """Raise `BudgetExceededError` if incrementing would breach either
-        ceiling; otherwise atomically increment both counters. Checked
-        before either counter is mutated, so a call that would breach the
-        *day* ceiling never partially increments the *thread* counter (or
-        vice versa) — fails closed, no partial spend recorded for a call
-        that was refused.
+        """Raise `BudgetExceededError` if incrementing would breach any
+        ceiling; otherwise atomically increment all three counters. Checked
+        before any counter is mutated, so a call that would breach one
+        ceiling never partially increments another — fails closed, no
+        partial spend recorded for a call that was refused.
         """
         async with self._lock:
             today = self._now_fn().date()
             day_key = (tenant_id, today)
             thread_count = self._thread_calls.get(thread_id, 0)
             day_count = self._day_calls.get(day_key, 0)
+            global_day_count = self._global_day_calls.get(today, 0)
 
             if thread_count + 1 > self._max_calls_per_thread:
                 raise BudgetExceededError(
@@ -84,9 +99,17 @@ class BudgetTracker:
                     f"tenant {tenant_id!r} would exceed max_model_calls_per_day="
                     f"{self._max_calls_per_day} for {today.isoformat()}"
                 )
+            # C1: a global, non-keyed backstop — cannot be reset by minting a
+            # fresh tenant_id, unlike the check immediately above.
+            if global_day_count + 1 > self._max_calls_per_day:
+                raise BudgetExceededError(
+                    f"deployment would exceed max_model_calls_per_day="
+                    f"{self._max_calls_per_day} for {today.isoformat()} (global ceiling)"
+                )
 
             self._thread_calls[thread_id] = thread_count + 1
             self._day_calls[day_key] = day_count + 1
+            self._global_day_calls[today] = global_day_count + 1
 
 
 _budget_tracker_singleton: BudgetTracker | None = None
