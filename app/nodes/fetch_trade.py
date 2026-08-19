@@ -3,12 +3,18 @@ and fan into `aggregate` as a parallel superstep — two independent,
 read-only HTTP calls with no data dependency on each other (docs/PLAN.md
 §2.2).
 
-Both call `app.tools.comtrade_client.ComtradeClient.fetch_flow` through the
-tool-result cache (`app.cache.tool_cache.ToolCache`), one year at a time
-across `query`'s resolved year range — matching the cache's
-`(hs_code, flow, year)` key granularity and the client's own verified
-one-request-per-year behavior (see `comtrade_client.py`'s module
+Both fetch through the tool-result cache (`app.cache.tool_cache.ToolCache`),
+one year at a time across `query`'s resolved year range — matching the
+cache's `(hs_code, flow, year)` key granularity and the client's own
+verified one-request-per-year behavior (see `comtrade_client.py`'s module
 docstring).
+
+Depends on `TradeDataProvider` (a `Protocol`), not `ComtradeClient`
+concretely — `get_comtrade_client()` is the only place a concrete provider
+is named. Per the project's 2026-08-20 roadmap decision
+(`docs/PLAN.md` "Trade-data-source flexibility"): swapping the source later
+means writing one new adapter and changing that one call site, not this
+module.
 """
 
 from __future__ import annotations
@@ -21,12 +27,12 @@ from app.schemas.query import TradeQuery
 from app.state import AnalysisState, get_or_mint_trace_id, has_error
 from app.tools.comtrade_client import (
     ComtradeCircuitOpenError,
-    ComtradeClient,
     ComtradeClientError,
     ComtradeRecord,
     ComtradeSchemaValidationError,
     ComtradeTimeoutError,
     ComtradeUpstreamError,
+    TradeDataProvider,
     get_comtrade_client,
 )
 
@@ -75,7 +81,7 @@ async def _fetch_flow_cached(
     query: TradeQuery,
     *,
     flow: Literal["import", "export"],
-    client: ComtradeClient,
+    client: TradeDataProvider,
     cache: ToolCache,
 ) -> list[ComtradeRecord]:
     """Fetch one flow direction across `query`'s resolved year range,
