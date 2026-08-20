@@ -17,6 +17,8 @@ import httpx
 import pytest
 
 from app.tools.comtrade_client import (
+    AUTHENTICATED_PATH,
+    PREVIEW_PATH,
     ComtradeCircuitOpenError,
     ComtradeClient,
     ComtradeSchemaValidationError,
@@ -172,6 +174,108 @@ async def test_fetch_flow_issues_one_request_per_year() -> None:
     for req in handler.requests:
         assert req.url.params["reporterCode"] == "699"
         assert req.headers["Ocp-Apim-Subscription-Key"] == "test-key"
+
+
+# --- authenticated-path selection and fallback (2026-08-20 finding) ---------
+# AUTHENTICATED_PATH was defined but never actually used — every call went
+# to PREVIEW_PATH regardless of whether a real key was configured. Now
+# verified live against a real registered key (module docstring); these
+# tests lock in the selection/fallback logic that makes that real.
+
+
+class _PathAwareHandler:
+    """Records every request and returns a per-path canned response —
+    unlike `_json_handler`/`_CountingHandler`, which are path-agnostic and
+    can't simulate the authenticated endpoint rejecting a bad key while the
+    preview endpoint keeps working."""
+
+    def __init__(self, responses: dict[str, httpx.Response]) -> None:
+        self.responses = responses
+        self.requests: list[httpx.Request] = []
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return self.responses[request.url.path]
+
+
+@pytest.mark.integration
+async def test_authenticated_path_used_when_api_key_is_configured() -> None:
+    handler = _CountingHandler(_load_fixture("empty.json"))
+    client = ComtradeClient(api_key="real-looking-key", transport=httpx.MockTransport(handler))
+    try:
+        await client.fetch_flow(hs_code="010121", flow="import", year_start=2023, year_end=2023)
+    finally:
+        await client.aclose()
+
+    assert len(handler.requests) == 1
+    assert handler.requests[0].url.path == AUTHENTICATED_PATH
+
+
+@pytest.mark.integration
+async def test_preview_path_used_when_no_api_key_is_configured() -> None:
+    handler = _CountingHandler(_load_fixture("empty.json"))
+    client = ComtradeClient(api_key="", transport=httpx.MockTransport(handler))
+    try:
+        await client.fetch_flow(hs_code="010121", flow="import", year_start=2023, year_end=2023)
+    finally:
+        await client.aclose()
+
+    assert len(handler.requests) == 1
+    assert handler.requests[0].url.path == PREVIEW_PATH
+
+
+@pytest.mark.integration
+async def test_authenticated_path_falls_back_to_preview_on_401() -> None:
+    """An invalid/placeholder key (a fresh clone's `.env.example` default,
+    or CI's placeholder string) must not fail every single request — the
+    client transparently retries the *same* call against the free preview
+    tier instead of surfacing an error, since preview requires no key at
+    all."""
+    empty = _load_fixture("empty.json")
+    handler = _PathAwareHandler(
+        {
+            AUTHENTICATED_PATH: httpx.Response(401, text="invalid subscription key"),
+            PREVIEW_PATH: httpx.Response(200, json=empty),
+        }
+    )
+    client = ComtradeClient(api_key="invalid-key", transport=httpx.MockTransport(handler))
+    try:
+        records = await client.fetch_flow(
+            hs_code="010121", flow="import", year_start=2023, year_end=2023
+        )
+    finally:
+        await client.aclose()
+
+    assert records == []  # the preview call succeeded, not an error
+    assert [req.url.path for req in handler.requests] == [AUTHENTICATED_PATH, PREVIEW_PATH]
+
+
+@pytest.mark.integration
+async def test_authenticated_path_fallback_is_sticky_across_calls() -> None:
+    """Once a key is confirmed invalid, every subsequent call on this same
+    client must go straight to the preview path — never re-attempt (and
+    fail against) the authenticated path again."""
+    empty = _load_fixture("empty.json")
+    handler = _PathAwareHandler(
+        {
+            AUTHENTICATED_PATH: httpx.Response(401, text="invalid subscription key"),
+            PREVIEW_PATH: httpx.Response(200, json=empty),
+        }
+    )
+    client = ComtradeClient(api_key="invalid-key", transport=httpx.MockTransport(handler))
+    try:
+        await client.fetch_flow(hs_code="010121", flow="import", year_start=2023, year_end=2023)
+        await client.fetch_flow(hs_code="010121", flow="export", year_start=2023, year_end=2023)
+    finally:
+        await client.aclose()
+
+    # First fetch: one rejected authenticated attempt + one preview fallback.
+    # Second fetch: straight to preview, no repeated authenticated attempt.
+    assert [req.url.path for req in handler.requests] == [
+        AUTHENTICATED_PATH,
+        PREVIEW_PATH,
+        PREVIEW_PATH,
+    ]
 
 
 @pytest.mark.integration
