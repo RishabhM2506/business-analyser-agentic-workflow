@@ -49,19 +49,21 @@ notes:
    below), fetched live the same day from
    `comtradeapi.un.org/files/v1/app/reference/partnerAreas.json`.
 
-**Unverified / inferred, logged here and in the final implementation report**
-(never fabricated, per the operating contract): the authenticated production
-path (`AUTHENTICATED_PATH` below, `Ocp-Apim-Subscription-Key` header) is
-real and documented (the official `comtradeapicall` Python client's README,
-and the standard Azure API-Management subscription-key convention that
-`comtradeapi.un.org` uses), but no real `COMTRADE_API_KEY` exists yet to
-independently confirm its response shape end-to-end. It is assumed
-schema-identical to the verified preview shape above (same underlying UN
-Comtrade dataset, gated differently — this is how UN Comtrade's own docs
-describe the preview/full distinction). `ComtradeClient` defaults to the
-verified preview path; `base_url`/the path constants are there to retarget
-once a real key exists — re-verify the first live authenticated call before
-trusting it in production.
+**Authenticated path, verified live (2026-08-20, real registered key)**: the
+authenticated production path (`AUTHENTICATED_PATH` below,
+`Ocp-Apim-Subscription-Key` header) was previously unverified — real key
+now confirmed: `GET /data/v1/get/C/A/HS?...` with a real subscription key
+returned `200 OK`, 154 real records, schema-identical to the already-
+verified preview shape (`typeCode`/`reporterCode`/`flowCode`/`partnerCode`/
+`cmdCode`/`primaryValue`/`isReported`/`isAggregate`, etc.) — no schema
+changes needed. `ComtradeClient` prefers this path whenever a key is
+configured (`__init__`), with a one-time sticky fallback to the free
+preview tier in `_get_once` if the configured key turns out invalid
+(401/403) — handles a placeholder/never-registered key gracefully instead
+of failing every request. This also gets real production traffic off the
+free/unauthenticated preview tier's aggressive shared rate limiting (429s
+observed repeatedly during development) onto the registered key's own
+documented 500-calls/day quota.
 
 Reporter is fixed to India (`INDIA_REPORTER_CODE`, Comtrade code 699) — this
 whole project is an India-focused trade-data assistant throughout
@@ -345,6 +347,20 @@ class ComtradeClient:
         self._api_key = api_key
         self._max_attempts = max_attempts
         self._circuit_breaker = circuit_breaker or _CircuitBreaker()
+        # Finding (2026-08-20, real registered key provided for the first
+        # time): AUTHENTICATED_PATH was defined but never actually used —
+        # every call went to PREVIEW_PATH regardless of whether a real key
+        # was configured, so a genuine subscription key sat completely
+        # inert. Now verified live against the real endpoint with a real
+        # key (200 OK, 154 real records, same response schema as the
+        # already-verified preview shape — no schema changes needed).
+        # Prefer the authenticated path whenever any key is configured;
+        # `_get_once` falls back to the free preview tier, once and
+        # stickily, the first time the authenticated path rejects the key
+        # (401/403) — handles a placeholder/never-registered key (a fresh
+        # clone's `.env.example` default, or CI's placeholder string)
+        # gracefully instead of failing every single request.
+        self._use_authenticated_path = bool(api_key)
         # Sent on every request, including preview-endpoint ones (harmless
         # no-op there — confirmed live: preview calls succeed with zero auth
         # headers) so the one code path already carries the header the
@@ -437,12 +453,33 @@ class ComtradeClient:
         return result
 
     async def _get_once(self, params: dict[str, str]) -> _ComtradeEnvelope:
+        path = AUTHENTICATED_PATH if self._use_authenticated_path else PREVIEW_PATH
         try:
-            response = await self._client.get(PREVIEW_PATH, params=params)
+            response = await self._client.get(path, params=params)
         except httpx.TimeoutException as exc:
             raise ComtradeTimeoutError(f"UN Comtrade request timed out: {exc}") from exc
         except httpx.TransportError as exc:
             raise ComtradeUpstreamError(f"UN Comtrade transport error: {exc}") from exc
+
+        if self._use_authenticated_path and response.status_code in (401, 403):
+            # Sticky, one-time fallback (see __init__'s comment): this key
+            # doesn't work against the authenticated endpoint — retrying the
+            # identical call against the identical path can only ever fail
+            # the same way, so switch to the free preview tier for the rest
+            # of this client's lifetime rather than rejecting every request
+            # a misconfigured/placeholder key would otherwise cause.
+            logger.warning(
+                "comtrade.authenticated_path_rejected status_code=%s — "
+                "falling back to the unauthenticated preview endpoint",
+                response.status_code,
+            )
+            self._use_authenticated_path = False
+            try:
+                response = await self._client.get(PREVIEW_PATH, params=params)
+            except httpx.TimeoutException as exc:
+                raise ComtradeTimeoutError(f"UN Comtrade request timed out: {exc}") from exc
+            except httpx.TransportError as exc:
+                raise ComtradeUpstreamError(f"UN Comtrade transport error: {exc}") from exc
 
         if response.status_code == 429 or response.status_code >= 500:
             raise ComtradeUpstreamError(
