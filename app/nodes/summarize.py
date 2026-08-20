@@ -9,15 +9,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.budget import BudgetExceededError, get_budget_tracker
-from app.guardrails import check_numbers_grounded
+from app.guardrails import check_numbers_grounded, find_ungrounded_numbers
 from app.models import get_model_for_role
 from app.schemas.errors import ErrorResponse
 from app.schemas.response import TradeTable
 from app.settings import get_settings
 from app.state import AnalysisState, get_or_mint_trace_id, has_error
+
+logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 
 PROMPT_VERSION = "summarize-v1"
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "summarize.md"
@@ -127,6 +130,25 @@ async def summarize(state: AnalysisState) -> dict[str, Any]:
     if not check_numbers_grounded(
         result.analytical_summary, imports_table, exports_table, hs_code=query.hs_code
     ):
+        # QA finding (2026-08-20, first-ever live run against a real,
+        # non-deterministic model): the guardrail tripped on genuine live
+        # Gemini output the very first time it was exercised outside
+        # MockLLM/cassette replay, and there was nothing in the logs to
+        # explain why — `find_ungrounded_numbers` (app/guardrails.py) was
+        # built and unit-tested specifically "for actionable error
+        # messages/logging when the guardrail trips" but was never actually
+        # called from here. Without this, a real rejection in production
+        # was undiagnosable after the fact: the rejected text was simply
+        # discarded and nothing about its content was ever logged anywhere.
+        logger.warning(
+            "summarize.guardrail_rejected",
+            hs_code=query.hs_code,
+            trace_id=get_or_mint_trace_id(state),
+            ungrounded_numbers=find_ungrounded_numbers(
+                result.analytical_summary, imports_table, exports_table, hs_code=query.hs_code
+            ),
+            rejected_summary=result.analytical_summary,
+        )
         # The concrete v1 instance of "the LLM never produces a number"
         # (master brief §2.2) — a defined error fallback, never a silent
         # partial render (docs/PLAN.md §3.2).

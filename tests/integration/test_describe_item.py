@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TypeVar
 
 import pytest
+import structlog
 from pydantic import BaseModel
 
 import app.nodes.describe_item as describe_item_module
@@ -155,12 +156,24 @@ async def test_describe_item_output_containing_a_number_is_rejected(
         "trace_id": "t-88",
     }
 
-    result = await describe_item(state)
+    with structlog.testing.capture_logs() as captured_logs:
+        result = await describe_item(state)
 
     assert "item_description" not in result
     error = result["error"]
     assert isinstance(error, ErrorResponse)
     assert error.error_code == "UNGROUNDED_DESCRIPTION"
+
+    # QA finding (2026-08-20) -- mirrors summarize.py's identical fix; see
+    # that test file's comment for the full rationale.
+    rejection_logs = [
+        log for log in captured_logs if log["event"] == "describe_item.guardrail_rejected"
+    ]
+    assert len(rejection_logs) == 1
+    assert rejection_logs[0]["log_level"] == "warning"
+    assert rejection_logs[0]["hs_code"] == "010121"
+    assert rejection_logs[0]["found_numbers"] == [4.0]
+    assert "4 percent" in rejection_logs[0]["rejected_description"]
     assert error.trace_id == "t-88"
 
 
