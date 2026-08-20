@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.budget import BudgetExceededError, get_budget_tracker
@@ -16,6 +17,8 @@ from app.models import get_model_for_role
 from app.schemas.errors import ErrorResponse
 from app.settings import get_settings
 from app.state import AnalysisState, get_or_mint_trace_id, has_error
+
+logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 
 PROMPT_VERSION = "describe_item-v1"
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "describe_item.md"
@@ -91,6 +94,19 @@ async def describe_item(state: AnalysisState) -> dict[str, Any]:
         # membership-in-a-table doesn't even apply here — rather than the
         # table-membership check `check_numbers_grounded` does for the
         # analytical summary.
+        #
+        # QA finding (2026-08-20): mirrors the identical, previously-missing
+        # log line added to summarize.py's UNGROUNDED_SUMMARY path — see
+        # that file's comment for the full rationale (a rejection here was
+        # previously undiagnosable after the fact; nothing about the
+        # rejected content was ever logged).
+        logger.warning(
+            "describe_item.guardrail_rejected",
+            hs_code=query.hs_code,
+            trace_id=get_or_mint_trace_id(state),
+            found_numbers=extract_numbers(result.description),
+            rejected_description=result.description,
+        )
         return {
             "error": ErrorResponse(
                 error_code="UNGROUNDED_DESCRIPTION",

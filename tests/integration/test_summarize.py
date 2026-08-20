@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TypeVar
 
 import pytest
+import structlog
 from pydantic import BaseModel
 
 import app.nodes.summarize as summarize_module
@@ -131,12 +132,27 @@ async def test_summarize_fabricated_number_is_caught_by_output_guardrail(
         "trace_id": "t-99",
     }
 
-    result = await summarize(state)
+    with structlog.testing.capture_logs() as captured_logs:
+        result = await summarize(state)
 
     assert "analytical_summary" not in result
     error = result["error"]
     assert isinstance(error, ErrorResponse)
     assert error.error_code == "UNGROUNDED_SUMMARY"
+
+    # QA finding (2026-08-20): a real guardrail rejection previously left
+    # zero trace of *why* in the logs -- the rejected text and the specific
+    # offending number(s) were simply discarded, undiagnosable after the
+    # fact. Assert the fix actually logs enough to debug a real production
+    # rejection without needing to reproduce it.
+    rejection_logs = [
+        log for log in captured_logs if log["event"] == "summarize.guardrail_rejected"
+    ]
+    assert len(rejection_logs) == 1
+    assert rejection_logs[0]["log_level"] == "warning"
+    assert rejection_logs[0]["hs_code"] == "010121"
+    assert rejection_logs[0]["ungrounded_numbers"] == [99999999.0]
+    assert "99,999,999" in rejection_logs[0]["rejected_summary"]
     assert error.trace_id == "t-99"
 
 
