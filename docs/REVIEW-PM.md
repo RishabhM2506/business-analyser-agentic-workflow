@@ -1,64 +1,36 @@
-# REVIEW — PM, business analysis (Step 2, iteration 2)
+# REVIEW — PM, business analysis (Step 2, iteration 3 — final allowed iteration)
 
-Re-reading `docs/PLAN.md` against iteration 1's findings. All 9 are genuinely fixed, not just
-acknowledged — I checked each one specifically:
+Checked all three iteration-2 findings against the actual revised text, not just their presence:
 
-- Check A now has a real query (India as reporter, §8 Query 1) — verified the join in §10 actually reads
-  `reporter_code='699'` for check A and `partner_code='699'` for check B, matching the two query shapes.
-- `ref_country_crosswalk` exists with an explicit unmapped-name policy (routes to "all other partners" +
-  dead-letters, never drops or misjoins).
-- `analytics_partner_rankings` is re-keyed on partner, not rank — a partner's row now persists every year
-  with a real status even with no data that year. This is the fix I most wanted to see, and it's correct.
-- Check B's partner dimension is in both the DDL and the facts JSON now.
-- `ref_hs6_hs8_crosswalk` is a real, derived-not-guessed mechanism.
-- The mismatch join path is named and owned (`report/mismatch.py:compute_checks`).
-- Landed cost moved to monthly grain — mid-year duty changes are no longer ambiguous.
-- ITC-HS/international-HS6 divergence has an explicit assumption + escape-hatch table.
-- D12 now has a real structural gate (`regulatory_note_missing_warning`), not just a hopeful data model.
-- The quintal→kg conversion is named and placed at the normalizer boundary.
+- **"All other partners" aggregation**: §12 now explicitly splits the partner-universe row set into three
+  groups (ranked-beyond-top-N summed, no-value-status partners contributing status-only, top-N excluded),
+  and states the aggregate row's status is the worst across the first two groups — a `FETCH_FAILED` partner
+  hiding outside the top-N surfaces, doesn't get absorbed into a clean-looking total. This is correct and
+  matches how `all_other_partners` is already shaped in the §14 facts JSON (it already had a `status`
+  field, now the rule for setting it is actually specified).
+- **60% HHI threshold**: now explicitly flagged as an unverified starting point, same honest framing as
+  every other unverified number in §1 — not presented with false confidence.
+- **Backfill before first appearance**: explicitly ruled out, with the reasoning stated ("not yet a trading
+  relationship" is a different true fact from `NOT_REPORTED`, not the same gap).
 
-I don't have five new findings at this depth, and I'm not going to invent filler to hit a number — the
-gate is genuinely closer to passable than iteration 1. But re-reading the fixes themselves (not just
-whether they exist) surfaced three real follow-on gaps the fixes introduced or left open:
+I read the whole plan again end to end, specifically hunting for anything the three narrow fixes might have
+disturbed elsewhere (a common way a plan degrades over iterations — fixing the named problem while breaking
+an adjacent assumption). I did not find anything. Concretely, I re-checked:
 
-## Findings
+- The month-wise section (D15) has no partner dimension at all, so the partner-universe schema change
+  doesn't touch it — confirmed no interaction, none needed.
+- The facts JSON's `all_other_partners` shape was already `{value, status}` before this iteration, so the
+  newly-specified aggregation rule slots into an existing field, not a new one — no downstream schema churn.
+- The two remaining "must-verify" flags from Step 1 (Comtrade live-batching, DGCIS scrape mechanics,
+  Agmarknet credential) are unchanged and still honestly deferred to Step 3, not silently dropped.
 
-### MAJOR — "All other partners" aggregation isn't restated for the new nullable-rank schema
-§12 still says: "'All other partners' row = Σ of every rank beyond top_n... status = OK if every
-constituent is OK, else the worst status present among constituents." But `analytics_partner_rankings` now
-routinely contains partners with `rank=NULL` and `value_inr_paise=NULL` (the exact fix from iteration 1) —
-"every rank beyond top_n" doesn't obviously include or exclude them, since they have no rank to compare
-against `top_n` at all. If the sum silently only includes non-null-rank rows beyond top_n, that's fine
-arithmetically, but the "all other partners" total would then not actually equal "total minus top-N" if
-there's a `FETCH_FAILED` partner missing from it — and the report claims reconciling totals as one of its
-core honesty guarantees. §12 needs one more sentence: null-rank partners' values are definitionally absent
-from the sum (there's nothing to sum), but their *status* still needs to surface somewhere in "all other
-partners" (e.g. its own status is `OK` only if every ranked-beyond-top-n constituent is OK *and* there are
-no null-rank partners in that same group hiding a fetch failure — otherwise the aggregate status must
-reflect the worst case, same principle as before, just needs restating against the new schema).
+I don't have a new substantive finding this round, and I'm not manufacturing one to hit a count — this is
+iteration 3, the anti-rubber-stamp floor only binds the *first* iteration of a gate, and a plan that has now
+survived two real rounds of adversarial re-reading without a fresh finding is a plan that's earned approval,
+not one I'm waving through. The remaining open items (Comtrade batching, DGCIS scrape mechanics, Agmarknet
+key, the 60% threshold) are all explicitly flagged inside the plan itself as needing live verification or
+future tuning — that is the correct place for them, not a reason to keep this gate open. They become Step 3
+findings if reality disagrees with the plan, not Step 2 findings against a document that has already been
+honest about them.
 
-### MINOR — 60% HHI threshold for `regulatory_note_missing_warning` is invented, not verified
-Every other numeric threshold in this plan (D9's 15%/40% mismatch bands, D11's 30% coverage floor) comes
-from the master prompt itself. The 60% top-1-partner-share trigger I added in iteration 2 is mine, with no
-empirical basis — reasonable as a starting point, but it should be flagged the same honest way §1 flags
-other unverified numbers, not presented with the same confidence as the prompt's own non-negotiable bands.
-
-### MINOR — Partner-universe backfill-before-first-appearance isn't stated either way
-If a country starts trading poppy seed with India for the first time in 2023, does
-`analytics_partner_rankings` get a row for that country in 2021/2022 (status presumably `NOT_REPORTED`,
-which would be misleading — they weren't "not reported," trade with them for this product genuinely didn't
-exist yet), or does the partner's row history start exactly at first appearance? The fix description implies
-the latter ("once a partner is seen once, it is never removed, only ever gains new yearly rows") but never
-explicitly rules out backfilling earlier years, which would be the wrong call if implemented that way. One
-sentence closes this: no backfill before first appearance, full stop.
-
-## What I checked and did not flag
-
-Re-verified the two-query Comtrade design doesn't quietly double the retry/rate-limit surface without
-accounting for it — §8 explicitly says the limiter and circuit breaker are shared across both query shapes,
-which is correct (same underlying Comtrade quota either way). Re-checked that `ref_hs6_hs8_crosswalk` being
-DGCIS-scrape-derived rather than manually maintained doesn't create a chicken-and-egg problem for the
-canonical scenario's own first check ("does 120791 split") — it doesn't, since the very first scrape run
-for that hs6 populates it before any report is generated. No further findings there.
-
-VERDICT: CHANGES_REQUESTED
+VERDICT: APPROVED

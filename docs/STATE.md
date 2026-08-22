@@ -1,9 +1,9 @@
-CURRENT_STEP: 2
-CURRENT_ROLE: PM (business analysis)
-ITERATION: 2
-GATE_STATUS: changes_requested
-LAST_COMPLETED: docs/PLAN.md iteration 2 fixed all 9 iteration-1 findings (verified, not just acknowledged); docs/REVIEW-PM.md iteration 2 written — 1 MAJOR + 2 MINOR new findings
-NEXT_TASK: Return to Step 1 (staff engineer), iteration 3 (final allowed iteration before escalation) — fix: restate "all other partners" aggregation against the nullable-rank schema, flag the 60% HHI threshold as unverified/starting-point, state explicitly that partner rows never backfill before first appearance
-BLOCKED_ON: none — Agmarknet data.gov.in API key remains a known future blocker (PLAN.md §1), not blocking planning iteration
-OPEN_FINDINGS: BLOCKER=0, MAJOR=1, MINOR=2 (docs/REVIEW-PM.md iteration 2, none yet resolved)
+CURRENT_STEP: 3
+CURRENT_ROLE: Software engineer (backend)
+ITERATION: 1
+GATE_STATUS: approved
+LAST_COMPLETED: Step 2 APPROVED on iteration 3 (docs/REVIEW-PM.md) — docs/PLAN.md is frozen as the build reference
+NEXT_TASK: Build sequence item 1 (PLAN.md §17) — app/warehouse/schema.py (SQLAlchemy Core Table defs matching PLAN.md §4 DDL exactly) + Alembic setup (migrations/, alembic.ini) + initial migration, applied against the local docker-compose postgres and verified clean-from-empty
+BLOCKED_ON: none for schema/FX (build sequence items 1-2) — Agmarknet data.gov.in API key still blocks build sequence item 7 only; DGCIS scrape mechanics and Comtrade live-batching still need live verification before build sequence items 4-5
+OPEN_FINDINGS: none open (Step 2 gate closed APPROVED)
 FILES_IN_FLIGHT: none
