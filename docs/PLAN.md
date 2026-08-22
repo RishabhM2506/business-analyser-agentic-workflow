@@ -171,9 +171,16 @@ lineage set.
 -- because "verified" is a per-fact property, not a per-row one.
 --
 -- NULL value_pct is structural, not incidental: a row's value_pct is only
--- ever non-NULL when verification_status='VERIFIED' — this is what makes
--- "NULL/unknown must never be interpreted as 0%" true by construction
--- rather than by convention a query could accidentally violate.
+-- ever non-NULL when verification_status is 'VERIFIED' or 'EXPIRED' — this
+-- is what makes "NULL/unknown must never be interpreted as 0%" true by
+-- construction rather than by convention a query could accidentally
+-- violate. EXPIRED keeps its value_pct too (found via a real test, not
+-- assumed): the user's own rule — "preserve it for historical analysis" —
+-- requires the actual historical number, not just the fact one once
+-- existed; only NOT_VERIFIED/CONFLICTING have no trustworthy single value.
+-- landed_cost.py still excludes EXPIRED from any *current*/complete
+-- calculation regardless, by checking verification_status='VERIFIED'
+-- specifically, not "does a value exist."
 CREATE TYPE duty_verification_status AS ENUM ('VERIFIED', 'NOT_VERIFIED', 'CONFLICTING', 'EXPIRED');
 
 CREATE TABLE ref_duty_components (
@@ -182,7 +189,7 @@ CREATE TABLE ref_duty_components (
   effective_from       DATE NOT NULL,
   effective_to         DATE,                  -- set (and status flipped to EXPIRED) when superseded
   verification_status  duty_verification_status NOT NULL,
-  value_pct            NUMERIC(6,3),          -- NULL unless verification_status='VERIFIED'
+  value_pct            NUMERIC(6,3),          -- NULL unless VERIFIED or EXPIRED
   source_authority      TEXT NOT NULL,        -- e.g. 'ICEGATE Trade Guide on Imports', 'CBIC Tax Information Portal'
   source_reference        TEXT NOT NULL,      -- notification/circular number, or 'none found' for NOT_VERIFIED
   source_url                TEXT,
@@ -190,8 +197,8 @@ CREATE TABLE ref_duty_components (
   notes                         TEXT,         -- conditions, caveats, why NOT_VERIFIED/CONFLICTING
   CHECK (component IN ('BCD','AIDC','SWS','IGST')),
   CHECK (
-    (verification_status = 'VERIFIED' AND value_pct IS NOT NULL) OR
-    (verification_status != 'VERIFIED' AND value_pct IS NULL)
+    (verification_status IN ('VERIFIED','EXPIRED') AND value_pct IS NOT NULL) OR
+    (verification_status IN ('NOT_VERIFIED','CONFLICTING') AND value_pct IS NULL)
   ),
   PRIMARY KEY (hs8, component, effective_from)
 );
@@ -540,7 +547,7 @@ class ConflictCandidate(BaseModel):
 class DutyComponentEvidence(BaseModel):
     component: Literal["BCD", "AIDC", "SWS", "IGST"]
     verification_status: Literal["VERIFIED", "NOT_VERIFIED", "CONFLICTING", "EXPIRED"]
-    value_pct: Decimal | None       # None unless VERIFIED — enforced by validator, not just convention
+    value_pct: Decimal | None       # None unless VERIFIED or EXPIRED — enforced by validator, not just convention
     source_authority: str
     source_reference: str
     source_url: str | None

@@ -57,12 +57,34 @@ jobs:
   test:
     name: unit + integration (pytest)
     runs-on: ubuntu-latest
+    # Real Postgres for the trade pipeline's warehouse tests (docs/PLAN.md
+    # Testing standards: "Integration tests run against a real Postgres...
+    # not mocks") — every other test in this suite still defaults to
+    # sqlite (tests/conftest.py) and is unaffected; only tests that
+    # explicitly need app.warehouse use this DATABASE_URL.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: business_analyser_test
+          POSTGRES_USER: business_analyser
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U business_analyser -d business_analyser_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://business_analyser:ci-only@localhost:5432/business_analyser_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
       - run: uv sync --frozen --group dev
+      - run: uv run alembic upgrade head
       - run: uv run pytest -m "unit or integration" --cov=app --cov-report=term-missing --cov-fail-under=90
 
   llm:

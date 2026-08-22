@@ -91,9 +91,13 @@ ref_duty_components = Table(
     Column("verified_date", Date, nullable=False),
     Column("notes", Text, nullable=True),
     CheckConstraint("component IN ('BCD','AIDC','SWS','IGST')", name="ck_rdc_component"),
+    # EXPIRED also keeps its value_pct ("preserve it for historical
+    # analysis") — only NOT_VERIFIED/CONFLICTING have no trustworthy
+    # single number. See the matching validator in
+    # app.pipeline.duty_source.DutyComponentEvidence.
     CheckConstraint(
-        "(verification_status = 'VERIFIED' AND value_pct IS NOT NULL) OR "
-        "(verification_status != 'VERIFIED' AND value_pct IS NULL)",
+        "(verification_status IN ('VERIFIED','EXPIRED') AND value_pct IS NOT NULL) OR "
+        "(verification_status IN ('NOT_VERIFIED','CONFLICTING') AND value_pct IS NULL)",
         name="ck_rdc_value_matches_status",
     ),
     PrimaryKeyConstraint("hs8", "component", "effective_from"),

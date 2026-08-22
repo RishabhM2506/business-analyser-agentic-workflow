@@ -91,3 +91,66 @@ failed because `FrankfurterClient`'s `base_url` already includes `/v2` — fixed
 §17 — needs a real, sourced starter duty-rate table (a real CBIC citation), not fabricated numbers; may
 need to ask the user for a citation or a specific HS8/rate to seed it with, per this step's own instruction
 not to fabricate real-world facts.
+
+## Build sequence item 3: evidence-first duty data (superseded/expanded by user direction)
+
+User redirected this item entirely: instead of a flat, trusted duty-rate CSV, build an evidence-first model
+(VERIFIED/NOT_VERIFIED/CONFLICTING/EXPIRED per component, cited to ICEGATE/CBIC only, never a guessed or
+secondary-source value). Full design added to `docs/PLAN.md` §4a before implementing (schema, `DutySource`
+adapter contract, `landed_cost.py`'s new "never present a complete total when unverified" contract) — see
+the `docs(pipeline): evidence-first duty data design` commit.
+
+**Files**: `app/warehouse/schema.py` (`ref_duty_components`/`ref_duty_component_conflicts` replace
+`ref_duty_rates`; `analytics_landed_cost` gains nullable duty columns + `is_complete`/
+`excluded_components`), two new migrations, `app/warehouse/db.py` (new — process-wide `AsyncEngine`
+singleton, nothing existed for warehouse-table access before this), `app/pipeline/duty_source.py`
+(`DutySource` Protocol, `DutyEvidence`/`DutyComponentEvidence`/`ConflictCandidate` Pydantic models,
+`ManualDutySource`), `app/report/landed_cost.py` (`compute_landed_cost`), `scripts/record_duty_rate.py`
+(the curator CLI — the only write path into these tables). New tests: `tests/unit/test_duty_evidence_models.py`,
+`tests/unit/test_landed_cost.py`, `tests/integration/test_duty_source_manual.py` (real Postgres, via the
+new `tests/integration/conftest.py::warehouse_engine` fixture). `.github/workflows/ci.yml` gained a real
+`postgres` service for the `test` job — there was none before, a real gap against this project's own
+Testing standard ("integration tests run against a real Postgres... not mocks"); verified locally first
+that pointing `DATABASE_URL` at a real Postgres doesn't disturb the other 361 pre-existing tests before
+committing to the CI change.
+
+**Real bugs found only by actually running things, not by re-reading the code:**
+
+1. **A genuine design error caught by writing the test, not by review**: my first draft of the
+   `value_pct IS NOT NULL` rule was "if and only if VERIFIED" — writing
+   `test_an_expired_component_also_makes_the_result_incomplete` immediately failed, because an `EXPIRED`
+   row needs to *keep* its historical value_pct (the user's own spec: "preserve it for historical
+   analysis" requires the actual number, not just the fact one existed). Fixed in three places kept in
+   sync by hand: the Pydantic validator, the DB check constraint (a second, hand-written migration, since
+   Alembic's autogenerate does not diff CHECK constraint SQL bodies), and `docs/PLAN.md` §4a itself.
+   Verified the corrected constraint directly with `psql`: a `VERIFIED`-or-`EXPIRED` row with a value
+   succeeds, a `NOT_VERIFIED`/`CONFLICTING` row with a value still fails.
+2. **`scripts/record_duty_rate.py` needs the same `sys.path` fix `scripts/embed_taxonomy.py` already
+   established** (a plain script's own directory isn't enough for `app.*` absolute imports) —
+   live-reproduced (`ModuleNotFoundError: No module named 'app'`) before fixing it the same way.
+3. **`ref_duty_components.source_authority`/`source_reference` are `NOT NULL`** (matches `docs/PLAN.md`
+   §4a's own DDL), but the CLI's first draft left them unset for `NOT_VERIFIED` — live-reproduced a real
+   `NotNullViolationError` from Postgres. `schema.py`'s own comment had already anticipated this exact
+   case ("or 'none found' for NOT_VERIFIED") but the CLI never implemented it; fixed to default both
+   fields to `"none found"` for `NOT_VERIFIED`, matching the already-established pattern for `CONFLICTING`.
+
+**Verification performed** (real, not claimed):
+- The DB check constraint genuinely rejects both wrong shapes and accepts the right one — direct `psql`
+  inserts, not just trusted from the Pydantic layer.
+- Full downgrade/upgrade round-trip on both new migrations, checkpoint tables confirmed untouched
+  throughout (same discipline as build sequence item 1).
+- The real CLI script run end-to-end against the real local Postgres: a `VERIFIED` rate recorded, then
+  superseded by a later `VERIFIED` rate (confirmed via `psql` that the old row's `effective_to` was set and
+  its status flipped to `EXPIRED`, value preserved), a `NOT_VERIFIED` component recorded, a `CONFLICTING`
+  component recorded with both candidates present and neither auto-picked, and an intentionally-invalid
+  invocation (`VERIFIED` with no `--value-pct`) correctly rejected before ever touching the database.
+- `uv run pytest -q` with `DATABASE_URL` pointed at the real local Postgres: 377 passed (373 without it,
+  4 gracefully skipped rather than failing). `mypy`/`ruff`/`black` clean throughout.
+
+**Still open, unchanged from before this item**: no real HS 120791 duty rates exist in the table yet — the
+user's direction was about the *mechanism*, not a specific rate; the actual `scripts/record_duty_rate.py`
+invocation for HS 12079100 needs a real citation from ICEGATE/CBIC, still pending.
+
+**Next**: build sequence item 4 (`app/pipeline/dgcis.py`) — needs real scrape-mechanics verification against
+the live DGCIS form first (`docs/PLAN.md` §1's flagged unknown), or item 5/6 (Comtrade mirror / BACI) if
+DGCIS's live form turns out to need more investigation than fits in one sitting.
