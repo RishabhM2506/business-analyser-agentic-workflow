@@ -1,6 +1,9 @@
 # PLAN — India Trade Analysis Pipeline (DGCIS-backbone)
 
-Status: DRAFT — Step 1, iteration 1. Awaiting Step 2 (PM) review.
+Status: DRAFT — Step 1, iteration 2. Revised in response to `docs/REVIEW-PM.md` iteration 1
+(4 BLOCKER + 4 MAJOR + 1 MINOR). Every finding is addressed inline below, each marked
+**[PM-1 fix: <finding>]** at the point of the fix, not collected in a separate changelog, so the fix is
+visible in context.
 
 ## 0. Repo survey — what already exists here
 
@@ -176,6 +179,55 @@ CREATE TABLE ref_regulatory_notes (         -- D12
   updated_by       TEXT NOT NULL
 );
 
+-- [PM-1 fix: BLOCKER "no country-code crosswalk"] DGCIS reports partner
+-- country as a free-text string; Comtrade/BACI use numeric UN/ISO codes.
+-- Every cross-source join (D9, D14 rankings) depends on this being correct
+-- and explicit, not implicit. Maintained the same way as ref_duty_rates: a
+-- committed CSV (data/country-crosswalk.csv), manually extended when a new
+-- unmapped DGCIS name is seen (see dead_letter policy below).
+CREATE TABLE ref_country_crosswalk (
+  dgcis_country_name TEXT PRIMARY KEY,      -- exact string as DGCIS renders it
+  country_code        TEXT NOT NULL,        -- UN M49 numeric code, matches Comtrade's reporter/partner codes
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- An DGCIS name with no crosswalk row does NOT block ingestion: the
+-- normalizer writes partner_country_code = 'UNMAPPED' (never drops the
+-- row), which routes into the "all other partners" bucket (D14) and is
+-- also written to dead_letter_ingestion with source='dgcis_crosswalk_gap'
+-- so it surfaces on the ops dashboard for a curator to add, rather than
+-- silently misjoining against a wrong code or silently vanishing.
+
+-- [PM-1 fix: MAJOR "HS6->HS8 mapping mechanism totally unspecified"] Not a
+-- manually maintained table like duty rates — this is DERIVED from what
+-- DGCIS's own scrape responses reveal. Every dgcis.py ingestion run
+-- upserts every distinct (hs6, hs8) pair it actually observed that run;
+-- "does 120791 split into multiple lines" becomes a direct query against
+-- this table, not an assumption. effective_to is set (not deleted) when a
+-- previously-seen hs8 stops appearing under its hs6 in a later run — this
+-- is itself a CODE_RETIRED signal, feeding back into §5's status enum.
+CREATE TABLE ref_hs6_hs8_crosswalk (
+  hs6              TEXT NOT NULL,
+  hs8              TEXT NOT NULL,
+  first_seen_at     TIMESTAMPTZ NOT NULL,
+  effective_to        TIMESTAMPTZ,          -- NULL = still observed in the most recent scrape
+  PRIMARY KEY (hs6, hs8)
+);
+
+-- [PM-1 fix: MAJOR "ITC-HS vs international HS6 divergence not addressed"]
+-- Documented assumption: ITC-HS8's leading 6 digits are treated as
+-- equivalent to the international HS6 used by Comtrade/BACI/this repo's
+-- own data/harmonized-system.csv taxonomy for join purposes. We do not
+-- build automated description-similarity checking for v1 (real effort,
+-- speculative payoff) — instead this is the explicit, human-populated
+-- escape hatch for the rare case where that assumption is known to be
+-- wrong for a specific code (most relevant right now given the live-found
+-- April-2026 ITC-HS revision).
+CREATE TABLE ref_hs_revision_notes (
+  hs6              TEXT PRIMARY KEY,
+  note             TEXT NOT NULL,           -- e.g. "ITC-HS8 12079100 does not map cleanly to intl HS6 120791 as of FY2026-27 revision; DGCIS totals for this code may be understated in check A/B/C"
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ── Raw layer: immutable, append-only, mirrors source shape ──────────────
 CREATE TABLE raw_dgcis_monthly (
   id               BIGSERIAL PRIMARY KEY,
@@ -278,18 +330,32 @@ CREATE TABLE normalized_trade_flows (
 );
 
 -- ── Analytics layer: precomputed on ingest, API reads only this ──────────
+-- [PM-1 fix: BLOCKER "partner-disappeared vs pipeline-broke is unanswerable"]
+-- Keyed on (hs6, flow, year, partner_country_code) — NOT (..., rank) — so a
+-- partner that has EVER appeared for this hs6/flow gets a row for every
+-- subsequent year, forever, even a year with zero data for them. `rank` is
+-- nullable and populated only for rows with a real, comparable value
+-- (status IN ('OK','ZERO')); a partner absent that year keeps its status
+-- row (NOT_REPORTED / FETCH_FAILED / SUPPRESSED / etc, per §5) with
+-- rank = NULL, so "this partner stopped trading" (NOT_REPORTED) and "our
+-- scraper broke" (FETCH_FAILED) are always distinguishable, never a
+-- silent gap in the list. The "partner universe" for a given (hs6, flow)
+-- is maintained by the ingestion normalizer: once a partner is seen once,
+-- it is never removed, only ever gains new yearly rows.
 CREATE TABLE analytics_partner_rankings (              -- D14 precompute strategy
   hs6              TEXT NOT NULL,
   flow             TEXT NOT NULL,
   year             INT NOT NULL,
-  rank              INT NOT NULL,
   partner_country_code TEXT NOT NULL,
-  value_inr_paise       BIGINT NOT NULL,
-  status                 cell_status NOT NULL,
-  PRIMARY KEY (hs6, flow, year, rank)
-  -- Full ranked list per (hs6,flow,year), every partner. Sliced to top-N at
-  -- query time (D14) — never precomputed per (years,topN) combination.
+  rank                   INT,               -- NULL when status has no comparable value
+  value_inr_paise           BIGINT,         -- NULL when rank is NULL
+  status                     cell_status NOT NULL,
+  PRIMARY KEY (hs6, flow, year, partner_country_code)
 );
+CREATE UNIQUE INDEX ix_apr_rank_where_present
+  ON analytics_partner_rankings (hs6, flow, year, rank) WHERE rank IS NOT NULL;
+  -- Slice to top-N at query time (D14): `WHERE rank <= :top_n AND rank IS NOT NULL`,
+  -- never precomputed per (years, topN) combination.
 
 CREATE TABLE analytics_monthly_current_year (            -- D15
   hs6              TEXT NOT NULL,
@@ -318,30 +384,53 @@ CREATE TABLE analytics_unit_value_series (               -- D8 three-way decompo
   PRIMARY KEY (hs6, flow, year)
 );
 
+-- [PM-1 fix: BLOCKER "check B has no partner dimension"] check B is
+-- inherently per-partner (D9: "DGCIS import vs partner's Comtrade
+-- export"); checks A and C are aggregate (whole-hs6, not per-partner).
+-- partner_country_code is part of the PK for all three so the schema is
+-- uniform: A/C rows use the sentinel 'ALL_PARTNERS' (Postgres PKs can't be
+-- NULL), B rows use the real partner_country_code — one row per partner
+-- per year, so "Turkey is 9%, Country X is 55%" coexist correctly.
 CREATE TABLE analytics_mismatch_checks (                  -- D9
   hs6              TEXT NOT NULL,
   flow             TEXT NOT NULL,
   year             INT NOT NULL,
   check_name        TEXT NOT NULL CHECK (check_name IN ('A_dgcis_vs_comtrade_india','B_dgcis_vs_partner_comtrade','C_dgcis_vs_baci')),
+  partner_country_code TEXT NOT NULL DEFAULT 'ALL_PARTNERS',
   gap_pct             NUMERIC(8,3) NOT NULL,
   severity             TEXT NOT NULL CHECK (severity IN ('quiet','flag','warning','untrustworthy')),
   direction_flip_yoy     BOOLEAN NOT NULL DEFAULT false,
-  PRIMARY KEY (hs6, flow, year, check_name)
+  PRIMARY KEY (hs6, flow, year, check_name, partner_country_code)
 );
 
+-- [PM-1 fix: MAJOR "mid-year duty-rate changes have no resolution rule"]
+-- Computed at MONTHLY granularity, not yearly — a Budget-day rate change
+-- is then visible exactly at the month it took effect, never averaged
+-- away or ambiguous about which rate applied. The report's headline
+-- "landed cost" figure for a year is explicitly the MOST RECENT month's
+-- row within that year, labeled "as of <month>" in the facts JSON (§14) —
+-- never a yearly average of a duty rate that only makes sense as a
+-- point-in-time figure.
 CREATE TABLE analytics_landed_cost (
   hs8              TEXT NOT NULL,
-  year             INT NOT NULL,
+  month            DATE NOT NULL,           -- first-of-month
   cif_inr_paise_per_kg BIGINT NOT NULL,
   bcd_inr_paise_per_kg BIGINT NOT NULL,
   aidc_inr_paise_per_kg BIGINT NOT NULL,
   surcharge_inr_paise_per_kg BIGINT NOT NULL,
   igst_inr_paise_per_kg BIGINT NOT NULL,
   landed_cost_inr_paise_per_kg BIGINT NOT NULL,
+  duty_rate_effective_from DATE NOT NULL,   -- traces back to the exact ref_duty_rates row used
+  -- [PM-1 fix: MINOR "Agmarknet per-quintal never converted to per-kg"]
+  -- Converted once, at the Agmarknet normalizer boundary (D7's "convert
+  -- only what needs converting" — do it once, at ingestion, never
+  -- mid-calculation): raw_agmarknet_prices.modal_price_inr_paise_per_qtl / 100
+  -- becomes normalized_trade_flows-equivalent per-kg value before it ever
+  -- reaches this table. landed_cost.py only ever reads already-per-kg values.
   domestic_price_inr_paise_per_kg BIGINT,     -- NULL if Agmarknet coverage too thin (see §1 gap)
   margin_pct          NUMERIC(8,3),
   domestic_price_confidence TEXT NOT NULL CHECK (domestic_price_confidence IN ('good','limited','unavailable')),
-  PRIMARY KEY (hs8, year)
+  PRIMARY KEY (hs8, month)
 );
 
 CREATE TABLE analytics_coverage_summary (                  -- D11
@@ -417,21 +506,37 @@ Every job proves idempotency with a "run twice, assert identical row count and c
 
 ## 8. Comtrade request shape / retry / limiter / breaker (D5, D6)
 
-Design (pending the live-batching verification flagged in §1):
+**[PM-1 fix: BLOCKER "check A cannot be computed from the query design"]** One query shape is not enough —
+check A (DGCIS vs India's *own* Comtrade submission) and check B (DGCIS vs *partner's* Comtrade submission)
+need India in different roles. Two query shapes, both still "one call, not fifty" (D5's actual requirement
+is *no per-country loop*, not *exactly one call ever*):
+
 ```
+Query 1 — India as REPORTER (feeds check A: India's own submission):
 GET {base}/data/v1/get/C/A/HS
-  ?reporterCode=          (omitted = all reporters, to be confirmed live)
-  &partnerCode=699        (India, always — this is a mirror of others' trade WITH India)
+  ?reporterCode=699
+  &partnerCode=          (omitted = all partners, to be confirmed live)
   &period=2021,2022,2023,2024,2025   (comma-joined, to be confirmed live)
   &cmdCode=<tracked hs6 list, comma-joined>
   &flowCode=M,X            (to be confirmed live)
+
+Query 2 — India as PARTNER (feeds check B: each partner's own submission about trade with India):
+GET {base}/data/v1/get/C/A/HS
+  ?reporterCode=          (omitted = all reporters, to be confirmed live)
+  &partnerCode=699
+  &period=2021,2022,2023,2024,2025
+  &cmdCode=<tracked hs6 list, comma-joined>
+  &flowCode=M,X
 ```
-Ranking (which partners matter) happens entirely in our own code from the returned rows — never a
-per-partner request. Retry: fixed schedule `[30, 60, 120, 300]` seconds ±20% jitter, `Retry-After` header
-overrides the schedule entry when present, token-bucket rate limiter sized to Comtrade's documented
-per-minute quota (to be confirmed against the real key's tier in Step 3), circuit breaker opens after 3
-consecutive 429s and pauses the worker 15 minutes. All retries run inside the background job — the mirror
-job is never invoked from a request path (this also satisfies D13).
+Both write into the same `raw_comtrade_records` table (§4) — which query a row came from is always
+recoverable from whether `reporter_code` or `partner_code` equals `'699'`, no new column needed. Ranking
+(which partners matter) happens entirely in our own code from the returned rows — never a per-partner
+request. Retry: fixed schedule `[30, 60, 120, 300]` seconds ±20% jitter, `Retry-After` header overrides the
+schedule entry when present, token-bucket rate limiter sized to Comtrade's documented per-minute quota (to
+be confirmed against the real key's tier in Step 3), circuit breaker opens after 3 consecutive 429s and
+pauses the worker 15 minutes — shared across both query shapes, since they hit the same rate limit. All
+retries run inside the background job — the mirror job is never invoked from a request path (this also
+satisfies D13).
 
 ## 9. Coverage gate (D11)
 
@@ -450,10 +555,24 @@ not theoretical).
 
 ## 10. Mismatch checks (D9)
 
+**[PM-1 fix: MAJOR "no described join path from normalized_trade_flows to analytics_mismatch_checks"]**
+Owned by `report/mismatch.py:compute_checks(hs6, flow, year)`, run as part of the same ingestion pass that
+writes `analytics_partner_rankings` (so mismatch checks are always precomputed, never request-time). Join
+is always `normalized_trade_flows` filtered to `hs6, flow, period_month within year`, grouped by
+`partner_country_code` (via `ref_country_crosswalk`, §4 — this is exactly the join finding #2 flagged as
+the highest-risk spot, so it's the *only* place this join happens, not re-implemented per check):
 ```
+check_A(year)          = groupby(source) -> compare 'dgcis' total vs 'comtrade' rows WHERE reporter=India (Query 1, §8)
+check_B(year, partner) = compare 'dgcis' row for that partner vs 'comtrade' row WHERE reporter=partner (Query 2, §8)
+check_C(year)           = compare 'dgcis' total vs 'baci' total (FOB, already CIF/FOB-adjusted by CEPII)
+
 check_A(year) = |dgcis_total - comtrade_india_reported_total| / dgcis_total
 check_B(year, partner) = |dgcis_import - partner_comtrade_export| / dgcis_import   # expect 5-12%, quiet
 check_C(year) = (baci_fob_total - dgcis_cif_total) / dgcis_cif_total               # expect BACI < DGCIS
+```
+A partner with `partner_country_code = 'UNMAPPED'` (§4) is excluded from check B individually and folded
+into check A/C's aggregate totals only — an unmapped country cannot be blamed for a specific partner-level
+gap it can't be identified for.
 
 severity:
   gap < 15%             -> quiet note
@@ -475,6 +594,8 @@ it into a flag later.
 - **Landed cost/kg** = `cif_inr_paise_per_kg × (1 + bcd_pct + aidc_pct + surcharge_pct) × (1 + igst_pct)`
   (duty on duty-inclusive base, matching how BCD/AIDC/surcharge compound before IGST is applied — verify
   the exact compounding order against a real CBIC worked example in Step 3, flagged, not assumed here).
+  Computed monthly (§4's revised `analytics_landed_cost`); the report's headline figure is the most recent
+  month within the selected window, labeled "as of `<month>`" rather than a yearly average.
 - **Margin** = `(domestic_price_per_kg - landed_cost_per_kg) / domestic_price_per_kg`, `domestic_price_confidence`
   copied from the Agmarknet coverage check (thin mandi coverage → `limited`, never silently `good`).
 - **FX decomposition**: §6.
@@ -517,15 +638,29 @@ as its own report section, never merged into the annual series (different confid
     {"year": 2021, "inr_paise_per_kg": 0, "delta_qty_pct": 0, "delta_price_pct": 0, "delta_fx_pct": 0}
   ],
   "hhi_by_year": [{"year": 2021, "hhi": 0.0}],
-  "landed_cost": {"year": 2025, "inr_paise_per_kg": 0, "domestic_price_inr_paise_per_kg": null,
+  "landed_cost": {"as_of_month": "2025-11", "inr_paise_per_kg": 0, "domestic_price_inr_paise_per_kg": null,
                     "margin_pct": null, "domestic_price_confidence": "limited"},
-  "mismatch_checks": [{"check": "B_dgcis_vs_partner_comtrade", "year": 2025, "gap_pct": 9.1, "severity": "quiet"}],
+  "mismatch_checks": [
+    {"check": "B_dgcis_vs_partner_comtrade", "year": 2025, "partner": "Turkey", "gap_pct": 9.1, "severity": "quiet"}
+  ],
   "regulatory_note": "CBN contract registration required; imports permitted only from a restricted origin list.",
+  "regulatory_note_missing_warning": false,
   "coverage": {"expected_cells": 0, "present_cells": 0, "not_yet_published": 0, "suppressed": 0,
                 "fetch_failed": 0, "degraded": false},
-  "hs8_split_note": "12079100 is the only ITC-HS8 line beneath 120791 as of this vintage — DGCIS's value here is frequency, not added granularity."
+  "hs8_split_note": "12079100 is the only ITC-HS8 line beneath 120791 as of this vintage (from ref_hs6_hs8_crosswalk) — DGCIS's value here is frequency, not added granularity."
 }
 ```
+**[PM-1 fix: BLOCKER "check B has no partner dimension"]**: every `mismatch_checks` entry now carries
+`"partner"` (§4's DDL fix); A/C entries carry `"partner": "ALL_PARTNERS"`.
+
+**[PM-1 fix: MAJOR "D12 enforcement gate"]**: `regulatory_note_missing_warning` is `true` when
+`ref_regulatory_notes` has no row for this hs6 **and** the latest `hhi_by_year` value exceeds a concentration
+threshold (top-1 partner share > 60%) — a genuine, checkable proxy for "this market might be regulated, not
+just commercially concentrated." `report/narrative.py`'s system prompt hard-rules: when this flag is true,
+the model must describe partner concentration neutrally ("origin is concentrated; reason not on file") and
+is explicitly forbidden from offering a commercial-preference explanation — this is the structural guard
+D12 was missing, not just a maintained-data-exists-somewhere hope.
+
 Every numeral the LLM is allowed to state must trace to a field in this document. `report/narrative.py`'s
 post-validator extracts every number from the model's prose and asserts membership against a flattened set
 of every numeric leaf in this JSON (mirrors the existing `app.guardrails.check_numbers_grounded` pattern
@@ -571,6 +706,20 @@ gets removed.
   behavior when the window exceeds available data.
 - `tests/integration/report/test_all_other_partners_reconciles.py` — sum of top-N + "all other partners" ==
   sum of the full ranked list, for a synthetic partner set larger than top-N.
+- `tests/unit/pipeline/test_country_crosswalk.py` — an unmapped DGCIS country name writes
+  `partner_country_code='UNMAPPED'` (never dropped), routes into "all other partners," and produces a
+  `dead_letter_ingestion` row — never a silent misjoin.
+- `tests/integration/report/test_partner_universe_persists.py` — the direct regression test for PM-1's
+  headline finding: a partner present in year N and absent in year N+1 must appear in
+  `analytics_partner_rankings` for year N+1 with `rank=NULL` and a real status (`NOT_REPORTED`), never
+  simply missing from the table; a `FETCH_FAILED` case for the same partner/year must be distinguishable
+  from the `NOT_REPORTED` case by status alone.
+- `tests/unit/report/test_check_a_uses_india_as_reporter.py` — asserts `compute_checks`'s check-A query
+  reads `raw_comtrade_records` rows where `reporter_code='699'` (Query 1, §8), not `partner_code='699'`
+  rows — the direct regression test for PM-1's check-A finding.
+- `tests/unit/report/test_regulatory_note_gate.py` — high-HHI + no `ref_regulatory_notes` row ->
+  `regulatory_note_missing_warning=true` in the facts JSON, and a fixed narrative prompt fixture asserts the
+  model is instructed not to offer a commercial-preference explanation when the flag is true.
 - Unit tests never touch the network (existing repo convention, `MockEmbeddingsClient`/`MockLLM`-style
   fakes extended here for `httpx`/Redis where needed).
 
@@ -604,10 +753,10 @@ gets removed.
 | D6 | §8 |
 | D7 | Every `normalized_trade_flows` column (§4) |
 | D8 | §6, with the verified Frankfurter-behavior deviation recorded in §1 |
-| D9 | §10 |
+| D9 | §10, with the two-query Comtrade design (§8) and the partner dimension (§4) fixed in iteration 2 |
 | D10 | §5 (`UNIT_MISMATCH`), §9 gate ordering (unit check before rollup) |
 | D11 | §9 |
-| D12 | `ref_regulatory_notes` (§4), fed into §14's facts JSON |
+| D12 | `ref_regulatory_notes` (§4) + the `regulatory_note_missing_warning` enforcement gate (§14, added iteration 2) |
 | D13 | `routes/trade_report.py` never calls a `pipeline/*` job synchronously; an untracked HS6 returns
         `NOT_TRACKED` + an enqueue option, mirroring the existing repo's "ingestion and query are separate
         planes" absence today (there is currently no ingestion at all in this repo — this plan introduces
