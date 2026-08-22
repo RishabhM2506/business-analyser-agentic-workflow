@@ -10,10 +10,39 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, TypedDict
 
+from pydantic import BaseModel, ConfigDict
+
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
 from app.schemas.response import TradeAnalysisResponse, TradeTable
 from app.tools.comtrade_client import ComtradeRecord
+
+
+class FetchIssue(BaseModel):
+    """One (year, reason) pair where `app.nodes.fetch_trade` ultimately
+    failed to fetch that year after every retry attempt — `reason` is the
+    real caught exception's own message (`str(exc)`), never a paraphrase.
+
+    A Pydantic model, not a plain `@dataclass` (live-reproduced 2026-08-21:
+    a plain dataclass here made `GET /threads/{id}` silently fail to
+    deserialize this field back out of the checkpointer —
+    `langgraph.checkpoint.serde.jsonplus`'s msgpack serde only reconstructs
+    a custom type via an `allowed_msgpack_modules` allowlist arbitrary
+    dataclasses aren't on; Pydantic models get native, no-allowlist-needed
+    support). Matches `app.tools.comtrade_client.ComtradeRecord` — the same
+    "small typed value stored in `AnalysisState` and round-tripped through
+    the checkpointer" shape, solved the same way there already.
+
+    Defined here (not in `app.nodes.fetch_trade`, where it's constructed)
+    so both that module and `app.nodes.aggregate` can import it from this
+    shared, dependency-free module without either importing the other —
+    `app.nodes.fetch_trade` already imports `AnalysisState`/`has_error`
+    from this module, so the reverse import would be circular."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    year: int
+    reason: str
 
 
 def _keep_first_error(
@@ -103,6 +132,12 @@ class AnalysisState(TypedDict, total=False):
 
     raw_imports: list[ComtradeRecord]
     raw_exports: list[ComtradeRecord]
+    # Per-year fetch failures that survived every retry attempt (2026-08-20
+    # roadmap decision: graceful degradation over a hard request failure —
+    # see `app.nodes.fetch_trade`'s module docstring). Always written
+    # alongside its sibling `raw_*` key, empty in the common case.
+    import_fetch_issues: list[FetchIssue]
+    export_fetch_issues: list[FetchIssue]
 
     imports_table: TradeTable
     exports_table: TradeTable

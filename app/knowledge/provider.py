@@ -103,6 +103,19 @@ def is_known_hs6_code(hs_code: str, *, taxonomy_path: str = _DEFAULT_TAXONOMY_PA
     return entry is not None and entry.level == HS6_LEVEL
 
 
+def get_hs6_taxonomy_entries(*, taxonomy_path: str = _DEFAULT_TAXONOMY_PATH) -> list[TaxonomyEntry]:
+    """Every HS6-level (`level == "6"`) row in the checked-in taxonomy —
+    the shared corpus for `app.search`'s BM25 index and the offline
+    embedding-generation script (`scripts/embed_taxonomy.py`). Reuses this
+    module's own cached `_load_taxonomy` rather than a second CSV parser,
+    same rationale as `is_known_hs6_code`/`build_taxonomy_text` above:
+    "one CSV loader... rather than two independent parsers of the same
+    file drifting apart." Row order is the CSV's own iteration order,
+    stable for a given file (Python 3.7+ dicts preserve insertion order)."""
+    entries = _load_taxonomy(_resolve_path(taxonomy_path))
+    return [entry for entry in entries.values() if entry.level == HS6_LEVEL]
+
+
 def build_taxonomy_text(
     hs_code: str,
     *,

@@ -71,6 +71,29 @@ class TradeTable(BaseModel):
     # purely additive field — every real construction path
     # (`build_trade_table`) sets it explicitly regardless.
     years_no_data: list[int] = Field(default_factory=list)
+    # 2026-08-20, live user-reported finding: a year whose Comtrade fetch
+    # itself failed (rate-limited/timed-out/etc. after every retry attempt)
+    # is a *third*, distinct case from both `years_finalized`'s complement
+    # and `years_no_data` — we don't actually know whether real data exists
+    # for that year, only that we couldn't retrieve it just now. Conflating
+    # it with `years_no_data` (which means Comtrade was successfully asked
+    # and genuinely had nothing) would repeat the exact class of mistake
+    # finding M21/PBO-03 already fixed for a different pair of cases. Each
+    # entry is a real, honest, one-line note (the real caught exception's
+    # own message, never a paraphrase) — computed here in code and placed
+    # directly in the response, never passed through the LLM, matching how
+    # every other footnote field on this model is grounded. Empty in the
+    # overwhelmingly common case (nothing failed) — defaulted, not
+    # required, since every pre-existing construction path predates this
+    # field.
+    fetch_issues: list[str] = Field(default_factory=list)
+    # The `year` half of each `fetch_issues` entry, structured — the
+    # frontend needs this to correctly exclude a fetch-failed year from the
+    # "provisional" `*` marker it renders per year-column (a fetch failure
+    # is not "check back later, still settling"), and parsing a year back
+    # out of `fetch_issues`' free-text messages would be fragile. Always
+    # exactly `len(fetch_issues)` long, same order.
+    fetch_issue_years: list[int] = Field(default_factory=list)
     excluded_partner_codes: list[str]  # transparency: aggregate/"nes" codes stripped
     rows: list[CountryRow]  # top 10
 
@@ -88,3 +111,32 @@ class TradeAnalysisResponse(BaseModel):
     exports: TradeTable
     analytical_summary: str
     provenance: Provenance
+
+
+class RankedCandidateOut(BaseModel):
+    """One reranked, display-ready HS6 candidate returned from
+    `POST /threads/{thread_id}/search` (`app.search.service`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hs_code: str
+    description: str
+    relevance_score: float
+
+
+class ProductSearchResponse(BaseModel):
+    """The full result of a free-text product search. `outcome` drives the
+    frontend's branch: `auto_selected` carries a non-null
+    `selected_hs_code` the UI should navigate straight to;
+    `disambiguate` asks the user to pick from `candidates`;
+    `no_candidates_found` is a normal 200 (a nonsense query returning
+    nothing is a legitimate outcome, not an error — the same principle as
+    `years_no_data` rendering "no data recorded," not a failure)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: str
+    query_text: str
+    outcome: Literal["auto_selected", "disambiguate", "no_candidates_found"]
+    selected_hs_code: str | None
+    candidates: list[RankedCandidateOut]

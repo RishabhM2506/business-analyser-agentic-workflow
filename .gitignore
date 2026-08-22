@@ -33,6 +33,18 @@ htmlcov/
 *.sqlite3
 .pytest-local.db
 
+# --- scripts/embed_taxonomy.py resume checkpoint ---------------------------
+# Written incrementally while the script runs (real Gemini free-tier daily
+# quota — 1000 embed requests/day, live-reproduced 2026-08-20 — routinely
+# spans multiple days for the full 5,613-row corpus); deleted automatically
+# on a successful full run. Never a build artifact, never committed.
+data/.hs_taxonomy_embeddings.progress.npy
+data/.hs_taxonomy_embeddings.progress.json
+# Log output from the daily launchd job (~/Library/LaunchAgents/
+# com.businessanalyser.embed-taxonomy.plist) that re-runs this script once a
+# day while a free-tier key's quota spreads the corpus over multiple days.
+data/.embed_taxonomy_launchd.log
+
 # --- Editors / OS ----------------------------------------------------------
 .DS_Store
 .idea/

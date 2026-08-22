@@ -341,7 +341,14 @@ class ComtradeClient:
         base_url: str = DEFAULT_BASE_URL,
         timeout_seconds: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
-        max_attempts: int = 3,
+        # Raised from 3 (2026-08-20, live-reproduced): a real 5-year/2-flow
+        # analysis fires up to 10 sequential-per-flow requests, and a real
+        # UN Comtrade key was observed rate-limiting one specific (year,
+        # flow) call with three consecutive 429s while every sibling call in
+        # the same batch recovered within 1-2 retries — 3 attempts is
+        # sometimes not enough headroom against a short-lived rate-limit
+        # burst that everything else in the same request rides out fine.
+        max_attempts: int = 5,
         circuit_breaker: _CircuitBreaker | None = None,
     ) -> None:
         self._api_key = api_key
