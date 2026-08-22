@@ -1,9 +1,9 @@
 # PLAN — India Trade Analysis Pipeline (DGCIS-backbone)
 
-Status: DRAFT — Step 1, iteration 2. Revised in response to `docs/REVIEW-PM.md` iteration 1
-(4 BLOCKER + 4 MAJOR + 1 MINOR). Every finding is addressed inline below, each marked
-**[PM-1 fix: <finding>]** at the point of the fix, not collected in a separate changelog, so the fix is
-visible in context.
+Status: DRAFT — Step 1, iteration 3 (final allowed iteration before escalation). Revised in response to
+`docs/REVIEW-PM.md` iteration 1 (4 BLOCKER + 4 MAJOR + 1 MINOR, marked **[PM-1 fix: ...]**) and iteration 2
+(1 MAJOR + 2 MINOR follow-on findings against those fixes, marked **[PM-2 fix: ...]**), both addressed
+inline at the point of the fix rather than in a separate changelog.
 
 ## 0. Repo survey — what already exists here
 
@@ -342,6 +342,13 @@ CREATE TABLE normalized_trade_flows (
 -- silent gap in the list. The "partner universe" for a given (hs6, flow)
 -- is maintained by the ingestion normalizer: once a partner is seen once,
 -- it is never removed, only ever gains new yearly rows.
+-- [PM-2 fix: MINOR "backfill-before-first-appearance ambiguous"] No
+-- backfill: a partner's row history starts exactly at the year they first
+-- appear for this (hs6, flow), never earlier. A year before a partner's
+-- first appearance means "not yet a trading relationship for this
+-- product," which is a different, true fact from NOT_REPORTED (which
+-- means the relationship exists but that period's filing is absent) —
+-- collapsing the two would misrepresent history, not just leave a gap.
 CREATE TABLE analytics_partner_rankings (              -- D14 precompute strategy
   hs6              TEXT NOT NULL,
   flow             TEXT NOT NULL,
@@ -605,10 +612,23 @@ it into a flag later.
 `years: int` (1-8, default 5), `top_n: int` (3-25, default 10) flow from the API request body →
 `report/service.py` → `analytics_partner_rankings` slice (`WHERE rank <= top_n`) and `analytics_*` window
 filters (`WHERE year >= current_year - years`). No literal `5`/`10` below the route handler's own default
-values. "All other partners" row = `Σ` of every rank beyond `top_n` for that `(hs6, flow, year)`, own
-`status` = `OK` if every constituent is `OK`, else the "worst" status present among constituents (never
-silently dropped — totals reconcile by construction since it's a sum over the *same* full ranked list the
-top-N was sliced from).
+values.
+
+**[PM-2 fix: MAJOR "'all other partners' not restated for the nullable-rank schema"]** "All other partners"
+is built from the **full partner-universe row set** for `(hs6, flow, year)`, split into three groups, not
+one sum:
+1. `rank > top_n` (real, comparable values beyond the cutoff) — summed into the value.
+2. `rank IS NULL` with a status that has no value at all (`NOT_REPORTED`, `SUPPRESSED`, `NOT_YET_PUBLISHED`,
+   `FETCH_FAILED`) — contribute nothing to the sum (there's nothing to add) but their **status** still
+   counts toward the aggregate row's own status.
+3. `rank <= top_n` — excluded entirely (already shown individually).
+
+`all_other_partners.value_inr_paise` = Σ of group 1 only. `all_other_partners.status` = `OK` only if every
+constituent in groups 1 **and** 2 is `OK`/`ZERO`; otherwise the worst status present across both groups
+(so a `FETCH_FAILED` partner hiding outside the top-N still surfaces as degraded status on the aggregate
+row, not silently absorbed into a clean-looking sum). Totals still reconcile: top-N shown + "all other
+partners" value + (group 2's implicit zero contribution, which is honest — there is genuinely no value to
+add for a `NOT_REPORTED` partner) always equals the sum of every `OK`/`ZERO` row in the full universe.
 
 ## 13. D15 — current-year month-wise section
 
@@ -656,7 +676,13 @@ as its own report section, never merged into the annual series (different confid
 **[PM-1 fix: MAJOR "D12 enforcement gate"]**: `regulatory_note_missing_warning` is `true` when
 `ref_regulatory_notes` has no row for this hs6 **and** the latest `hhi_by_year` value exceeds a concentration
 threshold (top-1 partner share > 60%) — a genuine, checkable proxy for "this market might be regulated, not
-just commercially concentrated." `report/narrative.py`'s system prompt hard-rules: when this flag is true,
+just commercially concentrated." **[PM-2 fix: MINOR "60% threshold is invented, not verified"]** Unlike
+D9's 15%/40% mismatch bands and D11's 30% coverage floor (both given directly by the master prompt), this
+60% figure is my own reasoned starting point, not empirically validated against real concentration data
+across tracked HS6 codes — flagged here the same way §1 flags other unverified numbers, and it's the first
+thing to revisit if it fires too often (every genuinely concentrated-but-unregulated commodity) or too
+rarely (a regulated market that just misses the threshold) once real data exists. `report/narrative.py`'s
+system prompt hard-rules: when this flag is true,
 the model must describe partner concentration neutrally ("origin is concentrated; reason not on file") and
 is explicitly forbidden from offering a commercial-preference explanation — this is the structural guard
 D12 was missing, not just a maintained-data-exists-somewhere hope.
