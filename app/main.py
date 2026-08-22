@@ -66,19 +66,25 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from langchain_core.exceptions import OutputParserException
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app.budget import BudgetExceededError, get_budget_tracker
 from app.cache.response_cache import filter_hash, get_response_cache
 from app.graph import COMBINED_PROMPT_VERSION, build_checkpointer, build_graph
 from app.guardrails import check_hs_code_allowlisted
+from app.models import get_model_for_role
 from app.nodes.validate_query import resolve_year_range
 from app.observability import build_trace_metadata, configure_langsmith_tracing
 from app.rate_limit import RateLimiter
 from app.schemas.errors import ErrorResponse
-from app.schemas.query import TradeQuery
-from app.schemas.response import TradeAnalysisResponse
+from app.schemas.query import ProductSearchQuery, TradeQuery
+from app.schemas.response import ProductSearchResponse, RankedCandidateOut, TradeAnalysisResponse
+from app.search.candidates import HybridSearchProvider
+from app.search.embeddings import get_embeddings_client
+from app.search.rerank import UngroundedRerankError
+from app.search.service import search_products
 from app.settings import Settings, get_settings
 from app.state import AnalysisState
 
@@ -99,6 +105,7 @@ _ERROR_STATUS_CODES: dict[str, int] = {
     "UPSTREAM_ERROR": 502,
     "UNGROUNDED_SUMMARY": 502,
     "UNGROUNDED_DESCRIPTION": 502,
+    "RERANK_INVALID_CANDIDATE": 502,
     "BUDGET_EXCEEDED": 429,
     "INCOMPLETE_STATE": 500,
     "SCHEMA_VALIDATION_FAILED": 500,
@@ -183,6 +190,16 @@ def _model_response(
     )
 
 
+def _bare_response(model: BaseModel, *, status_code: int) -> JSONResponse:
+    """Like `_model_response`, but without the `{"type": "final", "data":
+    ...}` envelope — used only by `post_search` below, which never touches
+    the graph/checkpointer and so has none of `_model_response`'s
+    streaming-envelope rationale (docs/PLAN.md's 2026-08-20 search-feature
+    roadmap decision: structurally closer to `POST /threads`'s own
+    unenveloped precedent than to `post_message`'s)."""
+    return JSONResponse(status_code=status_code, content=model.model_dump(mode="json"))
+
+
 def _current_trace_id() -> str:
     """The request-scoped id already bound by `request_id_middleware`
     (falls back to a fresh UUID4 if called outside a request, e.g. a
@@ -202,6 +219,31 @@ def configure_logging(*, json_logs: bool, log_level: str) -> None:
     to thread a request ID through every log line emitted during a request
     without passing a logger instance down every call chain. Documented in
     README.md's "Logging" section.
+
+    Mutates the existing `structlog.get_config()["processors"]` list in
+    place (`.clear()` + `.extend()`) rather than handing `structlog.configure`
+    a brand-new list object. Live-reproduced regression (2026-08-20/21,
+    `tests/integration/test_summarize.py`'s guardrail-rejection-logging
+    assertion failing only when certain other integration test files ran
+    first in the same pytest session): every module-level
+    `logger = structlog.get_logger("app")` (this app's standard pattern —
+    `app/nodes/summarize.py`, `describe_item.py`, etc.) is a lazy proxy that,
+    under `cache_logger_on_first_use=True`, permanently caches a *reference*
+    to whichever processors list was live the first time it actually logged
+    anything. `structlog.testing.capture_logs()`'s own docstring states its
+    contract precisely: it only works with that caching turned on because it
+    also mutates the *same* list in place, so an already-cached logger's
+    stale reference still sees the swapped-in `LogCapture` processor. Every
+    prior call to *this* function replaced that list wholesale instead —
+    each of this test suite's many independent `create_app()`/`lifespan`
+    instances re-running it once per test — which silently orphaned any
+    logger cached against an earlier instance's list, so a later
+    `capture_logs()` block (itself mutating only the *latest* list) could
+    never see that logger's output again. Real production only ever calls
+    this once at startup, so this had zero live-traffic impact — it was
+    purely a test-process artifact, but a dangerous one: it silently
+    disabled the exact log-line assertion this session's own earlier QA fix
+    added specifically to make a real guardrail rejection diagnosable.
     """
     shared_processors: list[structlog.typing.Processor] = [
         structlog.contextvars.merge_contextvars,
@@ -210,11 +252,11 @@ def configure_logging(*, json_logs: bool, log_level: str) -> None:
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
     ]
+    processors = structlog.get_config()["processors"]
+    processors.clear()
+    processors.extend([*shared_processors, structlog.stdlib.ProcessorFormatter.wrap_for_formatter])
     structlog.configure(
-        processors=[
-            *shared_processors,
-            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
-        ],
+        processors=processors,
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
@@ -755,6 +797,114 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 trace_id=trace_id,
             ),
             status_code=500,
+        )
+
+    @app.post("/threads/{thread_id}/search")
+    async def post_search(thread_id: str, query: ProductSearchQuery, request: Request) -> Response:
+        """Free-text product search: BM25 + vector + reciprocal-rank-fusion
+        candidates, reranked by one MODEL_UTILITY call
+        (`app.search.service.search_products`). Bare response, not
+        `{type, data}`-enveloped — see `_bare_response`'s docstring.
+        `no_candidates_found` is a normal 200, not an error (a nonsense
+        query returning nothing is a legitimate outcome — the same
+        principle as `TradeTable.years_no_data` rendering "no data
+        recorded," not a failure)."""
+        settings: Settings = request.app.state.settings
+        trace_id = _current_trace_id()
+        structlog.contextvars.bind_contextvars(tenant_id=query.tenant_id, user_id=query.user_id)
+
+        search_provider = HybridSearchProvider(
+            embeddings_client=get_embeddings_client(provider=settings.llm_provider)
+        )
+        model_client = get_model_for_role("utility", provider=settings.llm_provider)
+
+        try:
+            result = await search_products(
+                query.query_text,
+                thread_id=thread_id,
+                tenant_id=query.tenant_id,
+                search_provider=search_provider,
+                model_client=model_client,
+                budget_tracker=get_budget_tracker(),
+            )
+        except BudgetExceededError:
+            # Checked immediately before the one model call this pipeline
+            # can make (docs/PLAN.md §5.5: fails closed) — see
+            # `search_products`'s own docstring for the exact sequencing.
+            return _bare_response(
+                ErrorResponse(
+                    error_code="BUDGET_EXCEEDED",
+                    message="The model-call budget for this thread or day has been reached.",
+                    retryable=True,
+                    trace_id=trace_id,
+                ),
+                status_code=_status_code_for_error("BUDGET_EXCEEDED"),
+            )
+        except UngroundedRerankError as exc:
+            # Code-level enforcement (`app.guardrails.check_hs_codes_grounded`),
+            # already logged with the offending codes inside
+            # `rerank_candidates` itself — this is just the HTTP mapping.
+            logger.warning(
+                "search.guardrail_rejected",
+                thread_id=thread_id,
+                query_text=query.query_text,
+                ungrounded_codes=exc.ungrounded_codes,
+            )
+            return _bare_response(
+                ErrorResponse(
+                    error_code="RERANK_INVALID_CANDIDATE",
+                    message=(
+                        "The search reranker returned an invalid result and was "
+                        "discarded rather than shown."
+                    ),
+                    retryable=True,
+                    trace_id=trace_id,
+                ),
+                status_code=_status_code_for_error("RERANK_INVALID_CANDIDATE"),
+            )
+        except Exception:
+            # Defensive, matching `post_message`'s identical catch-all
+            # (docs/PLAN.md §3.2: *every* response is schema-validated, never
+            # a raw stack trace — master brief §9). Live-reproduced
+            # (2026-08-20, real `docker build`/`docker run` smoke test): a
+            # missing/corrupted `data/hs_taxonomy_embeddings.*` corpus
+            # (`app.search.vector_index.EmbeddingsFileMismatchError`, or a
+            # bare `FileNotFoundError` before that corpus has ever been
+            # generated via `scripts/embed_taxonomy.py`) previously reached
+            # here fully unhandled, returning FastAPI's default plain-text
+            # 500 instead of this endpoint's own `ErrorResponse` contract —
+            # exactly the "nothing tested the raw-exception path" gap this
+            # catch-all exists to close. `retryable=False`: unlike a
+            # transient upstream timeout, a missing/corrupted committed data
+            # file cannot be fixed by the client retrying the same request.
+            logger.exception("thread.search.unexpected_failure", thread_id=thread_id)
+            return _bare_response(
+                ErrorResponse(
+                    error_code="INTERNAL_ERROR",
+                    message="The search could not be completed due to an internal error.",
+                    retryable=False,
+                    trace_id=trace_id,
+                ),
+                status_code=_status_code_for_error("INTERNAL_ERROR"),
+            )
+
+        candidates_out = [
+            RankedCandidateOut(
+                hs_code=ranked.hs_code,
+                description=result.description_by_hs_code.get(ranked.hs_code, ""),
+                relevance_score=ranked.relevance_score,
+            )
+            for ranked in result.ranked_candidates
+        ]
+        return _bare_response(
+            ProductSearchResponse(
+                thread_id=thread_id,
+                query_text=query.query_text,
+                outcome=result.outcome,
+                selected_hs_code=result.selected_hs_code,
+                candidates=candidates_out,
+            ),
+            status_code=200,
         )
 
     return app

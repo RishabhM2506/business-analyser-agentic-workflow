@@ -87,3 +87,14 @@ class TradeQuery(BaseModel):
                     f"maximum allowed span of {MAX_YEAR_SPAN} years"
                 )
         return self
+
+
+class ProductSearchQuery(BaseModel):
+    """Request body for `POST /threads/{thread_id}/search`
+    (`app.search.service`) — free text in, ranked HS6 candidates out."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query_text: str = Field(min_length=1, max_length=200)
+    tenant_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
+    user_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)

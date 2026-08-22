@@ -18,9 +18,10 @@ documentation alone (`docs.langchain.com`'s current integration page for
 from __future__ import annotations
 
 import re
-from typing import Any, Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar, get_args, get_origin
 
 from pydantic import BaseModel
+from pydantic.fields import FieldInfo
 
 from app.guardrails import extract_numbers
 from app.nodes.aggregate import TOP_N_PARTNERS
@@ -108,6 +109,14 @@ def _mock_text_for(user_content: str, *, field_name: str) -> str:
       the output, not just "usually" avoid them. `_strip_numeric_words`
       removes every digit-containing token outright rather than trying to
       reformat around individual numbers.
+    - `app.search.normalize.NormalizedQuery`'s `normalized_query` field is a
+      deterministic passthrough of `user_content` (the raw query text)
+      unchanged — under `LLM_PROVIDER=mock`, normalization is always a
+      no-op, so `app.search.service.search_products`'s BM25-empty retry
+      path never fires in any mock-based test/CI run; it's exercised only
+      by tests using a fake `ModelClient` that returns a genuinely
+      different string (mirroring `test_describe_item.py`'s
+      `_NumberInventingModelClient` pattern).
     - Every other field (currently just `summarize`'s `analytical_summary`)
       keeps the original intent: if `user_content` contains any number (for
       `summarize`, the compact rendered trade table — `app/nodes/summarize.py`),
@@ -136,6 +145,9 @@ def _mock_text_for(user_content: str, *, field_name: str) -> str:
         body = excerpt or "a general trade classification"
         return f"[MockLLM deterministic output] {body}".strip()
 
+    if field_name == "normalized_query":
+        return user_content.strip()
+
     numbers = extract_numbers(user_content)
     if numbers:
         unambiguous = [n for n in numbers if not (n == round(n) and 0 <= n <= TOP_N_PARTNERS)]
@@ -145,20 +157,114 @@ def _mock_text_for(user_content: str, *, field_name: str) -> str:
     return f"[MockLLM deterministic output] {excerpt}".strip()
 
 
+_HS6_PATTERN = re.compile(r"\b\d{6}\b")
+
+# Not load-bearing for MockLLM's job (no existing field guardrail-checks a
+# bare float the way `describe_item`'s numbers are checked) — a fixed,
+# schema-valid constant is enough for `app.search.rerank.RankedCandidate.
+# relevance_score` and any future plain-`float` structured-output field.
+_MOCK_FLOAT_VALUE = 0.5
+
+
+def _list_item_model(annotation: Any) -> type[BaseModel] | None:
+    """If `annotation` is exactly `list[SomeModel]`, return `SomeModel`;
+    otherwise `None`. Used to detect the one new list shape `MockLLM`
+    supports (`app.search.rerank.RerankOutput.ranked_candidates`) without
+    handling `list[...]` in general."""
+    if get_origin(annotation) is not list:
+        return None
+    args = get_args(annotation)
+    if len(args) != 1 or not (isinstance(args[0], type) and issubclass(args[0], BaseModel)):
+        return None
+    return args[0]
+
+
+def _list_max_length(field: FieldInfo) -> int | None:
+    """`Field(max_length=...)` on a list field lands in `FieldInfo.metadata`
+    as an `annotated_types.MaxLen`, not a plain attribute (verified against
+    the installed `pydantic` directly) — read it back the same way."""
+    for constraint in field.metadata:
+        max_length = getattr(constraint, "max_length", None)
+        if isinstance(max_length, int):
+            return max_length
+    return None
+
+
+def _mock_nested_instance(item_model: type[BaseModel], *, hs_code: str, user_content: str) -> Any:
+    """Build one `item_model` instance for `_mock_hs_code_list` below.
+    `hs_code` is supplied directly (never routed through `_mock_text_for`,
+    which returns non-numeric prose that would fail that field's own
+    `pattern=r"^\\d{6}$"` constraint) — every other field falls back to the
+    same `str`/`float` handling `_build_mock_instance` itself supports."""
+    values: dict[str, Any] = {}
+    for name, field in item_model.model_fields.items():
+        if name == "hs_code":
+            values[name] = hs_code
+        elif field.annotation is str:
+            values[name] = _mock_text_for(user_content, field_name=name)
+        elif field.annotation is float:
+            values[name] = _MOCK_FLOAT_VALUE
+        else:
+            raise NotImplementedError(
+                f"MockLLM has no generic mock strategy for {item_model.__name__}.{name}: "
+                f"{field.annotation!r} (only plain `str`/`float` fields are supported)"
+            )
+    return item_model.model_validate(values)
+
+
+def _mock_hs_code_list(
+    item_model: type[BaseModel], *, field: FieldInfo, user_content: str
+) -> list[Any]:
+    """Every distinct 6-digit HS code mentioned in `user_content`, each
+    turned into one `item_model` instance — the real rerank prompt
+    (`app.search.rerank._build_user_content`) always lists candidate codes
+    as plain text, the same trick `_mock_text_for` already uses for
+    `summarize`'s numbers. Grounded by construction: every code this
+    produces necessarily came from the prompt itself, so a full graph run
+    under `LLM_PROVIDER=mock` exercises `app.guardrails.check_hs_codes_grounded`
+    meaningfully instead of trivially passing it. Zero codes found is a
+    caller bug (a rerank call with no candidates), not a case to paper over
+    with a fabricated placeholder — raises rather than returning an empty
+    or invented list."""
+    codes = list(dict.fromkeys(_HS6_PATTERN.findall(user_content)))
+    if not codes:
+        raise ValueError(
+            f"MockLLM found no 6-digit HS codes in user_content to build "
+            f"{item_model.__name__} instances from"
+        )
+    max_items = _list_max_length(field)
+    if max_items is not None:
+        codes = codes[:max_items]
+    return [
+        _mock_nested_instance(item_model, hs_code=code, user_content=user_content) for code in codes
+    ]
+
+
 def _build_mock_instance[U: BaseModel](schema: type[U], *, user_content: str) -> U:
     """Build a schema-valid canned instance generically from `schema`'s own
-    fields — works for any single-or-multi-`str`-field structured-output
-    schema without `MockLLM` needing to import `describe_item`'s or
-    `summarize`'s specific output types (which would create a circular
-    import: those modules import `app.models`)."""
+    fields — works for any structured-output schema built from `str`/
+    `float` fields, or a `list[NestedModel]` field where `NestedModel` has
+    an `hs_code` field, without `MockLLM` needing to import
+    `describe_item`'s/`summarize`'s/`app.search.rerank`'s specific output
+    types (which would create a circular import: those modules import
+    `app.models`)."""
     field_values: dict[str, Any] = {}
     for name, field in schema.model_fields.items():
+        item_model = _list_item_model(field.annotation)
         if field.annotation is str:
             field_values[name] = _mock_text_for(user_content, field_name=name)
+        elif field.annotation is float:
+            field_values[name] = _MOCK_FLOAT_VALUE
+        elif item_model is not None and "hs_code" in item_model.model_fields:
+            field_values[name] = _mock_hs_code_list(
+                item_model, field=field, user_content=user_content
+            )
         else:
             raise NotImplementedError(
                 f"MockLLM has no generic mock strategy for {schema.__name__}.{name}: "
-                f"{field.annotation!r} (only plain `str` fields are supported)"
+                f"{field.annotation!r} (only plain `str`/`float` fields and "
+                f"`list[NestedModel]` fields where `NestedModel` has an `hs_code` "
+                f"field are supported)"
             )
     return schema.model_validate(field_values)
 

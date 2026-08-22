@@ -20,11 +20,13 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import TypeVar
 
 import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from langchain_core.exceptions import OutputParserException
+from pydantic import BaseModel
 
 import app.nodes.describe_item as describe_item_module
 import app.nodes.fetch_trade as fetch_trade_module
@@ -34,6 +36,24 @@ from app.main import REQUEST_ID_HEADER, create_app
 from app.models import MockLLM
 from app.settings import Settings
 from app.tools.comtrade_client import ComtradeClient
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class _NumberInventingModelClient:
+    """Test double that always returns a schema-valid `description`
+    containing a number — a real, still-live in-graph failure path
+    (`describe_item`'s `UNGROUNDED_DESCRIPTION` output guardrail) used by
+    this file's error-resumability tests now that a Comtrade fetch failure
+    no longer produces `error` at all (2026-08-20 roadmap decision).
+    Mirrors `tests/integration/test_describe_item.py`'s identical double."""
+
+    async def generate_structured(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> T:
+        return schema.model_validate(
+            {"description": "This category represents about 4 percent of typical trade volume."}
+        )
 
 
 def _handler_with_data(request: httpx.Request) -> httpx.Response:
@@ -331,12 +351,26 @@ async def test_post_message_output_parser_exception_maps_to_schema_validation_fa
 
 
 @pytest.mark.integration
-async def test_post_message_upstream_timeout_maps_to_504(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _timeout_handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("simulated", request=request)
+async def test_post_message_upstream_timeout_degrades_gracefully_not_a_504(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-08-20 roadmap decision (live user-reported finding): a Comtrade
+    fetch failure no longer fails the whole request — the response is a
+    normal 200 with the failed year surfaced as `imports.fetch_issues`,
+    not a 504. Regresses what used to be `..._maps_to_504`. Only 2022 fails
+    (the other requested years succeed with empty-but-valid data), matching
+    the real live shape this was found in: one flaky year, not a total
+    outage — a genuinely single-year query would trip the shared circuit
+    breaker on its own first failure and never exercise the "some years
+    succeed, one doesn't" path this is actually regression-testing."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["period"] == "2022":
+            raise httpx.ReadTimeout("simulated", request=request)
+        return _handler_with_data(request)
 
     client = ComtradeClient(
-        api_key="test-key", transport=httpx.MockTransport(_timeout_handler), max_attempts=1
+        api_key="test-key", transport=httpx.MockTransport(_handler), max_attempts=1
     )
     monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client)
     monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: ToolCache())
@@ -344,11 +378,16 @@ async def test_post_message_upstream_timeout_maps_to_504(monkeypatch: pytest.Mon
 
     async with _client_for(_isolated_settings()) as client_app:
         response = await client_app.post(
-            f"/threads/{thread_id}/messages", json={"hs_code": "010121"}
+            f"/threads/{thread_id}/messages",
+            json={"hs_code": "010121", "year_start": 2021, "year_end": 2023},
         )
 
-    assert response.status_code == 504
-    assert _data(response)["error_code"] == "UPSTREAM_TIMEOUT"
+    assert response.status_code == 200
+    body = _data(response)
+    assert "error_code" not in body
+    assert len(body["imports"]["fetch_issues"]) == 1
+    assert "2022" in body["imports"]["fetch_issues"][0]
+    assert 2022 not in body["imports"]["years_no_data"]
 
 
 @pytest.mark.integration
@@ -379,35 +418,39 @@ async def test_get_thread_after_message_resumes_the_same_response(
 
 @pytest.mark.integration
 async def test_get_thread_after_error_resumes_the_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Uses an *in-graph* failure (upstream timeout), not the
-    `INVALID_HS_CODE` pre-check: that check deliberately rejects a request
-    before the graph is ever invoked (see `app/main.py`'s module docstring
-    on guardrail ordering), so it never writes any checkpoint for that
-    `thread_id` at all — `GET /threads/{id}` correctly reports
+    """Uses an *in-graph* failure (the output guardrail rejecting a
+    fabricated number — `describe_item`'s `UNGROUNDED_DESCRIPTION` path),
+    not the `INVALID_HS_CODE` pre-check: that check deliberately rejects a
+    request before the graph is ever invoked (see `app/main.py`'s module
+    docstring on guardrail ordering), so it never writes any checkpoint for
+    that `thread_id` at all — `GET /threads/{id}` correctly reports
     `THREAD_NOT_FOUND` for it (covered by
     `test_post_message_unknown_hs_code_returns_400_before_touching_upstream`
     above), not a resumable error. A failure that happens *inside* the
     graph, by contrast, does write real checkpoint state before returning
     — that's what this test proves is resumable.
+
+    A Comtrade fetch failure no longer serves this purpose (2026-08-20
+    roadmap decision: it degrades gracefully into `fetch_issues` instead of
+    writing `error` — see `test_post_message_upstream_timeout_degrades_
+    gracefully_not_a_504` above), so this uses the guardrail rejection path
+    instead, which still genuinely fails the graph.
     """
-
-    def _timeout_handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("simulated", request=request)
-
-    client_stub = ComtradeClient(
-        api_key="test-key", transport=httpx.MockTransport(_timeout_handler), max_attempts=1
+    _patch_comtrade(monkeypatch)
+    monkeypatch.setattr(
+        describe_item_module,
+        "get_model_for_role",
+        lambda role, provider: _NumberInventingModelClient(),
     )
-    monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client_stub)
-    monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: ToolCache())
     thread_id = str(uuid.uuid4())
 
     async with _client_for(_isolated_settings()) as client:
         posted = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "010121"})
         fetched = await client.get(f"/threads/{thread_id}")
 
-    assert posted.status_code == 504
-    assert fetched.status_code == 504
-    assert _data(fetched)["error_code"] == "UPSTREAM_TIMEOUT"
+    assert posted.status_code == 502
+    assert fetched.status_code == 502
+    assert _data(fetched)["error_code"] == "UNGROUNDED_DESCRIPTION"
 
 
 @pytest.mark.integration
@@ -522,18 +565,26 @@ async def test_post_message_after_earlier_failure_on_same_thread_is_not_replayed
     failing message, then a different, succeeding one, on the same thread,
     and asserts the second genuinely ran (a real, matching
     `TradeAnalysisResponse`) rather than reflecting the first call's error.
+
+    Uses the guardrail-rejection path for the first (failing) message, not
+    a Comtrade fetch failure (2026-08-20 roadmap decision: that degrades
+    gracefully now instead of writing `error` — see this file's other
+    updated tests) — the model client is monkeypatched to invent a number
+    only for the *first* call (via a call counter), so the second message's
+    own `describe_item` call on the same thread genuinely succeeds instead
+    of being forced to fail identically by a stateless monkeypatch.
     """
+    _patch_comtrade(monkeypatch)
+    call_count = {"n": 0}
+    real_get_model_for_role = describe_item_module.get_model_for_role
 
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.params["cmdCode"] == "010121":
-            raise httpx.ReadTimeout("simulated upstream failure", request=request)
-        return _handler_with_data(request)
+    def _fail_first_call_only(role: str, provider: str) -> object:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _NumberInventingModelClient()
+        return real_get_model_for_role(role, provider=provider)
 
-    client_stub = ComtradeClient(
-        api_key="test-key", transport=httpx.MockTransport(_handler), max_attempts=1
-    )
-    monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client_stub)
-    monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: ToolCache())
+    monkeypatch.setattr(describe_item_module, "get_model_for_role", _fail_first_call_only)
     thread_id = str(uuid.uuid4())
 
     async with _client_for(_isolated_settings()) as client:
@@ -541,8 +592,8 @@ async def test_post_message_after_earlier_failure_on_same_thread_is_not_replayed
         succeeded = await client.post(f"/threads/{thread_id}/messages", json={"hs_code": "160100"})
         fetched = await client.get(f"/threads/{thread_id}")
 
-    assert failed.status_code == 504
-    assert _data(failed)["error_code"] == "UPSTREAM_TIMEOUT"
+    assert failed.status_code == 502
+    assert _data(failed)["error_code"] == "UNGROUNDED_DESCRIPTION"
 
     # The critical assertion: the second, different hs_code actually ran (a
     # real TradeAnalysisResponse for 160100) instead of replaying the first

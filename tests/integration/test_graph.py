@@ -175,9 +175,16 @@ async def test_full_invocation_invalid_hs_code_short_circuits_before_any_fetch_o
 
 
 @pytest.mark.integration
-async def test_full_invocation_upstream_timeout_maps_to_upstream_timeout_error(
+async def test_full_invocation_upstream_timeout_degrades_gracefully_into_fetch_issues(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """2026-08-20 roadmap decision (live user-reported finding): a Comtrade
+    fetch failure no longer fails the whole request — the graph still
+    reaches `assemble_response` with a real `response`, and the failed
+    year is surfaced as `imports_table.fetch_issues`, excluded from
+    `years_no_data` (a fetch failure is not the same claim as "Comtrade
+    genuinely had nothing" — see `app.nodes.aggregate.flag_years_no_data`)."""
+
     def _timeout_handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("simulated", request=request)
 
@@ -190,8 +197,11 @@ async def test_full_invocation_upstream_timeout_maps_to_upstream_timeout_error(
     query = TradeQuery(hs_code="010121", year_start=2022, year_end=2022)
     final_state, _ = await _run(query)
 
-    assert "response" not in final_state
-    assert final_state["error"].error_code == "UPSTREAM_TIMEOUT"
+    assert "error" not in final_state
+    response = final_state["response"]
+    assert len(response.imports.fetch_issues) == 1
+    assert "2022" in response.imports.fetch_issues[0]
+    assert 2022 not in response.imports.years_no_data
 
 
 @pytest.mark.integration
@@ -199,13 +209,17 @@ async def test_full_invocation_both_fetch_nodes_failing_concurrently_does_not_cr
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`fetch_imports` and `fetch_exports` run as a genuine parallel
-    superstep (docs/PLAN.md §2.2) — a systemic upstream outage fails BOTH
-    at once, not just one flow, so both attempt to write `error` in the
-    SAME superstep. This must resolve to a single, well-formed
-    `ErrorResponse`, not an uncaught `InvalidUpdateError` from two
-    concurrent writes to the same state key (regression coverage for
-    exactly that crash, found by running this scenario for real — see
-    `app/state.py`'s `_keep_first_error` reducer)."""
+    superstep (docs/PLAN.md §2.2). Historically (before the 2026-08-20
+    graceful-degradation change) a systemic upstream outage failed BOTH at
+    once and both attempted to write the shared `error` key in the same
+    superstep, risking an uncaught `InvalidUpdateError` from two concurrent
+    writes to one state key (`app/state.py`'s `_keep_first_error` reducer
+    exists because of that exact crash). Fetch failures no longer write
+    `error` at all, so that specific collision is structurally impossible
+    now — this instead regression-covers that the *new* code path (each
+    flow writing to its own distinct `*_fetch_issues` key concurrently)
+    is equally crash-free and still produces one well-formed, successful
+    response with both tables' issues populated."""
 
     def _always_timeout(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("simulated", request=request)
@@ -219,10 +233,10 @@ async def test_full_invocation_both_fetch_nodes_failing_concurrently_does_not_cr
     query = TradeQuery(hs_code="010121", year_start=2022, year_end=2022)
     final_state, _ = await _run(query)  # must not raise
 
-    assert "response" not in final_state
-    error = final_state["error"]
-    assert error.error_code == "UPSTREAM_TIMEOUT"
-    assert error.retryable is True
+    assert "error" not in final_state
+    response = final_state["response"]
+    assert len(response.imports.fetch_issues) == 1
+    assert len(response.exports.fetch_issues) == 1
 
 
 @pytest.mark.integration

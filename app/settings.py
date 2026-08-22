@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     llm_provider: Literal["gemini", "mock"] = "mock"
     model_utility: str = "gemini-flash-lite-latest"
     model_analysis: str = "gemini-flash-latest"
+    # Product-search embeddings (app/search/embeddings.py, 2026-08-20 roadmap
+    # decision) — verified live against the real model, 3072-dim output.
+    # Shares `llm_provider`'s "gemini"/"mock" switch rather than a second
+    # setting: there is no scenario where chat is mocked but embeddings are
+    # real, or vice versa.
+    model_embedding: str = "gemini-embedding-2-preview"
 
     # --- Cost & recursion ceilings, fail closed (docs/PLAN.md §5.5) ---------
     max_model_calls_per_day: int = 500

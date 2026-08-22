@@ -20,7 +20,7 @@ from app.nodes.aggregate import (
     strip_aggregate_partners,
 )
 from app.schemas.query import TradeQuery
-from app.state import AnalysisState
+from app.state import AnalysisState, FetchIssue
 from app.tools.comtrade_client import ComtradeRecord
 
 YEARS = [2019, 2020, 2021, 2022, 2023]
@@ -362,6 +362,29 @@ def test_flag_years_no_data_disjoint_from_flag_years_finalized() -> None:
     assert provisional == [2022]
 
 
+@pytest.mark.unit
+def test_flag_years_no_data_excludes_a_year_whose_fetch_itself_failed() -> None:
+    """2026-08-20 roadmap decision (live user-reported finding): a year
+    with zero records because the *fetch* failed (retries exhausted) is a
+    third, distinct case from both `years_finalized`'s complement and a
+    genuine zero-records response — asserting we don't actually know
+    whether data exists would be dishonest, so it must NOT land in
+    `years_no_data` just because `flag_years_no_data`'s usual zero-records
+    check can't otherwise tell the two apart."""
+    # 2021: genuinely zero records (real "no data"). 2022: also zero
+    # records, but only because the fetch for it failed.
+    assert flag_years_no_data([], years=[2021, 2022], fetch_failed_years=frozenset({2022})) == [
+        2021
+    ]
+
+
+@pytest.mark.unit
+def test_flag_years_no_data_fetch_failed_years_defaults_to_empty() -> None:
+    # Backward-compatible default: every pre-existing call site (no
+    # `fetch_failed_years` argument at all) behaves exactly as before.
+    assert flag_years_no_data([], years=[2021]) == [2021]
+
+
 # --- build_trade_table (end-to-end pure pipeline) -----------------------------
 
 
@@ -421,6 +444,43 @@ def test_build_trade_table_empty_records_produces_empty_but_valid_table() -> Non
     assert table.years == YEARS
 
 
+@pytest.mark.unit
+def test_build_trade_table_fetch_issues_default_to_empty_list() -> None:
+    # The overwhelmingly common case: no `fetch_issues` argument at all.
+    table = build_trade_table([], years=[2021])
+    assert table.fetch_issues == []
+    assert table.fetch_issue_years == []
+
+
+@pytest.mark.unit
+def test_build_trade_table_formats_fetch_issues_and_excludes_them_from_no_data() -> None:
+    """2026-08-20 roadmap decision, end-to-end through `build_trade_table`:
+    a failed year is rendered as a real, honest one-line note (`"{year}:
+    {reason}"`) and is excluded from `years_no_data` even though it also
+    has zero records — the two must never both claim the same year."""
+    records = [
+        _record(partner_code="842", partner_country="USA", year=2021, value=100.0),
+    ]
+    issues = [FetchIssue(year=2022, reason="UN Comtrade returned retryable status 429")]
+    table = build_trade_table(records, years=[2021, 2022], fetch_issues=issues)
+
+    assert table.fetch_issues == ["2022: UN Comtrade returned retryable status 429"]
+    assert table.fetch_issue_years == [2022]
+    assert 2022 not in table.years_no_data
+    assert table.years_no_data == []
+
+
+@pytest.mark.unit
+def test_build_trade_table_fetch_issues_sorted_by_year_regardless_of_input_order() -> None:
+    issues = [
+        FetchIssue(year=2023, reason="reason for 2023"),
+        FetchIssue(year=2021, reason="reason for 2021"),
+    ]
+    table = build_trade_table([], years=[2021, 2022, 2023], fetch_issues=issues)
+    assert table.fetch_issues == ["2021: reason for 2021", "2023: reason for 2023"]
+    assert table.fetch_issue_years == [2021, 2023]
+
+
 # --- aggregate() node wrapper --------------------------------------------------
 
 
@@ -442,6 +502,43 @@ def test_aggregate_node_builds_both_tables() -> None:
     assert result["imports_table"].rows[0].partner_country == "USA"
     assert result["exports_table"].rows[0].partner_country == "UK"
     assert result["imports_table"].years == [2022, 2023]
+
+
+@pytest.mark.unit
+def test_aggregate_node_threads_fetch_issues_into_the_matching_table() -> None:
+    query = TradeQuery(hs_code="010121", year_start=2021, year_end=2022)
+    state: AnalysisState = {
+        "query": query,
+        "raw_imports": [],
+        "raw_exports": [
+            _record(partner_code="826", partner_country="UK", year=2021, value=200.0, flow="export")
+        ],
+        "import_fetch_issues": [FetchIssue(year=2022, reason="simulated import failure")],
+        "export_fetch_issues": [],
+    }
+    result = aggregate(state)
+
+    assert result["imports_table"].fetch_issues == ["2022: simulated import failure"]
+    assert 2022 not in result["imports_table"].years_no_data
+    assert result["exports_table"].fetch_issues == []
+
+
+@pytest.mark.unit
+def test_aggregate_node_missing_fetch_issues_keys_defaults_to_empty() -> None:
+    # `import_fetch_issues`/`export_fetch_issues` are always written
+    # alongside their `raw_*` sibling by `app.nodes.fetch_trade` in real
+    # use, but `AnalysisState` is `total=False` — the node must not crash
+    # if they're absent (e.g. a state built by hand, as every other test in
+    # this file already does for `raw_imports`/`raw_exports`).
+    query = TradeQuery(hs_code="010121", year_start=2021, year_end=2021)
+    state: AnalysisState = {
+        "query": query,
+        "raw_imports": [],
+        "raw_exports": [],
+    }
+    result = aggregate(state)
+    assert result["imports_table"].fetch_issues == []
+    assert result["exports_table"].fetch_issues == []
 
 
 @pytest.mark.unit

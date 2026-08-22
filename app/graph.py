@@ -114,7 +114,7 @@ from app.nodes.validate_query import validate_query
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
 from app.schemas.response import CountryRow, Provenance, TradeAnalysisResponse, TradeTable
-from app.state import AnalysisState, get_or_mint_trace_id, has_error
+from app.state import AnalysisState, FetchIssue, get_or_mint_trace_id, has_error
 from app.tools.comtrade_client import ComtradeRecord
 
 if TYPE_CHECKING:
@@ -143,6 +143,12 @@ _CHECKPOINTED_APP_TYPES: list[type] = [
     CountryRow,
     Provenance,
     TradeAnalysisResponse,
+    # 2026-08-20 roadmap decision (per-year graceful fetch degradation,
+    # `app.nodes.fetch_trade`): stored directly in `AnalysisState`'s
+    # `import_fetch_issues`/`export_fetch_issues`, so it needs the same
+    # allowlisting as every other `app.*` Pydantic type above — same real,
+    # live-reproduced warning this list already exists to silence.
+    FetchIssue,
 ]
 
 
