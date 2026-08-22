@@ -27,6 +27,7 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
@@ -37,8 +38,8 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
-from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 metadata = MetaData()
 
@@ -62,19 +63,65 @@ cell_status_enum = PGEnum(*CELL_STATUS_VALUES, name="cell_status", metadata=meta
 
 # ── Reference tables (maintained, not scraped) ───────────────────────────
 
-ref_duty_rates = Table(
-    "ref_duty_rates",
+# [docs/PLAN.md §4a, 2026-08-23 user-directed "evidence-first" revision]
+# Replaces an earlier flat, trusted ref_duty_rates table. One row per
+# (hs8, component, effective_from) — each duty component (BCD/AIDC/SWS/
+# IGST) carries its own verification status and citation independently.
+# value_pct is NULL unless verification_status='VERIFIED' (enforced by the
+# check constraint below, not just convention) — this is what makes "NULL/
+# unknown must never be interpreted as 0%" true by construction.
+DUTY_VERIFICATION_STATUS_VALUES = ("VERIFIED", "NOT_VERIFIED", "CONFLICTING", "EXPIRED")
+duty_verification_status_enum = PGEnum(
+    *DUTY_VERIFICATION_STATUS_VALUES, name="duty_verification_status", metadata=metadata
+)
+DUTY_COMPONENTS = ("BCD", "AIDC", "SWS", "IGST")
+
+ref_duty_components = Table(
+    "ref_duty_components",
     metadata,
     Column("hs8", Text, nullable=False),
+    Column("component", Text, nullable=False),
     Column("effective_from", Date, nullable=False),
     Column("effective_to", Date, nullable=True),
-    Column("bcd_pct", Numeric(6, 3), nullable=False),
-    Column("aidc_pct", Numeric(6, 3), nullable=False, server_default=text("0")),
-    Column("surcharge_pct", Numeric(6, 3), nullable=False, server_default=text("0")),
-    Column("igst_pct", Numeric(6, 3), nullable=False),
-    Column("source_note", Text, nullable=False),
-    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
-    PrimaryKeyConstraint("hs8", "effective_from"),
+    Column("verification_status", duty_verification_status_enum, nullable=False),
+    Column("value_pct", Numeric(6, 3), nullable=True),
+    Column("source_authority", Text, nullable=False),
+    Column("source_reference", Text, nullable=False),
+    Column("source_url", Text, nullable=True),
+    Column("verified_date", Date, nullable=False),
+    Column("notes", Text, nullable=True),
+    CheckConstraint("component IN ('BCD','AIDC','SWS','IGST')", name="ck_rdc_component"),
+    CheckConstraint(
+        "(verification_status = 'VERIFIED' AND value_pct IS NOT NULL) OR "
+        "(verification_status != 'VERIFIED' AND value_pct IS NULL)",
+        name="ck_rdc_value_matches_status",
+    ),
+    PrimaryKeyConstraint("hs8", "component", "effective_from"),
+)
+
+# Populated only for a component whose current row is CONFLICTING — the N
+# disagreeing official values found, each with its own citation. Never
+# auto-resolved into a single ref_duty_components.value_pct (user's
+# explicit rule: "do not automatically choose one value").
+ref_duty_component_conflicts = Table(
+    "ref_duty_component_conflicts",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("hs8", Text, nullable=False),
+    Column("component", Text, nullable=False),
+    Column("effective_from", Date, nullable=False),
+    Column("candidate_value_pct", Numeric(6, 3), nullable=False),
+    Column("source_authority", Text, nullable=False),
+    Column("source_reference", Text, nullable=False),
+    Column("source_url", Text, nullable=True),
+    ForeignKeyConstraint(
+        ["hs8", "component", "effective_from"],
+        [
+            "ref_duty_components.hs8",
+            "ref_duty_components.component",
+            "ref_duty_components.effective_from",
+        ],
+    ),
 )
 
 ref_regulatory_notes = Table(
@@ -361,18 +408,26 @@ analytics_mismatch_checks = Table(
 
 # [docs/PLAN.md §4, PM-1 fix: mid-year duty-rate ambiguity] Monthly grain,
 # not yearly — see landed_cost.py's "as of <month>" headline convention.
+# [docs/PLAN.md §4a, 2026-08-23 evidence-first revision] Every duty-amount
+# column is nullable and stays NULL when its component wasn't VERIFIED.
+# landed_cost_inr_paise_per_kg is populated only when is_complete;
+# partial_landed_cost_inr_paise_per_kg is always computable from whichever
+# components are VERIFIED, explicitly separate so nothing ever confuses
+# the two.
 analytics_landed_cost = Table(
     "analytics_landed_cost",
     metadata,
     Column("hs8", Text, nullable=False),
     Column("month", Date, nullable=False),
     Column("cif_inr_paise_per_kg", BigInteger, nullable=False),
-    Column("bcd_inr_paise_per_kg", BigInteger, nullable=False),
-    Column("aidc_inr_paise_per_kg", BigInteger, nullable=False),
-    Column("surcharge_inr_paise_per_kg", BigInteger, nullable=False),
-    Column("igst_inr_paise_per_kg", BigInteger, nullable=False),
-    Column("landed_cost_inr_paise_per_kg", BigInteger, nullable=False),
-    Column("duty_rate_effective_from", Date, nullable=False),
+    Column("bcd_inr_paise_per_kg", BigInteger, nullable=True),
+    Column("aidc_inr_paise_per_kg", BigInteger, nullable=True),
+    Column("sws_inr_paise_per_kg", BigInteger, nullable=True),
+    Column("igst_inr_paise_per_kg", BigInteger, nullable=True),
+    Column("is_complete", Boolean, nullable=False),
+    Column("excluded_components", ARRAY(Text), nullable=False, server_default=text("'{}'")),
+    Column("landed_cost_inr_paise_per_kg", BigInteger, nullable=True),
+    Column("partial_landed_cost_inr_paise_per_kg", BigInteger, nullable=True),
     Column("domestic_price_inr_paise_per_kg", BigInteger, nullable=True),
     Column("margin_pct", Numeric(8, 3), nullable=True),
     Column("domestic_price_confidence", Text, nullable=False),
@@ -402,6 +457,8 @@ analytics_coverage_summary = Table(
 
 __all__ = [
     "CELL_STATUS_VALUES",
+    "DUTY_COMPONENTS",
+    "DUTY_VERIFICATION_STATUS_VALUES",
     "analytics_coverage_summary",
     "analytics_landed_cost",
     "analytics_mismatch_checks",
@@ -410,6 +467,7 @@ __all__ = [
     "analytics_unit_value_series",
     "cell_status_enum",
     "dead_letter_ingestion",
+    "duty_verification_status_enum",
     "metadata",
     "normalized_trade_flows",
     "raw_agmarknet_prices",
@@ -417,7 +475,8 @@ __all__ = [
     "raw_comtrade_records",
     "raw_dgcis_monthly",
     "ref_country_crosswalk",
-    "ref_duty_rates",
+    "ref_duty_component_conflicts",
+    "ref_duty_components",
     "ref_hs6_hs8_crosswalk",
     "ref_hs_revision_notes",
     "ref_regulatory_notes",
