@@ -26,6 +26,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY app/ ./app/
 COPY prompts/ ./prompts/
 COPY data/ ./data/
+# migrations/ + alembic.ini: the trade pipeline's schema (docs/PLAN.md §4)
+# needs `alembic upgrade head` runnable inside the deployed container, not
+# just from a developer's local checkout.
+COPY migrations/ ./migrations/
+COPY alembic.ini ./alembic.ini
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
@@ -61,6 +66,8 @@ COPY --from=builder --chown=app:app /app/.venv ./.venv
 COPY --from=builder --chown=app:app /app/app ./app
 COPY --from=builder --chown=app:app /app/prompts ./prompts
 COPY --from=builder --chown=app:app /app/data ./data
+COPY --from=builder --chown=app:app /app/migrations ./migrations
+COPY --from=builder --chown=app:app /app/alembic.ini ./alembic.ini
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
