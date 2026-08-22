@@ -19,7 +19,7 @@ from collections import defaultdict
 from typing import Any
 
 from app.schemas.response import CountryRow, TradeTable
-from app.state import AnalysisState, has_error
+from app.state import AnalysisState, FetchIssue, has_error
 from app.tools.comtrade_client import (
     INDIA_REPORTER_CODE,
     ComtradeRecord,
@@ -149,7 +149,12 @@ def flag_years_finalized(records: list[ComtradeRecord], *, years: list[int]) -> 
     ]
 
 
-def flag_years_no_data(records: list[ComtradeRecord], *, years: list[int]) -> list[int]:
+def flag_years_no_data(
+    records: list[ComtradeRecord],
+    *,
+    years: list[int],
+    fetch_failed_years: frozenset[int] = frozenset(),
+) -> list[int]:
     """Which of `years` have ZERO retained (non-aggregate-code) partner
     records at all — the subset of "not finalized" years that means
     something structurally different from "still settling" (finding
@@ -169,30 +174,59 @@ def flag_years_no_data(records: list[ComtradeRecord], *, years: list[int]) -> li
     second case so the UI can use different, non-promissory language for
     it. Disjoint from `flag_years_finalized` by construction: a year here
     has zero records, a year there requires at least one.
+
+    `fetch_failed_years` (2026-08-20, live user-reported finding) excludes
+    a *third* case that would otherwise land here by the same zero-records
+    logic: a year whose Comtrade fetch itself failed after every retry
+    attempt (`app.nodes.fetch_trade.FetchIssue`). Unlike a genuine
+    zero-records response, we never actually got an answer for that year —
+    calling it "no data recorded" would assert something we don't know to
+    be true. `TradeTable.fetch_issues` carries that case instead.
     """
     by_year: dict[int, list[ComtradeRecord]] = defaultdict(list)
     for record in records:
         by_year[record.year].append(record)
-    return [year for year in years if not by_year[year]]
+    return [year for year in years if not by_year[year] and year not in fetch_failed_years]
+
+
+def _sort_fetch_issues(issues: list[FetchIssue]) -> list[FetchIssue]:
+    """Stable, predictable order regardless of the (already-sequential, but
+    defensively re-sorted here) order issues were appended in — shared by
+    `TradeTable.fetch_issues`/`fetch_issue_years` so the two stay in
+    lockstep by construction rather than being sorted independently."""
+    return sorted(issues, key=lambda issue: issue.year)
 
 
 def build_trade_table(
-    records: list[ComtradeRecord], *, years: list[int], top_n: int = TOP_N_PARTNERS
+    records: list[ComtradeRecord],
+    *,
+    years: list[int],
+    top_n: int = TOP_N_PARTNERS,
+    fetch_issues: list[FetchIssue] | None = None,
 ) -> TradeTable:
     """Full pipeline for one flow direction (imports or exports): strip
     aggregate codes, rank top-N by 5yr cumulative value, flag year
     completeness, assemble the `TradeTable` the response envelope carries
-    (docs/PLAN.md §3.2)."""
+    (docs/PLAN.md §3.2). `fetch_issues` (2026-08-20 roadmap decision):
+    years `app.nodes.fetch_trade` couldn't retrieve after every retry —
+    excluded from `years_no_data` (see that function's own docstring) and
+    surfaced instead as `TradeTable.fetch_issues`."""
+    sorted_issues = _sort_fetch_issues(fetch_issues or [])
+    fetch_failed_years = frozenset(issue.year for issue in sorted_issues)
     excluded_partner_codes = find_excluded_partner_codes(records)
     country_records = strip_aggregate_partners(records)
     rows = rank_top_partners(country_records, years=years, top_n=top_n)
     years_finalized = flag_years_finalized(country_records, years=years)
-    years_no_data = flag_years_no_data(country_records, years=years)
+    years_no_data = flag_years_no_data(
+        country_records, years=years, fetch_failed_years=fetch_failed_years
+    )
     return TradeTable(
         unit="USD",
         years=years,
         years_finalized=years_finalized,
         years_no_data=years_no_data,
+        fetch_issues=[f"{issue.year}: {issue.reason}" for issue in sorted_issues],
+        fetch_issue_years=[issue.year for issue in sorted_issues],
         excluded_partner_codes=excluded_partner_codes,
         rows=rows,
     )
@@ -212,6 +246,10 @@ def aggregate(state: AnalysisState) -> dict[str, Any]:
 
     years = list(range(query.year_start, query.year_end + 1))
     return {
-        "imports_table": build_trade_table(raw_imports, years=years),
-        "exports_table": build_trade_table(raw_exports, years=years),
+        "imports_table": build_trade_table(
+            raw_imports, years=years, fetch_issues=state.get("import_fetch_issues")
+        ),
+        "exports_table": build_trade_table(
+            raw_exports, years=years, fetch_issues=state.get("export_fetch_issues")
+        ),
     }

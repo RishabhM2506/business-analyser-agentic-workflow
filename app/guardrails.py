@@ -227,3 +227,21 @@ def find_ungrounded_numbers(
     return [
         value for value, grounded in _scan_numbers(prose, *tables, hs_code=hs_code) if not grounded
     ]
+
+
+def check_hs_codes_grounded(codes: list[str], candidate_codes: set[str]) -> bool:
+    """The code-identity equivalent of `check_numbers_grounded`, applied to
+    `app.search.rerank`: the LLM reranker may only ever return an HS6 code
+    that search itself actually found (`candidate_codes`, the fused BM25 +
+    vector result set), never one it invents from its own training-data
+    familiarity with the HS taxonomy. All-or-nothing, matching
+    `check_numbers_grounded`'s own behavior — a single invented code
+    invalidates the whole reranked result, not just that one entry."""
+    return all(code in candidate_codes for code in codes)
+
+
+def find_ungrounded_hs_codes(codes: list[str], candidate_codes: set[str]) -> list[str]:
+    """Like `check_hs_codes_grounded`, but returns the offending codes
+    instead of a bool — used for actionable error messages/logging when the
+    guardrail trips."""
+    return [code for code in codes if code not in candidate_codes]

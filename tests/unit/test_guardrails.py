@@ -9,8 +9,10 @@ import pytest
 
 from app.guardrails import (
     check_hs_code_allowlisted,
+    check_hs_codes_grounded,
     check_numbers_grounded,
     extract_numbers,
+    find_ungrounded_hs_codes,
     find_ungrounded_numbers,
 )
 from app.schemas.response import CountryRow, TradeTable
@@ -385,3 +387,56 @@ def test_check_hs_code_allowlisted_false_for_non_hs6_level_code() -> None:
     # "01" is a real code in the taxonomy, but at level 2 (a chapter), not
     # level 6 (a sub-heading) - the allowlist is HS6-specific.
     assert check_hs_code_allowlisted("01") is False
+
+
+# --- check_hs_codes_grounded / find_ungrounded_hs_codes -----------------------
+# The code-identity equivalent of check_numbers_grounded, used by
+# app.search.rerank to guarantee the LLM reranker can never surface an HS6
+# code that search itself didn't already find. Adversarial cases are the
+# point here too: a single invented code must fail the whole result.
+
+
+@pytest.mark.unit
+def test_check_hs_codes_grounded_true_when_every_code_is_a_candidate() -> None:
+    candidates = {"090111", "090121", "090190"}
+    assert check_hs_codes_grounded(["090111", "090190"], candidates) is True
+
+
+@pytest.mark.unit
+def test_check_hs_codes_grounded_true_for_empty_code_list() -> None:
+    # Vacuously true - no code was returned, so nothing could be ungrounded.
+    # (RerankOutput's own `min_length=1` makes this unreachable in practice,
+    # but the guardrail function itself should not assume that.)
+    assert check_hs_codes_grounded([], {"090111"}) is True
+
+
+@pytest.mark.unit
+def test_check_hs_codes_grounded_false_when_a_single_code_is_invented() -> None:
+    """The exact failure mode this guardrail exists to catch: the model
+    knows a real, plausible-looking HS6 code from its own training data
+    that was never in the candidate set search actually returned."""
+    candidates = {"090111", "090121"}
+    assert check_hs_codes_grounded(["090111", "999999"], candidates) is False
+
+
+@pytest.mark.unit
+def test_check_hs_codes_grounded_false_all_or_nothing_even_with_one_valid_code() -> None:
+    # Mirrors check_numbers_grounded's own all-or-nothing behavior: one
+    # invented code invalidates the *whole* result, not just that entry.
+    candidates = {"090111"}
+    assert check_hs_codes_grounded(["090111", "010121"], candidates) is False
+
+
+@pytest.mark.unit
+def test_find_ungrounded_hs_codes_returns_only_the_offending_codes() -> None:
+    candidates = {"090111", "090121"}
+    assert find_ungrounded_hs_codes(["090111", "999999", "010121"], candidates) == [
+        "999999",
+        "010121",
+    ]
+
+
+@pytest.mark.unit
+def test_find_ungrounded_hs_codes_empty_when_all_grounded() -> None:
+    candidates = {"090111", "090121"}
+    assert find_ungrounded_hs_codes(["090111", "090121"], candidates) == []

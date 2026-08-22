@@ -1,0 +1,8 @@
+{
+  "model": "gemini-embedding-2-preview",
+  "task_type": "RETRIEVAL_DOCUMENT",
+  "dims": 3072,
+  "count": 5613,
+  "source_csv_sha256": "e77ee9e1cfd15a42d1fadeb2c0618d10f6b9ed9aec0e5d66826dc7ef9d3126a5",
+  "generated_at": "2026-08-20T21:21:23.923249+00:00"
+}

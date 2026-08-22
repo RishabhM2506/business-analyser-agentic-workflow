@@ -15,66 +15,43 @@ is named. Per the project's 2026-08-20 roadmap decision
 (`docs/PLAN.md` "Trade-data-source flexibility"): swapping the source later
 means writing one new adapter and changing that one call site, not this
 module.
+
+**Per-year graceful degradation (2026-08-20, live user-reported finding)**:
+a single (year, flow) call exhausting its retries (`ComtradeClientError`)
+used to fail the *entire* request with an `ErrorResponse`, discarding
+whatever other years already succeeded in the same loop. Real UN Comtrade
+rate-limiting can hit one specific call in an otherwise-successful batch —
+live-reproduced: 2022 imports got three consecutive 429s while every other
+(year, flow) in the same request recovered on retry. A single flaky year
+no longer voids the whole analysis: `_fetch_flow_cached` now catches
+per-year, keeps fetching the remaining years, and returns the failures
+alongside whatever records it did get. `aggregate.py` folds these into
+`TradeTable.fetch_issues` — real, honest per-year notes in the final
+response itself, never routed through the LLM (the same "structured data,
+not model prose" discipline as `years_no_data`/`years_finalized`) — instead
+of an opaque request-level failure.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from app.cache.tool_cache import ToolCache, get_tool_cache
-from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
-from app.state import AnalysisState, get_or_mint_trace_id, has_error
+from app.state import AnalysisState, FetchIssue, has_error
 from app.tools.comtrade_client import (
-    ComtradeCircuitOpenError,
     ComtradeClientError,
     ComtradeRecord,
-    ComtradeSchemaValidationError,
-    ComtradeTimeoutError,
-    ComtradeUpstreamError,
     TradeDataProvider,
     get_comtrade_client,
 )
 
-# (error_code, retryable) per exception type — `retryable` here means "worth
-# the *user* retrying shortly", distinct from the bounded retries the client
-# already performed internally. A schema mismatch means our parsing is out
-# of sync with a live upstream shape change: retrying the identical request
-# will keep failing until code changes, so it is NOT user-retryable, unlike
-# a timeout or a temporarily-open circuit breaker.
-#
-# `ComtradeUpstreamError` is deliberately NOT a key here (finding M9/QA-03):
-# unlike every other exception type, it already carries its own
-# correctly-computed `.retryable` (a 429/5xx is transient, a 4xx other than
-# 429 means *our own request* was malformed and can never succeed on
-# retry — see that class's own docstring in comtrade_client.py). A static
-# dict entry could only ever encode one fixed value, which would discard
-# that distinction — `_map_error` below special-cases it instead of
-# putting it in this dict.
-_ERROR_MAPPING: dict[type[ComtradeClientError], tuple[str, bool]] = {
-    ComtradeTimeoutError: ("UPSTREAM_TIMEOUT", True),
-    ComtradeCircuitOpenError: ("UPSTREAM_UNAVAILABLE", True),
-    ComtradeSchemaValidationError: ("UPSTREAM_SCHEMA_INVALID", False),
-}
-_DEFAULT_ERROR_CODE_AND_RETRYABLE = ("UPSTREAM_ERROR", True)
 
-
-def _map_error(exc: ComtradeClientError) -> tuple[str, bool]:
-    # Checked first, ahead of the dict/default fallback (finding M9/QA-03):
-    # before this fix, `ComtradeUpstreamError` was never a key in
-    # `_ERROR_MAPPING`, so every instance fell through to
-    # `_DEFAULT_ERROR_CODE_AND_RETRYABLE = ("UPSTREAM_ERROR", True)` —
-    # discarding the exception's own correctly-computed `.retryable`, so a
-    # 400/404 (our own malformed request, can never succeed on retry) or a
-    # DNS/transport failure was reported to the caller as `retryable=True`
-    # anyway, live-verified against the real node function for exactly
-    # those cases.
-    if isinstance(exc, ComtradeUpstreamError):
-        return "UPSTREAM_ERROR", exc.retryable
-    for exc_type, mapping in _ERROR_MAPPING.items():
-        if isinstance(exc, exc_type):
-            return mapping
-    return _DEFAULT_ERROR_CODE_AND_RETRYABLE
+@dataclass(frozen=True)
+class _FlowFetchResult:
+    records: list[ComtradeRecord]
+    issues: list[FetchIssue]
 
 
 async def _fetch_flow_cached(
@@ -83,12 +60,17 @@ async def _fetch_flow_cached(
     flow: Literal["import", "export"],
     client: TradeDataProvider,
     cache: ToolCache,
-) -> list[ComtradeRecord]:
+) -> _FlowFetchResult:
     """Fetch one flow direction across `query`'s resolved year range,
     year-by-year through the tool-result cache (docs/PLAN.md §5.4 level 3).
     A cache hit for a given (hs_code, flow, year) skips the network call
     entirely; a miss fetches just that year and populates the cache with
-    the finalized/provisional TTL split (`app/cache/tool_cache.py`)."""
+    the finalized/provisional TTL split (`app/cache/tool_cache.py`).
+
+    A year whose fetch ultimately fails (retries exhausted) is recorded as
+    a `FetchIssue` and skipped, not raised — the loop always continues
+    through every year regardless (module docstring: no single flaky year
+    voids the rest of an otherwise-successful fetch)."""
     if query.year_start is None or query.year_end is None:
         # validate_query always resolves these before any fetch node runs;
         # defensive, not expected to trigger outside a test calling this
@@ -96,14 +78,19 @@ async def _fetch_flow_cached(
         raise ValueError("query.year_start/year_end must be resolved before fetching")
 
     all_records: list[ComtradeRecord] = []
+    issues: list[FetchIssue] = []
     for year in range(query.year_start, query.year_end + 1):
         cached = await cache.get(hs_code=query.hs_code, flow=flow, year=year)
         if cached is not None:
             all_records.extend(cached)
             continue
-        year_records = await client.fetch_flow(
-            hs_code=query.hs_code, flow=flow, year_start=year, year_end=year
-        )
+        try:
+            year_records = await client.fetch_flow(
+                hs_code=query.hs_code, flow=flow, year_start=year, year_end=year
+            )
+        except ComtradeClientError as exc:
+            issues.append(FetchIssue(year=year, reason=str(exc)))
+            continue
         # A year is "finalized" only if every retained record for it was
         # genuinely reported (not modeled/estimated) — conservative by
         # design (docs/PLAN.md §11: a provisional year may still revise).
@@ -116,11 +103,11 @@ async def _fetch_flow_cached(
             is_finalized=is_finalized,
         )
         all_records.extend(year_records)
-    return all_records
+    return _FlowFetchResult(records=all_records, issues=issues)
 
 
 async def _fetch_flow_node(
-    state: AnalysisState, *, flow: Literal["import", "export"], state_key: str
+    state: AnalysisState, *, flow: Literal["import", "export"], records_key: str, issues_key: str
 ) -> dict[str, Any]:
     if has_error(state):
         return {}  # validate_query (or a sibling fetch node) already failed
@@ -128,33 +115,23 @@ async def _fetch_flow_node(
     if query is None:
         return {}  # defensive: validate_query should always set query or error
 
-    try:
-        records = await _fetch_flow_cached(
-            query, flow=flow, client=get_comtrade_client(), cache=get_tool_cache()
-        )
-    except ComtradeClientError as exc:
-        error_code, retryable = _map_error(exc)
-        return {
-            "error": ErrorResponse(
-                error_code=error_code,
-                message=(
-                    f"Could not retrieve {flow} data from UN Comtrade right now. "
-                    "Please try again shortly."
-                ),
-                retryable=retryable,
-                trace_id=get_or_mint_trace_id(state),
-            )
-        }
-    return {state_key: records}
+    result = await _fetch_flow_cached(
+        query, flow=flow, client=get_comtrade_client(), cache=get_tool_cache()
+    )
+    return {records_key: result.records, issues_key: result.issues}
 
 
 async def fetch_imports(state: AnalysisState) -> dict[str, Any]:
     """Fetch import-flow records for `state["query"].hs_code`; writes
-    `raw_imports`."""
-    return await _fetch_flow_node(state, flow="import", state_key="raw_imports")
+    `raw_imports` and `import_fetch_issues`."""
+    return await _fetch_flow_node(
+        state, flow="import", records_key="raw_imports", issues_key="import_fetch_issues"
+    )
 
 
 async def fetch_exports(state: AnalysisState) -> dict[str, Any]:
     """Fetch export-flow records for `state["query"].hs_code`; writes
-    `raw_exports`."""
-    return await _fetch_flow_node(state, flow="export", state_key="raw_exports")
+    `raw_exports` and `export_fetch_issues`."""
+    return await _fetch_flow_node(
+        state, flow="export", records_key="raw_exports", issues_key="export_fetch_issues"
+    )

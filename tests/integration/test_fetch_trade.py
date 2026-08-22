@@ -1,8 +1,9 @@
 """Tests for `fetch_imports`/`fetch_exports` — the tool-result cache layer
-and error mapping, against `httpx.MockTransport` (no live network,
-docs/PLAN.md §7). `get_comtrade_client`/`get_tool_cache` are monkeypatched
-at their point of use in `app.nodes.fetch_trade` so each test gets an
-isolated client/cache rather than sharing the process-wide singletons.
+and per-year graceful degradation, against `httpx.MockTransport` (no live
+network, docs/PLAN.md §7). `get_comtrade_client`/`get_tool_cache` are
+monkeypatched at their point of use in `app.nodes.fetch_trade` so each test
+gets an isolated client/cache rather than sharing the process-wide
+singletons.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ async def test_fetch_imports_populates_raw_imports(monkeypatch: pytest.MonkeyPat
     result = await fetch_imports(state)
 
     assert result["raw_imports"] == []
+    assert result["import_fetch_issues"] == []
     assert sorted(handler.calls) == ["2021", "2022", "2023"]
 
 
@@ -63,6 +65,7 @@ async def test_fetch_exports_populates_raw_exports(monkeypatch: pytest.MonkeyPat
     result = await fetch_exports(state)
 
     assert result["raw_exports"] == []
+    assert result["export_fetch_issues"] == []
     assert handler.calls == ["2022"]
 
 
@@ -110,91 +113,113 @@ async def test_fetch_imports_missing_query_is_defensive_noop(
 
 
 @pytest.mark.integration
-async def test_fetch_imports_maps_timeout_to_upstream_timeout_error(
+async def test_fetch_imports_one_failing_year_degrades_gracefully_not_an_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def timeout_handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("simulated", request=request)
+    """2026-08-20 roadmap decision (live user-reported finding): a single
+    (year, flow) exhausting its retries must not void the whole request —
+    the failing year is recorded as a `FetchIssue` and the *other* years
+    still succeed, with no `error` key at all. Regression coverage for
+    exactly the real shape observed live: 2022 failed while 2021/2023
+    succeeded in the same request."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["period"] == "2022":
+            raise httpx.ReadTimeout("simulated", request=request)
+        return httpx.Response(200, json={"count": 0, "data": [], "error": ""})
 
     client = ComtradeClient(
-        api_key="test-key", transport=httpx.MockTransport(timeout_handler), max_attempts=1
+        api_key="test-key", transport=httpx.MockTransport(handler), max_attempts=1
     )
     cache = ToolCache()
     monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client)
     monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: cache)
 
-    query = TradeQuery(hs_code="010121", year_start=2022, year_end=2022)
+    query = TradeQuery(hs_code="010121", year_start=2021, year_end=2023)
     state: AnalysisState = {"query": query, "trace_id": "t-42"}
 
     result = await fetch_imports(state)
 
-    assert "raw_imports" not in result
-    error = result["error"]
-    assert error.error_code == "UPSTREAM_TIMEOUT"
-    assert error.retryable is True
-    assert error.trace_id == "t-42"
+    assert "error" not in result
+    assert result["raw_imports"] == []  # the two successful years had no records either
+    issues = result["import_fetch_issues"]
+    assert len(issues) == 1
+    assert issues[0].year == 2022
+    assert "timed out" in issues[0].reason or "timeout" in issues[0].reason.lower()
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    ("case", "expected_retryable"),
-    [
-        ("client_error_400", False),
-        ("client_error_404", False),
-        ("transport_error", False),
-        ("rate_limited_429_exhausted", True),
-    ],
-)
-async def test_fetch_imports_upstream_error_retryable_matches_client_exception(
-    monkeypatch: pytest.MonkeyPatch, case: str, expected_retryable: bool
+async def test_fetch_imports_every_year_failing_still_degrades_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """M9/QA-03: `ComtradeUpstreamError` was never a key in `_map_error`'s
-    `_ERROR_MAPPING`, so every instance fell through to the default
-    `("UPSTREAM_ERROR", True)` — discarding the exception's own
-    correctly-computed `.retryable`. A 400/404 (our own malformed request)
-    or a transport failure can never succeed on retry and must report
-    `retryable=False`; a 429 still retryable after the client's own
-    bounded attempts are exhausted correctly stays `retryable=True`
-    (the one case that happened to already be correct, by coincidence)."""
-
-    def handler_400(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"error": "bad request"})
-
-    def handler_404(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"error": "not found"})
-
-    def handler_transport_error(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("simulated connection failure", request=request)
+    """Even a total per-flow outage (every year fails) is not a hard
+    request failure anymore — `raw_imports` is empty and every year is
+    listed as an issue, but the request itself still succeeds; the caller
+    (`aggregate`/`assemble_response`) is responsible for rendering an
+    honestly-empty table plus these notes, not this node."""
 
     def handler_429(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, json={"error": "rate limited"})
 
-    handlers: dict[str, Callable[[httpx.Request], httpx.Response]] = {
-        "client_error_400": handler_400,
-        "client_error_404": handler_404,
-        "transport_error": handler_transport_error,
-        "rate_limited_429_exhausted": handler_429,
-    }
-    # A small max_attempts for the 429 case keeps the test fast (it still
-    # genuinely exhausts the client's bounded retries, just quickly) - the
-    # other three cases are never retried at all (retryable=False from the
-    # client's own logic), so max_attempts is irrelevant for them.
-    max_attempts = 2 if case == "rate_limited_429_exhausted" else 1
     client = ComtradeClient(
-        api_key="test-key",
-        transport=httpx.MockTransport(handlers[case]),
-        max_attempts=max_attempts,
+        api_key="test-key", transport=httpx.MockTransport(handler_429), max_attempts=1
+    )
+    cache = ToolCache()
+    monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client)
+    monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: cache)
+
+    query = TradeQuery(hs_code="010121", year_start=2021, year_end=2022)
+    state: AnalysisState = {"query": query, "trace_id": "t-all-fail"}
+
+    result = await fetch_imports(state)
+
+    assert "error" not in result
+    assert result["raw_imports"] == []
+    issues = result["import_fetch_issues"]
+    assert sorted(issue.year for issue in issues) == [2021, 2022]
+    assert all("429" in issue.reason for issue in issues)
+
+
+def _handler_client_error_400(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(400, json={"error": "bad request"})
+
+
+def _handler_transport_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("simulated connection failure", request=request)
+
+
+def _handler_server_error_500(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(500, json={"error": "internal"})
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "handler",
+    [_handler_client_error_400, _handler_transport_error, _handler_server_error_500],
+    ids=["client_error_400", "transport_error", "server_error_500"],
+)
+async def test_fetch_imports_records_the_real_exception_message_as_the_reason(
+    monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]
+) -> None:
+    """`FetchIssue.reason` is the real caught exception's own `str(exc)`,
+    never a paraphrase — checked across a few different real failure
+    shapes (a non-retryable 4xx, a transport-level error, a retryable
+    5xx), not just the timeout/429 cases the other tests already cover."""
+    client = ComtradeClient(
+        api_key="test-key", transport=httpx.MockTransport(handler), max_attempts=1
     )
     cache = ToolCache()
     monkeypatch.setattr(fetch_trade_module, "get_comtrade_client", lambda: client)
     monkeypatch.setattr(fetch_trade_module, "get_tool_cache", lambda: cache)
 
     query = TradeQuery(hs_code="010121", year_start=2022, year_end=2022)
-    state: AnalysisState = {"query": query, "trace_id": "t-map-error"}
+    state: AnalysisState = {"query": query, "trace_id": "t-reason"}
 
     result = await fetch_imports(state)
 
-    assert "raw_imports" not in result
-    error = result["error"]
-    assert error.error_code == "UPSTREAM_ERROR"
-    assert error.retryable is expected_retryable
+    assert "error" not in result
+    issues = result["import_fetch_issues"]
+    assert len(issues) == 1
+    assert issues[0].year == 2022
+    assert len(issues[0].reason) > 0
+    assert "UN Comtrade" in issues[0].reason  # every real exception message starts this way
