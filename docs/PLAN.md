@@ -1,9 +1,12 @@
 # PLAN — India Trade Analysis Pipeline (DGCIS-backbone)
 
-Status: DRAFT — Step 1, iteration 3 (final allowed iteration before escalation). Revised in response to
+Status: APPROVED (Step 2, iteration 3) as the Step 3 build reference, with one user-directed amendment
+since approval: §4a (evidence-first duty data), added 2026-08-23 in response to explicit user direction —
+not re-run through the Step 2 gate since it strengthens an already-approved invariant (D1/D2's "never a
+dash, always a reason") rather than changing anything the PM already reviewed. Earlier revision history:
 `docs/REVIEW-PM.md` iteration 1 (4 BLOCKER + 4 MAJOR + 1 MINOR, marked **[PM-1 fix: ...]**) and iteration 2
-(1 MAJOR + 2 MINOR follow-on findings against those fixes, marked **[PM-2 fix: ...]**), both addressed
-inline at the point of the fix rather than in a separate changelog.
+(1 MAJOR + 2 MINOR follow-on findings, marked **[PM-2 fix: ...]**), both addressed inline at the point of
+the fix rather than in a separate changelog.
 
 ## 0. Repo survey — what already exists here
 
@@ -127,7 +130,7 @@ app/
     comtrade_mirror.py # bulk nightly Comtrade pull (mirror/benchmark only)
     baci.py            # annual BACI ZIP download + load
     agmarknet.py        # daily mandi price pull
-    duty_table.py       # loads data/duty-rates.csv into ref_duty_rates
+    duty_source.py       # DutySource Protocol + ManualDutySource (§4a) — evidence-first, cited
     dead_letter.py      # shared FETCH_FAILED write path + alerting hook (D3)
   warehouse/
     schema.py           # SQLAlchemy Core Table defs for raw_*/normalized_*/analytics_*/ref_*
@@ -140,7 +143,7 @@ app/
   report/
     mismatch.py            # D9 checks A/B/C
     unit_consistency.py    # D10 gate
-    landed_cost.py          # CIF + duty table → landed cost
+    landed_cost.py          # consumes DutyEvidence (§4a), never raw percentages — partial-calc rule
     facts.py                 # assembles the frozen facts JSON (LLM contract)
     narrative.py               # LLM call + D4 post-validator
     service.py                  # orchestrates: coverage gate -> metrics -> facts -> narrative -> response
@@ -159,17 +162,56 @@ lineage set.
 
 ```sql
 -- ── Reference (maintained, not scraped) ──────────────────────────────────
-CREATE TABLE ref_duty_rates (
+-- [2026-08-23 revision, user-directed: "evidence-first" duty data — do not
+-- fill a missing duty component with a guess, a secondary-source value, or
+-- 0%.] Not a flat row of 4 percentages. One row per (hs8, component,
+-- effective_from) — each component (BCD/AIDC/SWS/IGST) carries its own
+-- verification status, citation, and dates independently, because a real
+-- notification can update one component without touching the others, and
+-- because "verified" is a per-fact property, not a per-row one.
+--
+-- NULL value_pct is structural, not incidental: a row's value_pct is only
+-- ever non-NULL when verification_status='VERIFIED' — this is what makes
+-- "NULL/unknown must never be interpreted as 0%" true by construction
+-- rather than by convention a query could accidentally violate.
+CREATE TYPE duty_verification_status AS ENUM ('VERIFIED', 'NOT_VERIFIED', 'CONFLICTING', 'EXPIRED');
+
+CREATE TABLE ref_duty_components (
+  hs8                  TEXT NOT NULL,
+  component            TEXT NOT NULL,        -- 'BCD' | 'AIDC' | 'SWS' | 'IGST'
+  effective_from       DATE NOT NULL,
+  effective_to         DATE,                  -- set (and status flipped to EXPIRED) when superseded
+  verification_status  duty_verification_status NOT NULL,
+  value_pct            NUMERIC(6,3),          -- NULL unless verification_status='VERIFIED'
+  source_authority      TEXT NOT NULL,        -- e.g. 'ICEGATE Trade Guide on Imports', 'CBIC Tax Information Portal'
+  source_reference        TEXT NOT NULL,      -- notification/circular number, or 'none found' for NOT_VERIFIED
+  source_url                TEXT,
+  verified_date               DATE NOT NULL,  -- when a human curator last checked this, regardless of status
+  notes                         TEXT,         -- conditions, caveats, why NOT_VERIFIED/CONFLICTING
+  CHECK (component IN ('BCD','AIDC','SWS','IGST')),
+  CHECK (
+    (verification_status = 'VERIFIED' AND value_pct IS NOT NULL) OR
+    (verification_status != 'VERIFIED' AND value_pct IS NULL)
+  ),
+  PRIMARY KEY (hs8, component, effective_from)
+);
+
+-- Populated only for a component whose current row is CONFLICTING — the N
+-- disagreeing official values found, each with its own citation. A
+-- CONFLICTING row in ref_duty_components itself never carries a value_pct
+-- (see the check constraint above); the candidates live here so nothing
+-- forces an automatic pick between them (user's explicit rule: "do not
+-- automatically choose one value").
+CREATE TABLE ref_duty_component_conflicts (
   hs8              TEXT NOT NULL,
+  component        TEXT NOT NULL,
   effective_from   DATE NOT NULL,
-  effective_to     DATE,                    -- NULL = still current
-  bcd_pct          NUMERIC(6,3) NOT NULL,
-  aidc_pct         NUMERIC(6,3) NOT NULL DEFAULT 0,
-  surcharge_pct    NUMERIC(6,3) NOT NULL DEFAULT 0,
-  igst_pct         NUMERIC(6,3) NOT NULL,
-  source_note      TEXT NOT NULL,           -- citation, e.g. "Budget 2024 notification no. ..."
-  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (hs8, effective_from)
+  candidate_value_pct NUMERIC(6,3) NOT NULL,
+  source_authority     TEXT NOT NULL,
+  source_reference       TEXT NOT NULL,
+  source_url                TEXT,
+  FOREIGN KEY (hs8, component, effective_from)
+    REFERENCES ref_duty_components (hs8, component, effective_from)
 );
 
 CREATE TABLE ref_regulatory_notes (         -- D12
@@ -418,16 +460,27 @@ CREATE TABLE analytics_mismatch_checks (                  -- D9
 -- row within that year, labeled "as of <month>" in the facts JSON (§14) —
 -- never a yearly average of a duty rate that only makes sense as a
 -- point-in-time figure.
+--
+-- [2026-08-23 revision: evidence-first duty data, §4a] Every duty-amount
+-- column is nullable and stays NULL when its component wasn't VERIFIED —
+-- `is_complete`/`excluded_components` say why, rather than the absence
+-- being ambiguous between "zero" and "unknown" (the exact D1/D2 rule this
+-- whole plan already applies to trade data, now applied here too).
+-- `landed_cost_inr_paise_per_kg` is populated only when `is_complete`;
+-- `partial_landed_cost_inr_paise_per_kg` is the always-computable,
+-- explicitly-partial figure from whichever components are VERIFIED.
 CREATE TABLE analytics_landed_cost (
   hs8              TEXT NOT NULL,
   month            DATE NOT NULL,           -- first-of-month
   cif_inr_paise_per_kg BIGINT NOT NULL,
-  bcd_inr_paise_per_kg BIGINT NOT NULL,
-  aidc_inr_paise_per_kg BIGINT NOT NULL,
-  surcharge_inr_paise_per_kg BIGINT NOT NULL,
-  igst_inr_paise_per_kg BIGINT NOT NULL,
-  landed_cost_inr_paise_per_kg BIGINT NOT NULL,
-  duty_rate_effective_from DATE NOT NULL,   -- traces back to the exact ref_duty_rates row used
+  bcd_inr_paise_per_kg BIGINT,
+  aidc_inr_paise_per_kg BIGINT,
+  sws_inr_paise_per_kg BIGINT,
+  igst_inr_paise_per_kg BIGINT,
+  is_complete            BOOLEAN NOT NULL,
+  excluded_components      TEXT[] NOT NULL DEFAULT '{}',  -- e.g. {'IGST'} when NOT_VERIFIED/CONFLICTING/EXPIRED
+  landed_cost_inr_paise_per_kg BIGINT,          -- NULL unless is_complete
+  partial_landed_cost_inr_paise_per_kg BIGINT,  -- always populated from whatever IS verified
   -- [PM-1 fix: MINOR "Agmarknet per-quintal never converted to per-kg"]
   -- Converted once, at the Agmarknet normalizer boundary (D7's "convert
   -- only what needs converting" — do it once, at ingestion, never
@@ -435,10 +488,15 @@ CREATE TABLE analytics_landed_cost (
   -- becomes normalized_trade_flows-equivalent per-kg value before it ever
   -- reaches this table. landed_cost.py only ever reads already-per-kg values.
   domestic_price_inr_paise_per_kg BIGINT,     -- NULL if Agmarknet coverage too thin (see §1 gap)
-  margin_pct          NUMERIC(8,3),
+  margin_pct          NUMERIC(8,3),           -- NULL unless is_complete AND domestic price known
   domestic_price_confidence TEXT NOT NULL CHECK (domestic_price_confidence IN ('good','limited','unavailable')),
   PRIMARY KEY (hs8, month)
 );
+-- Full per-component evidence (status, citation, verified_date, notes) for
+-- a given (hs8, month) is a join against ref_duty_components on whichever
+-- row's [effective_from, effective_to) window covers that month — not
+-- duplicated into this table, which only holds the already-computed
+-- amounts. The facts JSON (§14) assembles both together.
 
 CREATE TABLE analytics_coverage_summary (                  -- D11
   hs6              TEXT NOT NULL,
@@ -455,6 +513,85 @@ CREATE TABLE analytics_coverage_summary (                  -- D11
   PRIMARY KEY (hs6, flow, window_start, window_end)
 );
 ```
+
+## 4a. Evidence-first duty data (2026-08-23 revision, user-directed)
+
+**Primary sources only**: ICEGATE's Trade Guide on Imports / Customs Duty Calculator, and the CBIC Tax
+Information Portal (`taxinformation.cbic.gov.in`). Both verified to be real, official government sites, but
+**neither exposes a public API** — both are human-facing search/calculator tools (confirmed: ICEGATE's own
+description is "search by text or Customs Tariff Head... shows all applicable duties per Tariff"; CBIC's
+portal is a notification/circular search interface). A live fetch attempt against both also hit TLS
+certificate-verification failures from this environment — a concrete signal that even a best-effort scraper
+would be fragile, not just unofficial. **Decision: no scraper for v1.** Duty verification is a deliberate
+manual-curation workflow, not an ingestion job — consistent with this plan's own non-goals section already
+saying duty rates are "a maintained reference table... an operator updates it, same pattern as the
+taxonomy CSV," now made evidence-strict rather than a flat trusted CSV.
+
+**`DutySource` adapter** (`app/pipeline/duty_source.py`), the seam that makes the verification mechanism
+swappable later without touching `landed_cost.py`:
+
+```python
+class ConflictCandidate(BaseModel):
+    value_pct: Decimal
+    source_authority: str
+    source_reference: str
+    source_url: str | None
+
+class DutyComponentEvidence(BaseModel):
+    component: Literal["BCD", "AIDC", "SWS", "IGST"]
+    verification_status: Literal["VERIFIED", "NOT_VERIFIED", "CONFLICTING", "EXPIRED"]
+    value_pct: Decimal | None       # None unless VERIFIED — enforced by validator, not just convention
+    source_authority: str
+    source_reference: str
+    source_url: str | None
+    verified_date: date
+    notes: str | None
+    conflicting_candidates: list[ConflictCandidate] | None  # populated only when CONFLICTING
+
+class DutyEvidence(BaseModel):
+    hs8: str
+    as_of: date
+    components: dict[Literal["BCD", "AIDC", "SWS", "IGST"], DutyComponentEvidence]
+
+class DutySource(Protocol):
+    async def get_duty_evidence(self, hs8: str, *, as_of: date) -> DutyEvidence: ...
+```
+
+`ManualDutySource` (v1, only implementation): reads `ref_duty_components`/`ref_duty_component_conflicts`
+(§4) for the row(s) covering `as_of`. **Populating those tables is a human task**: a curator looks up the
+current rate on ICEGATE/CBIC, records the citation via a small CLI (`scripts/record_duty_rate.py`, to be
+built alongside this) that writes one `ref_duty_components` row and — on entering a new `VERIFIED` row for
+a component that already has a current one — atomically sets the old row's `effective_to`/flips it to
+`EXPIRED` in the same transaction. A component with no row at all for a given `hs8` returns
+`verification_status='NOT_VERIFIED'` by construction (the query's default, not a stored row) — there is
+never a code path that invents a 0% or omits the component silently.
+
+**`landed_cost.py`'s contract changes from "compute a number" to "compute an evidence-aware result":**
+
+```python
+class LandedCostResult(BaseModel):
+    is_complete: bool                              # False if any component isn't VERIFIED
+    landed_cost_inr_paise_per_kg: int | None        # None when is_complete=False — never a partial total
+    partial_landed_cost_inr_paise_per_kg: int | None  # computed from only the VERIFIED components, clearly labeled
+    excluded_components: list[str]                  # which components were excluded and why (their status)
+    components: dict[str, DutyComponentEvidence]     # every component's full evidence, always
+```
+
+`compute_landed_cost(cif_per_kg, evidence: DutyEvidence) -> LandedCostResult`: **never** substitutes 0% or
+any guessed value for a `NOT_VERIFIED`/`CONFLICTING`/`EXPIRED` component. If every component is `VERIFIED`,
+`is_complete=True` and `landed_cost_inr_paise_per_kg` is populated as before (§11's formula). Otherwise
+`is_complete=False`, `landed_cost_inr_paise_per_kg=None`, and `partial_landed_cost_inr_paise_per_kg` holds a
+clearly-separate, explicitly-partial figure computed only from the components that *are* `VERIFIED` (useful
+context, never presented as "the" landed cost) — this is the direct implementation of the user's rule "you
+may show a clearly labelled partial calculation, but it must explicitly exclude the unverified
+component(s)."
+
+**Report/facts JSON** (§14, updated): `landed_cost` gains `is_complete`, `excluded_components`, and a full
+`components` breakdown — each with its own `verification_status` and citation shown next to the number,
+never a bare figure. The narrative (`report/narrative.py`) is instructed never to state a landed-cost total
+when `is_complete=False`, only the partial figure with its explicit caveat — enforced the same way as
+D4's number-grounding validator (a stated total that doesn't match a `VERIFIED`-backed computation is
+rejected).
 
 ## 5. Status enum — where each value is set
 
@@ -598,13 +735,18 @@ it into a flag later.
   is never the `end` point of a CAGR without an explicit flag on the output.
 - **HHI** (partner concentration) = `Σ(share_i²)` over the full ranked list (§ D14 precompute), computed
   once per `(hs6, flow, year)`, independent of the request's chosen top-N.
-- **Landed cost/kg** = `cif_inr_paise_per_kg × (1 + bcd_pct + aidc_pct + surcharge_pct) × (1 + igst_pct)`
-  (duty on duty-inclusive base, matching how BCD/AIDC/surcharge compound before IGST is applied — verify
-  the exact compounding order against a real CBIC worked example in Step 3, flagged, not assumed here).
-  Computed monthly (§4's revised `analytics_landed_cost`); the report's headline figure is the most recent
-  month within the selected window, labeled "as of `<month>`" rather than a yearly average.
-- **Margin** = `(domestic_price_per_kg - landed_cost_per_kg) / domestic_price_per_kg`, `domestic_price_confidence`
-  copied from the Agmarknet coverage check (thin mandi coverage → `limited`, never silently `good`).
+- **Landed cost/kg** = `cif_inr_paise_per_kg × (1 + bcd_pct + aidc_pct + sws_pct) × (1 + igst_pct)` (duty on
+  duty-inclusive base, matching how BCD/AIDC/SWS compound before IGST is applied — verify the exact
+  compounding order against a real CBIC worked example in Step 3, flagged, not assumed here). **Only
+  computed when every one of BCD/AIDC/SWS/IGST is `VERIFIED`** (§4a) — otherwise `landed_cost_inr_paise_per_kg`
+  stays `NULL` and `partial_landed_cost_inr_paise_per_kg` is computed from whichever components are
+  `VERIFIED`, explicitly labeled partial with `excluded_components` naming the rest. Computed monthly
+  (§4's revised `analytics_landed_cost`); the report's headline figure is the most recent month within the
+  selected window, labeled "as of `<month>`" rather than a yearly average.
+- **Margin** = `(domestic_price_per_kg - landed_cost_per_kg) / domestic_price_per_kg`, computed only when
+  `is_complete` **and** the domestic price is known — `domestic_price_confidence` copied from the Agmarknet
+  coverage check (thin mandi coverage → `limited`, never silently `good`). A margin is never computed
+  against a partial landed-cost figure (that would silently understate real cost).
 - **FX decomposition**: §6.
 
 ## 12. D14 — parameters end to end
@@ -658,8 +800,30 @@ as its own report section, never merged into the annual series (different confid
     {"year": 2021, "inr_paise_per_kg": 0, "delta_qty_pct": 0, "delta_price_pct": 0, "delta_fx_pct": 0}
   ],
   "hhi_by_year": [{"year": 2021, "hhi": 0.0}],
-  "landed_cost": {"as_of_month": "2025-11", "inr_paise_per_kg": 0, "domestic_price_inr_paise_per_kg": null,
-                    "margin_pct": null, "domestic_price_confidence": "limited"},
+  "landed_cost": {
+    "as_of_month": "2025-11",
+    "is_complete": false,
+    "inr_paise_per_kg": null,
+    "partial_inr_paise_per_kg": 0,
+    "excluded_components": ["IGST"],
+    "components": {
+      "BCD": {"verification_status": "VERIFIED", "value_pct": 20.0,
+        "source_authority": "ICEGATE Trade Guide on Imports", "source_reference": "<citation>",
+        "verified_date": "2026-08-23"},
+      "AIDC": {"verification_status": "VERIFIED", "value_pct": 0.0,
+        "source_authority": "ICEGATE Trade Guide on Imports", "source_reference": "<citation>",
+        "verified_date": "2026-08-23"},
+      "SWS": {"verification_status": "NOT_VERIFIED", "value_pct": null,
+        "notes": "Not verified from an authoritative official source."},
+      "IGST": {"verification_status": "CONFLICTING", "value_pct": null,
+        "notes": "Two official sources disagree; excluded from any complete landed-cost figure pending manual review.",
+        "conflicting_candidates": [
+          {"value_pct": 5.0, "source_authority": "CBIC Tax Information Portal", "source_reference": "<citation A>"},
+          {"value_pct": 12.0, "source_authority": "CBIC Tax Information Portal", "source_reference": "<citation B>"}
+        ]}
+    },
+    "domestic_price_inr_paise_per_kg": null, "margin_pct": null, "domestic_price_confidence": "limited"
+  },
   "mismatch_checks": [
     {"check": "B_dgcis_vs_partner_comtrade", "year": 2025, "partner": "Turkey", "gap_pct": 9.1, "severity": "quiet"}
   ],
@@ -726,6 +890,12 @@ gets removed.
 - `tests/unit/report/test_coverage_gate.py` — 29%/30%/31% `QTY_MISSING` boundary, refusal not approximation.
 - `tests/unit/report/test_facts_validator.py` — the D4 test: prose containing a number absent from the
   facts JSON must be rejected.
+- `tests/unit/pipeline/test_landed_cost_evidence.py` — §4a's core regression tests: all-VERIFIED produces
+  `is_complete=True` with a real total; any single `NOT_VERIFIED`/`CONFLICTING`/`EXPIRED` component forces
+  `is_complete=False`, `landed_cost_inr_paise_per_kg=None`, and a `partial_` figure computed from only the
+  verified components; a missing component is never silently treated as 0% (assert the computed partial
+  total differs from what a naive "missing=0" calculation would produce); `CONFLICTING` never
+  auto-selects a candidate value.
 - `tests/integration/pipeline/test_idempotency.py` — real Postgres (docker/testcontainers), run each
   ingestion job twice against the same fixture, assert identical row count and content.
 - `tests/integration/report/test_parameter_boundaries.py` — years ∈ {1,8,9}, top_n ∈ {3,25,26}, clamp
@@ -753,8 +923,11 @@ gets removed.
 
 1. `app/warehouse/schema.py` + Alembic migration (empty → full schema) — nothing else can start without it.
 2. `app/fx/` (client + cache + decomposition) — fully specified already (§1, §6), no external unknowns left.
-3. `app/pipeline/duty_table.py` + `data/duty-rates.csv` (a real, sourced starter table — flagged: initial
-   rates need a real CBIC citation, not fabricated numbers).
+3. `app/pipeline/duty_source.py` (§4a: `DutySource` Protocol, `ManualDutySource`, `ref_duty_components`/
+   `ref_duty_component_conflicts` access) + `scripts/record_duty_rate.py` (the curator-facing entry-point
+   CLI). **No rate is entered until the user supplies a real ICEGATE/CBIC citation for HS 120791** — this
+   step ships the mechanism, not fabricated data; the table starts empty (every component genuinely
+   `NOT_VERIFIED` by construction) until real evidence is recorded.
 4. `app/pipeline/dgcis.py` — **first**, real scrape-mechanics verification against the live form (§1), then
    parser + normalizer + status-enum coverage tests.
 5. `app/pipeline/comtrade_mirror.py` — after the D5 live-batching verification (§1).
