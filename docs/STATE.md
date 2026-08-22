@@ -2,8 +2,8 @@ CURRENT_STEP: 3
 CURRENT_ROLE: Software engineer (backend)
 ITERATION: 1
 GATE_STATUS: in_progress
-LAST_COMPLETED: Build sequence item 1 — app/warehouse/schema.py (all 18 tables + cell_status enum, matching PLAN.md §4 exactly) + Alembic migrations, applied/downgraded/reapplied clean against the real local postgres, verified inside a real Docker build too. 3 real deviations found and fixed, documented in docs/BUILD-LOG.md. Full test suite (346), mypy, ruff, black all clean.
-NEXT_TASK: Build sequence item 2 (PLAN.md §17) — app/fx/ (client.py: Frankfurter HTTP client; cache.py: Redis-backed cache per PLAN.md §6's exact contract; decomposition.py: the D8 three-way qty/price/FX split), with unit tests mocking httpx/redis (never touching the network in tests, per this repo's standing convention)
-BLOCKED_ON: none for build sequence items 2-3 — Agmarknet data.gov.in API key still blocks item 7; DGCIS scrape mechanics and Comtrade live-batching still need live verification before items 4-5
+LAST_COMPLETED: Build sequence item 2 — app/fx/ (client.py, cache.py, decomposition.py) complete, 15 new unit tests, plus a real end-to-end smoke test against the actual local Frankfurter API + Redis (not just fakes) confirming the D8 cache contract for real (TTL -1 on a historical-date key, verified via redis-cli). Full suite 361 passed, mypy/ruff/black clean. Both checkpoints committed.
+NEXT_TASK: Build sequence item 3 (PLAN.md §17) — app/pipeline/duty_table.py + data/duty-rates.csv. BLOCKED: see BLOCKED_ON — asked the user for a real duty-rate citation rather than fabricate one, per this step's own "do not fabricate credentials or skip validation" standard applied to real-world regulatory facts, not just credentials.
+BLOCKED_ON: waiting on user input for HS 120791/12079100's real, current duty rates (BCD/AIDC/Social Welfare Surcharge/IGST) — web research found BCD=20%, AIDC=0% reasonably consistently across secondary sources (exportgenius.in, eximguru.com), but IGST is unconfirmed/contradictory (one stale 2020 source shows a pre-GST duty structure) and no source was a primary CBIC citation. Also still open: Agmarknet data.gov.in API key (blocks item 7); DGCIS scrape mechanics and Comtrade live-batching verification (blocks items 4-5) — not blocking right now, just not yet done.
 OPEN_FINDINGS: none open
 FILES_IN_FLIGHT: none

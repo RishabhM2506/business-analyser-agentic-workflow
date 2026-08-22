@@ -56,3 +56,38 @@ bulk-COPY-friendly, matches the plan's bulk-upsert requirement). `cell_status` i
 **Next**: build sequence item 2 (`app/fx/` — client, cache, decomposition) per `docs/PLAN.md` §17. Fully
 specified already (§1, §6 of the plan) via the live Frankfurter verification done in Step 1 — no known
 open unknowns before starting it.
+
+## Build sequence item 2: `app/fx/` (client, cache, decomposition)
+
+**Files**: `app/fx/client.py` (`FxClient` Protocol + `FrankfurterClient`, mirrors
+`app.tools.comtrade_client.ComtradeClient`'s existing `transport=` constructor seam for tests),
+`app/fx/cache.py` (`FxCache`, `RedisLike` Protocol so unit tests use a plain in-memory fake, never a real
+Redis connection), `app/fx/decomposition.py` (`decompose()`, the D8 three-way split, `Decimal.ln()`
+throughout — no float round-trip). `app/settings.py` gained `redis_url` (default matches the new
+`docker-compose.yml` `redis` service, host port 6380 to avoid colliding with any other local Redis, same
+reasoning as postgres's 5433). `tests/unit/test_fx_client.py`, `test_fx_cache.py`, `test_fx_decomposition.py`
+(15 new tests) — flat `tests/unit/test_fx_*.py` naming rather than `docs/PLAN.md` §16's sketched
+`tests/unit/fx/` subdirectory, matching this repo's actual, real convention (flat `tests/unit/`, no
+per-feature subdirectories — confirmed by listing the directory before writing these, not assumed).
+
+**No plan deviations this time** — §1's live Frankfurter verification during Step 1 meant there were no
+open unknowns to discover while building. The one real bug caught was in my own first test draft, not the
+implementation: an `httpx.MockTransport` handler asserted `request.url.path == "/rate/USD/INR"`, which
+failed because `FrankfurterClient`'s `base_url` already includes `/v2` — fixed the assertion to
+`/v2/rate/USD/INR`, matching the real, verified path from §1.
+
+**Verification performed**:
+- `uv run pytest tests/unit/test_fx_*.py`: 15 passed, including the load-bearing "exactly one Frankfurter
+  call for two `get_or_fetch` calls on the same date" assertion and the stale-fallback path.
+- Real end-to-end smoke test (not mocked): `FxCache` wired to a real `FrankfurterClient` and a real
+  `redis.asyncio.Redis` against the actual local `docker-compose` `redis` service. First call fetched
+  `73.349` for 2021-06-15 (matching §1's original live verification exactly); second call returned the
+  same value from cache. Confirmed directly via `redis-cli GET`/`TTL` that the historical-date key was
+  written with `TTL -1` (no expiry), exactly matching D8's contract — not just trusted from the test double.
+- `uv run pytest -q` (full suite): 361 passed. `uv run mypy app`: clean. `uv run ruff check .`: clean.
+  `uv run black --check .`: clean.
+
+**Next**: build sequence item 3 (`app/pipeline/duty_table.py` + `data/duty-rates.csv`) per `docs/PLAN.md`
+§17 — needs a real, sourced starter duty-rate table (a real CBIC citation), not fabricated numbers; may
+need to ask the user for a citation or a specific HS8/rate to seed it with, per this step's own instruction
+not to fabricate real-world facts.

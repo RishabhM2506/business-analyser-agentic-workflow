@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     # any deployed environment").
     database_url: str = "sqlite+aiosqlite:///./local.db"
     checkpoint_retention_days: int = 90  # docs/PLAN.md §6: explicit 90-day rolling retention
+    # Trade pipeline's FX cache only (app/fx/cache.py) — nothing else in this
+    # app uses Redis (the existing response/tool caches are deliberately
+    # in-process, see app/cache/tool_cache.py's own docstring). Default
+    # matches the new `redis` service in docker-compose.yml.
+    redis_url: str = "redis://localhost:6379/0"
 
     # --- Model routing (master brief §3: node-role -> model, config-driven,
     # never hard-coded; docs/PLAN.md §5.1) -----------------------------------
