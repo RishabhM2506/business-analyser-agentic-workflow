@@ -10,7 +10,13 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.pipeline.dgcis import ANNUAL_IMPORT_PATH, DgcisClient, DgcisRequestError
+from app.pipeline.dgcis import (
+    ANNUAL_IMPORT_PATH,
+    MONTHLY_EXPORT_PATH,
+    MONTHLY_IMPORT_PATH,
+    DgcisClient,
+    DgcisRequestError,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -105,3 +111,53 @@ async def test_fetch_annual_raises_on_unexpected_status() -> None:
         await client.fetch_annual(
             path=ANNUAL_IMPORT_PATH, hs8="12079100", country_code="409", year="2024"
         )
+
+
+@pytest.mark.unit
+async def test_fetch_monthly_uses_the_imdd_prefixed_fields_for_import() -> None:
+    """Real, verified live: import uses `imdd`-prefixed fields - not a
+    simple symmetric swap with export's bare `dd`-prefixed ones."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, text=_TOKEN_PAGE)
+        return httpx.Response(200, text=_RESULT_PAGE)
+
+    client = DgcisClient(transport=httpx.MockTransport(handler))
+    await client.fetch_monthly(
+        path=MONTHLY_IMPORT_PATH, hs8="12079100", month=6, year=2022, report_value="3"
+    )
+
+    post_body = calls[1].content.decode()
+    assert "comval=12079100" in post_body
+    assert "imddMonth=6" in post_body
+    assert "imddYear=2022" in post_body
+    assert "imddReportVal=3" in post_body
+    assert "imddReportYear=2" in post_body  # always Calendar Year framing
+    # "ddMonth" is a substring of "imddMonth", so check the export field's
+    # own "&"-delimited key, not a naive substring (which would always
+    # spuriously match).
+    assert "&ddMonth=" not in post_body
+
+
+@pytest.mark.unit
+async def test_fetch_monthly_uses_the_bare_dd_prefixed_fields_for_export() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, text=_TOKEN_PAGE)
+        return httpx.Response(200, text=_RESULT_PAGE)
+
+    client = DgcisClient(transport=httpx.MockTransport(handler))
+    await client.fetch_monthly(
+        path=MONTHLY_EXPORT_PATH, hs8="12079100", month=6, year=2022, report_value="2"
+    )
+
+    post_body = calls[1].content.decode()
+    assert "ddMonth=6" in post_body
+    assert "ddReportVal=2" in post_body
+    assert "imddMonth" not in post_body  # never the import field name

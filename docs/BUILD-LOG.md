@@ -979,3 +979,51 @@ clean.
 
 **This closes build sequence item 6 (BACI) as a real, working, end-to-end capability** — ingestion, real FX
 -aware normalization, and the D9 check it exists to power are all real and verified, not just scaffolded.
+
+## D15's real data source — DGCIS monthly national-total path, raw layer built and live-verified
+
+**Real, live investigation before writing any code** (`meidb/commoditywise_import`/`_export`, D15's real
+source, previously flagged as "not yet built"): confirmed real form field names by fetching both live pages
+directly — a genuine, non-obvious asymmetry: import uses `imdd`-prefixed fields (`imddMonth`, `imddYear`,
+`imddCommodityLevel`, `imddReportVal`, `imddReportYear`), export uses bare `dd`-prefixed fields, **not** a
+simple copy-paste of the annual report's own `ContEidbi`/`ContEidbe` symmetry. Confirmed the report is
+genuinely **month-granular** (one request = one calendar month, alongside the same month a year earlier for
+the site's own YoY display) — a full year needs 12 requests, unlike the annual report's "5 years in one
+response" efficiency. Confirmed live, via a real test POST, that **this report does return real quantity
+data** (`imddReportVal="2"`, e.g. `6,347,970 KGS` for June 2022) — a first for this pipeline; the annual
+report never returns a quantity at all. Value and quantity need two separate real requests each.
+
+**A real, load-bearing revision-status marker, found only by probing three different real months**: the
+response's current-month column header carries a suffix — `"(R)"` (Revised/Final, an older fully finalized
+month), `"(F)"` (Flash/provisional, a recent published-but-not-final month, real example: June 2026), or
+`"(A)"` (Advance — genuinely unpublished, real example: August 2026, the literal current month at capture
+time, where *both* the specific commodity's value **and** the "India's Total Import" national-total footer
+row read `0.00`, confirming the whole month's collection hasn't happened yet — not a coincidental real zero
+for poppy seeds specifically). This marker is preserved verbatim in `raw_dgcis_monthly.raw_payload` for a
+future normalizer to translate into a D1 status value — never interpreted at parse time, matching the
+annual path's own raw/normalized separation. Four real responses captured as committed fixtures
+(`tests/fixtures/dgcis/poppy_seed_monthly_import_*.html`), one per real scenario (finalized value,
+finalized quantity, flash, not-yet-published).
+
+**Files**: `app/pipeline/dgcis.py` gained `parse_monthly_response` (locates the current-month column by its
+own header text, not a hardcoded index — a quantity-flavored response inserts a real extra `UNIT` header a
+value-flavored one doesn't have), `DgcisClient.fetch_monthly`, `DgcisMonthlyRecord`/
+`DgcisMonthlyFetchFailure`, `fetch_monthly_record` (combines the two real value+quantity calls),
+`fetch_year_monthly` (the same rate-limited batch-loop contract as `fetch_all_countries_annual`),
+`_fiscal_year_label_for_month`, `upsert_monthly_records` (writes `raw_dgcis_monthly`, always
+`partner_country='ALL_PARTNERS'` — this report structurally has no partner dimension, per §4's own
+documented policy). 16 new tests: 6 parser tests against the real fixtures (covering all three real
+markers), 2 client tests proving the real import/export field-name asymmetry, 4 fiscal-year-label tests
+(the April boundary), 4 upsert tests (real Postgres, idempotency).
+
+**Verification performed**: real end-to-end run against the live site for HS8 `12079100`/import, 3 real
+months (March/June/September 2022, 6 real HTTP calls) — zero failures, real values (June matches the
+fixture capture exactly: ₹166.50cr/6,347,970 KGS; March correctly real `ZERO`; September a real, distinct
+₹381.2cr/1,338,450 KGS), all upserted and confirmed via `psql`, including the fiscal-year boundary working
+correctly (March 2022 lands in FY "2021 - 2022", distinct from June/September 2022's FY "2022 - 2023").
+`uv run pytest -q`: 536 passed (was 520; +16). `mypy app` (59 files)/`ruff`/`black`: clean.
+
+**Deliberately not done in this unit**: the `analytics_monthly_current_year` writer itself (deterministic
+MoM/YoY computation from these raw rows, plus D15's "always write all 12 months, including
+`NOT_YET_PUBLISHED` future ones" requirement) — a real, separate follow-up, kept out to preserve the same
+raw-ingestion-then-analytics-writer sequencing already used for DGCIS annual and BACI.

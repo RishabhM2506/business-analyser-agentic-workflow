@@ -15,3 +15,24 @@
   2026" CODE_RETIRED-relevant footnote elsewhere on the page, both real.
 
   Parser tests (`tests/unit/pipeline/test_dgcis_parser.py`) run against this fixture, not a live call.
+
+- `poppy_seed_monthly_import_jun2022_value.html` / `_quantity.html` — **verbatim** captures of real live
+  responses, 2026-08-23, `POST https://tradestat.commerce.gov.in/meidb/commoditywise_import` for HS8
+  `12079100`, June 2022, `imddReportVal=3` (₹ Crore) and `=2` (quantity) respectively — the two real,
+  separate requests `fetch_monthly_record` combines into one record (no single request returns both).
+  Real values: `166.50` ₹ Crore, `6,347,970` KGS, both marked `"(R)"` (Revised/Final — a fully finalized
+  past month).
+
+- `poppy_seed_monthly_import_jun2026_flash.html` — real capture, June 2026 (₹ Crore), marked `"(F)"` —
+  a recent, published-but-not-yet-finalized month (real value `0.00` for this specific product, but the
+  page's own "India's Total Import" footer row shows a real nonzero national total, confirming June 2026
+  data genuinely exists and simply has zero real poppy-seed trade that month).
+
+- `poppy_seed_monthly_import_aug2026_not_yet_published.html` — real capture, August 2026 (the literal
+  current month at capture time), marked `"(A)"` (Advance) — genuinely unpublished: *both* the specific
+  commodity's value and the "India's Total Import" national-total footer row read `0.00`, confirming the
+  whole month's collection hasn't happened yet, not a coincidental real zero for poppy seeds specifically.
+
+  These four monthly fixtures together verify all three of DGCIS's real revision-status markers
+  (`docs/PLAN.md` §1, D15) — `parse_monthly_response` tests (`tests/unit/test_dgcis_parser.py`) run
+  against them, not live calls.
