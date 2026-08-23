@@ -1,6 +1,6 @@
 """BACI (CEPII) annual bulk-ZIP ingestion (`docs/PLAN.md` §7, build
-sequence item 6) — powers D9's check C (`report/mismatch.py`, not yet
-implemented there).
+sequence item 6) — powers D9's check C (`app.report.mismatch.
+compute_check_c`).
 
 **Real, verified format** (2026-08-23, vintage `V202601`, HS22 revision —
 the current/most-detailed revision offered, and the smallest download at
@@ -22,13 +22,22 @@ unverified guess in this project's own planning notes assumed a
 different UN M49 numeric scheme — corrected here by checking, not
 assumed).
 
-**A real, flagged coverage gap, not a bug**: the HS22-revision file only
-contains years **2022-2024** (HS22 became the active nomenclature that
-year) — it does **not** cover 2020-2021, part of this pipeline's
-canonical 2020-2024 window. Covering the earlier years would need the
-HS17-revision file too (~795MB, confirmed live, not downloaded or parsed
-by this module) — a real, open follow-up, not silently absorbed into a
-narrower window without saying so.
+**2020-2021 coverage gap, closed 2026-08-24**: the HS22-revision file only
+contains years 2022-2024 (HS22 became the active nomenclature that year),
+leaving 2020-2021 of this pipeline's canonical 2020-2024 window uncovered
+for a while. Closed by loading the same vintage's HS17-revision file too
+(`BACI_HS17_V202601.zip`, 794,583,540 bytes, confirmed live) — its member
+CSVs span 2017-2024, confirmed to include real `BACI_HS17_Y2020_V202601.csv`/
+`_Y2021_V202601.csv` members before loading. No code change was needed:
+this module was already fully generic over `hs_revision`. Real result for
+HS6 `120791`: 50 India-involving 2020 records, 58 for 2021 (108 total),
+loaded via `scripts/load_baci_zip.py --hs-revision 17 --years 2020 2021`,
+then folded into `normalized_trade_flows` via
+`app.pipeline.normalize.normalize_baci_rows` using real Frankfurter FX
+rates for 2020-06-15/2021-06-15 (`75.999`/`73.349`), the same
+mid-year-rate convention already used for 2022-2024. `D9` check C now
+produces a real result for 2020 (previously impossible for lack of BACI
+data at all) — confirmed live via `app.report.mismatch.compute_check_c`.
 
 **Streamed directly from the ZIP member**, never fully extracted to disk
 and never loaded whole into memory — each year's CSV is real, ~11 million

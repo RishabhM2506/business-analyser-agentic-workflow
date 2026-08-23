@@ -1202,3 +1202,54 @@ touched files) as part of this round's final acceptance checklist.
 (Apr-Jun `is_provisional=true`); Jul-Dec `NOT_YET_PUBLISHED`. Export — Jan-Mar `OK` (real values); Apr-Jun
 `PROVISIONAL` (real values, real mom deltas: 0%, -43.6%, +368.2%); Jul-Dec `NOT_YET_PUBLISHED`. No month
 anywhere shows a fabricated zero or a fabricated percentage for a month DGCIS hasn't actually published.
+
+### 4. "posta dana" vernacular-search fix — already implemented and committed; live-verified in this round
+
+The plan the user approved for this (`~/.claude/plans/drifting-plotting-marshmallow.md`) turned out to
+already be fully implemented and committed earlier in this same session, before the portion covered by this
+log's most recent entries: `app/search/normalize.py`, `prompts/normalize_query.md`, the gated retry in
+`app/search/service.py`, the `MockLLM` branch in `app/models.py`, and their tests
+(`tests/unit/test_normalize_query.py`, `tests/integration/test_search_service.py`, etc.) all already exist,
+landed in commit `2dd82cf` ("hybrid BM25+vector+LLM product search, graceful Comtrade degradation,
+cross-lingual query fix"). `docs/STATE.md`'s note that this plan was "not yet approved" was stale, carried
+over from before that commit landed.
+
+No code changes were needed. Ran the plan's own rollout-verification checklist for real, against the live
+Gemini-backed app (real embeddings corpus, real `GEMINI_API_KEY`) since it had apparently never been
+confirmed post-commit: `search_products("posta dana", ...)` → `auto_selected`, `120791` (poppy seeds) — the
+exact bug this plan targeted, fixed. `"haldi powder"` → `091030` (turmeric); `"chana dal"` → `071320`
+(chickpeas); both `auto_selected` with sane codes. `"green coffee beans"` → `090111` and `"coffee"` →
+`090121`, both `auto_selected`, confirming no regression on already-English queries. A genuine nonsense
+query (`"zzzqqqxxx asdkjhaskjdh nonsense gibberish"`) still correctly returns `no_candidates_found`. All 6
+existing unit/integration tests for this feature re-run clean.
+
+### 5. BACI HS17 2020-2021 historical coverage (closes the last open gap from item 3)
+
+`app/pipeline/baci.py` was already fully generic over `hs_revision` — no code changes needed, a real
+data-loading task. Downloaded the real `BACI_HS17_V202601.zip` (same vintage already used for HS22) from
+`https://www.cepii.fr/DATA_DOWNLOAD/baci/data/BACI_HS17_V202601.zip`, confirmed live at exactly
+794,583,540 bytes matching the server's own `Content-Length`. First download attempt timed out at 600s with
+only 207MB fetched (a real, slow connection this session, ~350KB/s effective); resumed with `curl -C -` and
+a 30-minute timeout to completion. Confirmed the ZIP's real member list includes `BACI_HS17_Y2020_V202601.csv`
+and `_Y2021_V202601.csv` (the file's real coverage is 2017-2024) before loading anything.
+
+Loaded via the existing `scripts/load_baci_zip.py --hs-revision 17 --years 2020 2021 --hs6 120791` — 108
+real India-involving records (50 for 2020, 58 for 2021), upserted into `raw_baci_records`. Folded into
+`normalized_trade_flows` via `app.pipeline.normalize.normalize_baci_rows` (also already fully generic, no
+code change), using real Frankfurter FX rates fetched live for 2020-06-15 (`75.999`) and 2021-06-15
+(`73.349`) — the same mid-year-representative-rate convention already used for 2022-2024's real
+`78.045`/`82.200`/`83.610`. `normalized_trade_flows` now holds 258 real BACI rows for HS6 `120791`
+(up from 150), covering the pipeline's full canonical 2020-2024 window with zero remaining gap.
+
+**Real, end-to-end verification**: ran `app.report.mismatch.compute_check_c` (D9 check C, DGCIS vs. BACI)
+for import/2020-2024 — 2020 now produces a real result (216.6% gap, `warning` severity; previously
+impossible for total lack of BACI data that year), 2022 a real `quiet`-severity result; 2021/2023/2024
+correctly skipped for real, distinct reasons (DGCIS `NOT_REPORTED` for 2021; DGCIS `ZERO` denominator for
+2023/2024 - a percentage against zero is correctly left undefined, not computed as infinite or silently
+treated as agreement). Added one new unit test (`test_parse_works_with_the_hs17_revision_closing_the_2020_
+2021_gap`) using a real row from the actual downloaded HS17 file, confirming the parser's `hs_revision`
+genericity is actually exercised by the test suite, not just assumed from reading the code. Updated
+`app/pipeline/baci.py`'s own module docstring (previously described this as an open, unresolved gap) to
+document the real resolution. 577 tests passing (was 576; +1). `mypy app` (61 files)/`ruff`/`black`: clean.
+
+**All 5 items from the user's 2026-08-24 unblocking-round message are now complete.**

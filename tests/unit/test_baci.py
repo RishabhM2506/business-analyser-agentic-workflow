@@ -125,3 +125,30 @@ def test_parse_stores_the_real_verified_india_code() -> None:
     unverified guess in this project's own planning notes assumed a
     different UN M49 numeric scheme)."""
     assert INDIA_CODE == "699"
+
+
+def test_parse_works_with_the_hs17_revision_closing_the_2020_2021_gap() -> None:
+    """Regression test for the real 2020-2021 BACI coverage gap closed
+    2026-08-24: the HS22-revision file only covers 2022-2024, so 2020-2021
+    needed the same vintage's HS17-revision file. `hs_revision` is just a
+    stored/propagated string here, not branched on - this test uses a real
+    row shape from the actual downloaded `BACI_HS17_Y2020_V202601.csv`
+    (India as importer, exporter 156) to confirm that genericity is
+    actually exercised, not just assumed from reading the code."""
+    csv_text = "t,i,j,k,v,q\n2020,156,699,120791,3275.229,2037.187\n"
+    records = list(
+        parse_baci_year_csv(
+            _csv_stream(csv_text),
+            vintage="202601",
+            hs_revision="17",
+            year=2020,
+            hs6_codes={"120791"},
+        )
+    )
+
+    assert len(records) == 1
+    r = records[0]
+    assert r.hs_revision == "17"
+    assert r.year == 2020
+    assert r.value_fob_usd == Decimal("3275229.000")
+    assert r.quantity_kg == Decimal("2037187.000")
