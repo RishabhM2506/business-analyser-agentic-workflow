@@ -463,3 +463,47 @@ runs `mypy app`, matching this project's established scope).
 **Next**: `coverage_gate.py` (D11) and `unit_consistency.py` (D10) — both still open within item 8, both
 needed before `report/service.py` can assemble a real end-to-end report response. Check C (vs. BACI) remains
 unimplemented pending BACI ingestion (item 6, not started).
+
+## Build sequence item 8, remaining pieces: `unit_consistency.py` (D10) and `coverage_gate.py` (D11), built and live-verified
+
+**Files**: `app/report/unit_consistency.py` (`check_unit_consistency`, `mark_unit_mismatch`), 5 new
+integration tests. `app/warehouse/coverage_gate.py` (`evaluate_coverage`, `upsert_coverage_summary`), 6 new
+integration tests (§9's 30% threshold boundary-tested at exactly 30% (passes, `>` not `>=`) and 30.1%
+(fails), plus the zero-`expected_cells` fail-closed path and `degraded` detection).
+
+**Design decisions, both flagged rather than silently assumed**:
+- `unit_consistency.py` only compares `raw_dgcis_annual.unit` across HS8 siblings — the only source in this
+  pipeline with a per-row, source-stated unit at HS8 granularity (§1 already verified DGCIS's report header
+  states its own unit "for free"); Comtrade's `hs8` is always `NULL` in `normalized_trade_flows`, so it has
+  no siblings to compare and never participates. `mark_unit_mismatch` only overwrites rows whose current
+  status is `OK`/`ZERO`/`QTY_MISSING` — never `FETCH_FAILED`/`NOT_REPORTED`/etc, which carry a stronger,
+  unrelated signal that `UNIT_MISMATCH` must not silently hide (§5's status table treats each value as its
+  own distinct, non-overlapping condition).
+- `coverage_gate.py`'s `tracked_partners_in_scope` (§9's own formula) is a caller-supplied count, not
+  inferred from whatever's already in the database — inferring it from present rows would conflate "how
+  much of our intended scope has data" with "how much of the data we happen to have has data," which is
+  exactly the same real distortion already flagged for `mismatch.py`'s check A. `periods_expected` is
+  computed at annual grain (`window_end.year - window_start.year + 1`) since the only series built so far
+  (`raw_dgcis_annual`) is annual; D15's monthly current-year section is a separate table with its own
+  row discipline and doesn't go through this gate. `degraded` (a column in `analytics_coverage_summary`
+  with no formula given in §9) is defined here as "any `FETCH_FAILED` cell present in-window" — a stated,
+  flagged judgment call, not an unstated spec detail silently invented.
+
+**Verification performed**: real end-to-end runs against the real database. `check_unit_consistency` for
+HS6 120791: `is_consistent=True`, `{'12079100': {'KGS'}}` (only one HS8 ingested so far, so this is a real
+but limited positive-path check — the mismatch path is proven only by the synthetic integration tests).
+`evaluate_coverage` for HS6 120791/import/2020-2024, `tracked_partners=1` (the real, honest count — only
+Turkey ingested): `expected_cells=5`, `present_cells=5`, `qty_missing_cells=0`, `gate_passed=True`. **Flagged
+explicitly**: `qty_missing_cells=0` here reflects a known, already-recorded gap, not a new finding —
+`normalize_dgcis_annual_rows` doesn't yet populate `QTY_MISSING` status even though §5's table says every
+DGCIS row should be `QTY_MISSING` (DGCIS's annual report never returns a quantity, verified in the DGCIS
+build-log entry above). The gate itself is built correctly against whatever statuses exist; the input data's
+status coverage is the open item, tracked in `docs/STATE.md`, not silently glossed over here. Real result
+persisted to `analytics_coverage_summary` via `upsert_coverage_summary`, confirmed idempotent.
+`uv run pytest -q`: 451 passed (was 440; +11). `mypy app`/`ruff`/`black`: clean.
+
+**Next**: `report/facts.py` (§14, frozen LLM contract) is the next natural step toward a real, demonstrable
+end-to-end report for the canonical scenario — coverage gate, mismatch checks A/B, and unit consistency are
+all now real and computable for HS6 120791. Still open before a true end-to-end report: populating
+`QTY_MISSING` in the DGCIS normalizer (a real, flagged gap above), `report/landed_cost.py`'s real duty-rate
+citation (still pending from the user), `report/narrative.py`, and `route/trade_report.py`.
