@@ -208,6 +208,7 @@ class Facts(BaseModel):
 
     hs6: str
     product_label: str
+    flow: str
     window: Window
     top_n: int
     annual_series: list[AnnualSeriesYear]
@@ -538,6 +539,7 @@ async def assemble_facts(
     return Facts(
         hs6=hs6,
         product_label=product_label,
+        flow=flow,
         window=Window(years=len(years), start_year=years[0], end_year=years[-1]),
         top_n=top_n,
         annual_series=annual_series,

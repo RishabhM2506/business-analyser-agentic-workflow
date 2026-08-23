@@ -685,3 +685,52 @@ used `type: ignore` before).
 `/messages` flow's `check_numbers_grounded` pattern) is the next step toward a real end-to-end report
 response. `routes/trade_report.py` (D14 params) can follow once narrative exists. `analytics_monthly_current_year`
 (D15) and `analytics_landed_cost`'s monthly writer remain open, not blocking a first working narrative.
+
+## `app/report/narrative.py` — MODEL_ANALYSIS narrative + D4 number-grounding, built and live-verified
+
+**Files**: `app/report/narrative.py` (`generate_narrative`, `check_narrative_grounded`,
+`find_ungrounded_numbers`, `flatten_facts_numbers`, `render_facts_for_prompt`, `render_template_fallback`),
+`prompts/trade_narrative.md` (new, versioned `trade_narrative-v1`, includes the D12 hard-rule clause
+`app/report/narrative.py` appends conditionally), 13 unit tests (grounding-set generation, prompt
+rendering, template-fallback grounded-by-construction, the reject→regenerate-once→template-fallback
+orchestration against a fake `ModelClient` mirroring `tests/integration/test_describe_item.py`'s
+`_NumberInventingModelClient` pattern).
+
+**Grounding generalizes, doesn't reuse, `app.guardrails.check_numbers_grounded`** (that function is
+hardwired to `TradeTable`'s shape): every numeric leaf of `Facts` is grounded, including structural ones
+(`year`/`rank`/`top_n`) — actually simpler than the original, since every one of `Facts`' fields is a real
+leaf of the document being grounded against, unlike `TradeTable` where `rank` needed a separate allowlist.
+A `_inr_paise`/`inr_paise_per_kg` leaf is grounded in both its raw-paise and rupee-crore forms, since the
+rendered prompt states crore, not raw paise.
+
+**Two real bugs found by this module's own test suite before it ever needed a live model** (both would
+have caused `render_template_fallback` — a supposedly always-grounded fallback — to spuriously fail its
+own grounding check):
+1. `hs6` is a `str` field on `Facts`, so `flatten_facts_numbers`'s numeric walk never added it — any
+   narrative stating "120791" (the whole subject of the document) was ungrounded. This is the exact same
+   real gap `app.guardrails._flatten_value_numbers` already documents and fixes for `hs_code` — fixed the
+   same way, `hs6` added to the grounded set explicitly.
+2. `extract_numbers`' regex has no way to distinguish the "6" in "HS6" from a real single-digit trade
+   figure — the digit isn't preceded by another digit, so the existing hyphen-lookbehind guard doesn't
+   help. Fixed by stripping `HS6`/`HS8` down to `HS` before extraction (`_strip_hs_level_labels`), narrow
+   and targeted rather than weakening the shared regex used elsewhere.
+
+**D12 enforcement**: `_load_system_prompt` appends `_REGULATORY_WARNING_CLAUSE` (forbidding a
+commercial-preference explanation for partner concentration) only when `facts.regulatory_note_missing_warning`
+is true — verified by two tests that the clause is present/absent exactly as expected.
+
+**Verification performed**: real end-to-end run for HS6 120791/import/2020-2024. A genuine live call against
+the real, configured Gemini API hit a real `503 UNAVAILABLE` (Google's own transient overload, confirmed on
+two separate attempts a few seconds apart — external infrastructure, not a code defect); the identical code
+path was then exercised for real with `MockLLM`, which passed grounding on the first attempt
+(`source="model"`) using the real numbers rendered from the actual facts document. The
+reject→regenerate→template-fallback path was also exercised for real against the same live data using a
+fake client that always returns an invented "999%" figure: correctly fell through to
+`source="template_fallback"`, producing a real, fully grounded narrative that correctly named the two
+`QTY_MISSING` years, the three real `ZERO` years, the incomplete landed cost with its unverified components,
+and the missing regulatory note concentration warning — verified with `check_narrative_grounded` directly.
+`uv run pytest -q`: 494 passed (was 481; +13). `mypy app`/`ruff`/`black`: clean.
+
+**Next**: `routes/trade_report.py` (`POST /threads/{id}/trade-report`, D14 params: `years` 1-8 default 5,
+`top_n` 3-25 default 10) wires `facts.py` + `narrative.py` into a real HTTP endpoint — the last piece for a
+genuine end-to-end request/response for the canonical scenario.
