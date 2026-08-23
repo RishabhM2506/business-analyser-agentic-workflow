@@ -11,7 +11,12 @@ from decimal import Decimal
 
 import pytest
 
-from app.report.monthly_current_year import _pct_change, _RawCell, _status_for_cell
+from app.report.monthly_current_year import (
+    _pct_change,
+    _RawCell,
+    _status_for_cell,
+    _trustworthy_value,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -101,3 +106,37 @@ def test_status_for_flash_value_and_quantity_is_provisional() -> None:
 
     assert status == "PROVISIONAL"
     assert is_provisional is True
+
+
+def test_trustworthy_value_is_none_for_a_missing_cell() -> None:
+    assert _trustworthy_value(None) is None
+
+
+def test_trustworthy_value_ignores_an_advance_markers_placeholder_zero() -> None:
+    """Regression test for a real bug found live, 2026-08-24: a genuine
+    "(A)"-marked row (`raw_dgcis_monthly`, real 2026 poppy-seed export
+    data) carries a literal `value_inr_paise=0` placeholder, not a real
+    reported zero. Before this fix, `compute_monthly_current_year` used
+    that placeholder directly as `value_inr_paise` and as an input to
+    `mom_change_pct`, producing a real, observed `-100%` "decline" figure
+    on a month whose own status correctly said `NOT_YET_PUBLISHED` -
+    exactly the "NULL/unknown coerced into a real number" mistake D2
+    forbids."""
+    cell = _RawCell(value_inr_paise=0, quantity_kg=None, marker="A")
+
+    assert _trustworthy_value(cell) is None
+
+
+def test_trustworthy_value_passes_through_a_real_finalized_value() -> None:
+    cell = _RawCell(value_inr_paise=1000, quantity_kg=Decimal("50"), marker="R")
+
+    assert _trustworthy_value(cell) == 1000
+
+
+def test_trustworthy_value_passes_through_a_real_reported_zero() -> None:
+    """A real ZERO (finalized/flash marker) is a genuine reported number,
+    unlike an advance marker's placeholder - it must still be usable for
+    mom/yoy math (a real decline to zero is real data)."""
+    cell = _RawCell(value_inr_paise=0, quantity_kg=None, marker="R")
+
+    assert _trustworthy_value(cell) == 0

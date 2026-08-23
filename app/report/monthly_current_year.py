@@ -140,6 +140,24 @@ def _status_for_cell(cell: _RawCell | None) -> tuple[str, str | None, bool]:
     return "OK", None, False
 
 
+def _trustworthy_value(cell: _RawCell | None) -> int | None:
+    """`cell.value_inr_paise`, unless the cell's own status is
+    `NOT_YET_PUBLISHED` - a real, live-confirmed case (2026-08-24, a real
+    `"(A)"`-marked row): DGCIS's "advance" response carries a literal
+    `0.00` placeholder for a month it hasn't actually collected data for
+    yet, not a genuine reported zero. Treating that placeholder as a real
+    number - either as this row's own `value_inr_paise` or as an input to
+    `mom_change_pct`/`yoy_same_month_pct` - would silently manufacture a
+    fabricated 0 (or a fabricated -100% "decline") for a month that is
+    genuinely unknown, exactly what D2 forbids."""
+    if cell is None:
+        return None
+    status, _status_detail, _is_provisional = _status_for_cell(cell)
+    if status == "NOT_YET_PUBLISHED":
+        return None
+    return cell.value_inr_paise
+
+
 async def compute_monthly_current_year(
     engine: AsyncEngine, *, hs6: str, flow: str, year: int
 ) -> list[MonthlyCurrentYearRow]:
@@ -150,22 +168,18 @@ async def compute_monthly_current_year(
         month = date(year, month_num, 1)
         cell = cells.get(month)
         status, status_detail, is_provisional = _status_for_cell(cell)
-        value = cell.value_inr_paise if cell is not None else None
+        value = _trustworthy_value(cell)
 
         prev_month = date(year, month_num - 1, 1) if month_num > 1 else date(year - 1, 12, 1)
-        prev_cell = cells.get(prev_month)
+        prev_value = _trustworthy_value(cells.get(prev_month))
         mom = None
-        if value is not None and prev_cell is not None and prev_cell.value_inr_paise is not None:
-            mom = _pct_change(previous=prev_cell.value_inr_paise, current=value)
+        if value is not None and prev_value is not None:
+            mom = _pct_change(previous=prev_value, current=value)
 
-        prior_year_cell = cells.get(date(year - 1, month_num, 1))
+        prior_year_value = _trustworthy_value(cells.get(date(year - 1, month_num, 1)))
         yoy = None
-        if (
-            value is not None
-            and prior_year_cell is not None
-            and prior_year_cell.value_inr_paise is not None
-        ):
-            yoy = _pct_change(previous=prior_year_cell.value_inr_paise, current=value)
+        if value is not None and prior_year_value is not None:
+            yoy = _pct_change(previous=prior_year_value, current=value)
 
         rows.append(
             MonthlyCurrentYearRow(

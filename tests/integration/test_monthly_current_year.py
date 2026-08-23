@@ -195,6 +195,43 @@ async def test_compute_sums_value_but_never_quantity_across_multiple_hs8_lines(
     assert june.status == "QTY_MISSING"  # quantity never guessed across lines
 
 
+async def test_an_advance_markers_placeholder_zero_is_never_used_as_a_real_value(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """Regression test for a real bug found live, 2026-08-24, against real
+    2026 poppy-seed export data: a genuine "(A)"-marked row carries a
+    literal `value_inr_paise=0` placeholder, not a real reported zero.
+    Before the fix, this placeholder was used directly as the month's own
+    `value_inr_paise` and fed into `mom_change_pct`, producing a real,
+    observed `-100%` "decline" on a month whose status correctly said
+    `NOT_YET_PUBLISHED` - a fabricated number, exactly what D2 forbids."""
+    from decimal import Decimal
+
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(raw_dgcis_monthly).values(
+                [
+                    _raw_row(
+                        month=date(2023, 6, 1),
+                        value=1_030_000_000,
+                        quantity=Decimal("6548"),
+                        marker="F",
+                    ),
+                    _raw_row(month=date(2023, 7, 1), value=0, quantity=Decimal("0"), marker="A"),
+                ]
+            )
+        )
+
+    results = await compute_monthly_current_year(
+        warehouse_engine, hs6=_TEST_HS6, flow="import", year=2023
+    )
+
+    july = next(r for r in results if r.month == date(2023, 7, 1))
+    assert july.status == "NOT_YET_PUBLISHED"
+    assert july.value_inr_paise is None  # never the raw placeholder 0
+    assert july.mom_change_pct is None  # never a fabricated -100%
+
+
 async def test_upsert_writes_all_12_months_and_is_idempotent(warehouse_engine: AsyncEngine) -> None:
     results = await compute_monthly_current_year(
         warehouse_engine, hs6=_TEST_HS6, flow="import", year=2023

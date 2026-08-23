@@ -1158,3 +1158,47 @@ targeted `ruff check`/`black` run on that single file, immediately before that c
 repo-wide `ruff check .`/`black --check .` (run for the first time this session as part of the final
 acceptance checklist below) surfaced and fixed it. Folded into this commit rather than amending the prior
 one, per this project's "never amend, always a new commit" convention.
+
+### 3. Real, full 2026 monthly DGCIS run (`scripts/run_dgcis_monthly.py`, new) — and a real bug it surfaced
+
+New curator CLI mirroring `run_dgcis_country_batch.py`'s shape for the monthly path: runs
+`fetch_year_monthly`, upserts `raw_dgcis_monthly`, then immediately computes and upserts
+`analytics_monthly_current_year` for the same (hs6, flow, year) — a full raw-to-analytics run in one
+command. Ran for real against poppy seeds, HS8 `12079100` / HS6 `120791`, both flows, year 2026 (today's
+real date, 2026-08-24): import (11/12 months had a response row, 0 failures) and export (12/12, 0 failures).
+
+**Real, richer data than any prior live verification this session exercised** — export had genuine non-zero
+trade every month Jan-Jun 2026 (₹3.6-10.3 lakh range), finalized (`"R"`) for Jan-Mar, flash/provisional
+(`"F"`) for Apr-Jun, and `"(A)"`-advance for Jul-Dec. This combination surfaced **a real bug in the D15
+writer committed earlier in this session**: `compute_monthly_current_year` took `mom_change_pct`'s "current"
+value straight from the raw cell whenever it was non-`None`, without checking that cell's own `status` first.
+A real `"(A)"`-marked row (confirmed already, `docs/BUILD-LOG.md`'s D15 entry) carries a literal
+`value_inr_paise=0` *placeholder* (DGCIS hasn't actually collected the month's data yet), not a real reported
+zero — the writer's own `_status_for_cell` correctly recognized this as `NOT_YET_PUBLISHED`, but the mom/yoy
+math bypassed that and used the placeholder anyway, producing a real, observed **`-100%` "decline"** on
+2026-07 (July's placeholder 0 vs. June's real ₹10.3 lakh) — a fabricated number attached to a month
+explicitly flagged as unknown, exactly what D2 forbids and never caught by the earlier live verification
+(that one's `NOT_YET_PUBLISHED` months all had *zero raw rows at all*, not a placeholder-carrying row, so
+the bug path was never exercised).
+
+**Fixed**: new `_trustworthy_value(cell)` helper — returns `cell.value_inr_paise` unless that cell's own
+`_status_for_cell` result is `NOT_YET_PUBLISHED`, in which case it returns `None`. Used for the row's own
+`value_inr_paise` field *and* as both the current and baseline input to `mom_change_pct`/
+`yoy_same_month_pct` — a `NOT_YET_PUBLISHED` month (or a `NOT_YET_PUBLISHED` prior month used as a
+baseline) can now never surface a real-looking number. Re-verified live after the fix: July 2026 export now
+correctly reads `value_inr_paise=None, mom_change_pct=None` instead of `0, -100%`; re-ran the import flow
+too (it had been upserted with the pre-fix code) to refresh its stale placeholder-zero rows in
+`analytics_monthly_current_year`. A real, finalized/flash `ZERO` (e.g. 2026-02 through 2026-06 import, all
+genuinely zero trade, markers `"R"`/`"F"`) is unaffected — `_trustworthy_value` only excludes
+`NOT_YET_PUBLISHED` cells, never a real reported zero.
+
+5 new regression tests (3 unit exercising `_trustworthy_value` directly, including the exact real bug shape;
+1 integration reproducing the real June-real/July-placeholder scenario end to end). 576 tests passing (was
+571; +5). `mypy app` (61 files)/`ruff`/`black`: clean, including a first-ever repo-wide pass (not just the
+touched files) as part of this round's final acceptance checklist.
+
+**Final real 2026 state** (`analytics_monthly_current_year`, HS6 `120791`): import — Jan `NOT_YET_PUBLISHED`
+(the one response with no matching row at all, a separate, rarer case, also handled safely); Feb-Jun `ZERO`
+(Apr-Jun `is_provisional=true`); Jul-Dec `NOT_YET_PUBLISHED`. Export — Jan-Mar `OK` (real values); Apr-Jun
+`PROVISIONAL` (real values, real mom deltas: 0%, -43.6%, +368.2%); Jul-Dec `NOT_YET_PUBLISHED`. No month
+anywhere shows a fabricated zero or a fabricated percentage for a month DGCIS hasn't actually published.
