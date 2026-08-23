@@ -1275,3 +1275,72 @@ HTTP 500s). Updated `BCD`'s `NOT_VERIFIED` notes with the full new evidence trai
 directly to confirm the real rendered column header/tooltip for `rta` in their own browser session, per
 their own earlier explicit instruction not to assume this. No application code changed — pure data curation
 via the existing `scripts/record_duty_rate.py`/`record_regulatory_note.py`.
+
+Also confirmed the "rta" ambiguity: the user checked the real rendered column header/tooltip in their own
+browser and confirmed it is specifically Basic Customs Duty, not a combined rate. Recorded `BCD=20%` as
+`VERIFIED` for HS8 `12079100` via `scripts/record_duty_rate.py`, citing both the live `Desc_details` fetch
+and the user's own browser confirmation. HS 120791's duty picture is now: `BCD` `VERIFIED` 20%; `AIDC`/
+`SWS`/`IGST` still `NOT_VERIFIED` (no evidence found for these three specifically).
+
+## Tier-1 agriculture-source expansion, begun 2026-08-24 (user-approved, full 9-source scope)
+
+User proposed a broader source registry (Agmarknet variety data + MSP + crop production/area/yield +
+horticulture, prioritized as a data.gov.in "Tier 1" of 9 datasets, plus a Tier 2/3 of DGFT/CBIC/FSSAI/BACI/
+FAOSTAT/World Bank enrichment). Chose to build this the same way as every other unit this session: one real,
+live-verified, tested, committed source at a time — not a single giant untested batch.
+
+### Extracted `app/pipeline/data_gov_in.py` — shared client, ahead of building a second dataset
+
+Every dataset on this platform shares one real REST shape (confirmed by building a second, independent
+resource): `GET /resource/<uuid>?api-key=...&format=json&offset=&limit=&filters[<Field>]=...`. Extracted
+the HTTP mechanics `app.pipeline.agmarknet` had already found and fixed live (the httpx-default-User-Agent
+silent block, the `HTTP 200`-with-error-body rate-limit shape) into a shared module, plus a newly-found
+second real rate-limit shape (a genuine `HTTP 429`, hit live while discovering the MSP dataset below — data.
+gov.in's rate limiting is not consistently shaped across calls). `app.pipeline.agmarknet` refactored to a
+thin wrapper over the shared client; its own 17 existing tests re-run clean, confirming the refactor changed
+nothing observable.
+
+**A real, live-confirmed pagination bug found and fixed before it ever shipped**: the generic
+`fetch_all_pages`'s first draft used a "stop at the first page shorter than the requested `page_size`"
+heuristic (copied from `agmarknet.py`'s own, which happened to always work because Agmarknet honors whatever
+`limit` is requested). The very next real dataset broke that assumption: the MSP resource (below) silently
+caps its own effective page size to 10 regardless of what's requested - a real `limit=25` request returned
+exactly 10 records, with `"limit": 10` echoed back in the response. Under the old heuristic, every page
+would have looked "short" relative to the *requested* size, silently truncating every dataset on this
+resource to its first 10 rows. Fixed by advancing `offset` by each page's own *actual* returned length and
+stopping only at a genuinely empty page - correct regardless of whether a resource honors, caps, or
+otherwise alters the requested limit. Caught in unit tests (a new regression test reproducing the exact real
+22-rows/10-per-page shape) before it ever touched real data; live-verified afterward that the fix pulls all
+44 real rows (see below), not 10.
+
+10 new unit tests for the shared client (success, User-Agent, filter-param construction, both rate-limit
+shapes + exhaustion, non-retryable status, pagination including the cap-bug regression).
+
+### `app/pipeline/msp.py` (new) — Commodity-wise MSP + Cost of Production
+
+First concrete Tier-1 source, chosen (per the user's own pick when asked to scope this down) as the
+single highest-value addition: "mandi price vs. government MSP" is a genuinely new per-product comparison.
+Real resource `50012e24-85bc-4731-a6a9-2918caf5f0bf` ("Commodity-wise Minimum Support Price (MSP) and Cost
+of Production of Mandated Agricultural Crops from 2017-18 and 2022-23", Rajya Sabha) - found via web search
+(data.gov.in's own site search is a JS-heavy SPA that resisted direct scraping; extracted the real resource
+UUID from a dataset page's embedded state and confirmed it live against `api.data.gov.in`, discarding a
+second, wrong UUID - the page's `catalog_uuid` - the same way `catalog_uuid` vs. real `resource_id` was
+already distinguished for Agmarknet). A small, static reference table: 22 real rows total (one per mandated
+crop), not a daily feed.
+
+New `raw_msp_records` table (migration `9d9b27ce34f8`, real upgrade/downgrade/upgrade round-trip verified) -
+normalizes the source's own wide year-pair columns (`"2017-18 - Cost"`, `"2017-18 - MSP"`, ...) into one row
+per `(commodity, year_label)`, this pipeline's established "one fact per row" convention. Money parsed via
+`Decimal`, never `float` (D8); a missing cost/MSP field parses to `None`, never coerced to 0 (D2). Unit
+(Rs./Quintal) is an inherited assumption, not newly reconfirmed from this API's own metadata - same
+real gap as Agmarknet's.
+
+12 new tests (7 unit, 5 integration against real Postgres). **Real end-to-end verification**: live fetch
+against the real API returned exactly 44 records (22 commodities × 2 year pairs) - direct proof the
+pagination-cap fix above works against real data, not just mocked tests - all 44 upserted to real Postgres,
+confirmed via `psql`. 599 tests passing (was 577; +22, across the shared client + Agmarknet's unchanged
+17 + MSP's 12 + this round's earlier-recorded net). `mypy app` (63 files)/`ruff`/`black`: clean, repo-wide.
+
+**Remaining Tier-1 sources not yet built**: crop-wise area/production/yield, horticulture production/area,
+horticulture varieties (Agmarknet variety-wise daily prices, the 7th listed item, was already built earlier
+this session). Continuing one source at a time, same pattern.

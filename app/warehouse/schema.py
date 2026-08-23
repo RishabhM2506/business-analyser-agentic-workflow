@@ -289,6 +289,28 @@ raw_agmarknet_prices = Table(
     UniqueConstraint("price_date", "commodity", "market", name="uq_raw_agmarknet_prices"),
 )
 
+# [Tier-1 agriculture-source expansion, 2026-08-24] Commodity-wise MSP +
+# Cost of Production (data.gov.in resource 50012e24-85bc-4731-a6a9-2918caf5f0bf).
+# A small, static reference table (22 real rows as of this writing, one
+# per mandated crop) - the source's own wide year-pair columns
+# (`"2017-18 - Cost"`, `"2017-18 - MSP"`, ...) are normalized here into
+# one row per (commodity, year_label), matching this pipeline's "one fact
+# per row" raw-layer convention rather than mirroring the source's wide
+# shape verbatim.
+raw_msp_records = Table(
+    "raw_msp_records",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("fetched_at", DateTime(timezone=True), nullable=False),
+    Column("crops", Text, nullable=False),
+    Column("commodity", Text, nullable=False),
+    Column("year_label", Text, nullable=False),
+    Column("cost_inr_paise_per_qtl", BigInteger, nullable=True),
+    Column("msp_inr_paise_per_qtl", BigInteger, nullable=True),
+    Column("raw_payload", JSONB, nullable=False),
+    UniqueConstraint("commodity", "year_label", name="uq_raw_msp_records"),
+)
+
 # ── Dead letter (docs/PLAN.md D3) ────────────────────────────────────────
 
 dead_letter_ingestion = Table(
@@ -524,6 +546,7 @@ __all__ = [
     "raw_comtrade_records",
     "raw_dgcis_annual",
     "raw_dgcis_monthly",
+    "raw_msp_records",
     "ref_country_crosswalk",
     "ref_duty_component_conflicts",
     "ref_duty_components",

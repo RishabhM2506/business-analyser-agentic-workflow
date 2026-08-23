@@ -3,6 +3,12 @@
 real user-supplied `AGMARKNET_API_KEY`, `app.settings.Settings.
 agmarknet_api_key`).
 
+HTTP mechanics (the User-Agent fix, rate-limit retry, pagination) now
+live in `app.pipeline.data_gov_in`, extracted here once a second dataset
+(`app.pipeline.msp`) needed the identical behavior. Everything below this
+point is Agmarknet-specific: its own filter dimensions, response-record
+shape, and `raw_agmarknet_prices` upsert.
+
 Real mechanics verified live, 2026-08-24, against
 `https://api.data.gov.in/resource/35985678-0d79-46b4-9ed6-6f13308a1d24`
 ("Variety-wise Daily Market Prices Data of Commodity", Dept. of
@@ -79,23 +85,18 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 
 import httpx
-import structlog
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.pipeline.data_gov_in import BASE_URL as BASE_URL
+from app.pipeline.data_gov_in import DataGovInError, DataGovInRateLimitedError
+from app.pipeline.data_gov_in import fetch_page as _generic_fetch_page
 from app.warehouse.schema import raw_agmarknet_prices
 
-logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
-
-BASE_URL = "https://api.data.gov.in"
 RESOURCE_PATH = "/resource/35985678-0d79-46b4-9ed6-6f13308a1d24"
 
 # Unverified, conservative starting point - see module docstring.
 _DEFAULT_PAGE_SIZE = 100
-_RATE_LIMIT_RETRY_SCHEDULE_SECONDS: tuple[float, ...] = (10.0, 30.0, 60.0)
-_JITTER_FRACTION = 0.2
-# Real, live-confirmed necessity - see module docstring's User-Agent finding.
-_REQUEST_HEADERS = {"User-Agent": "business-analyser-agentic-workflow/1.0"}
 
 
 class AgmarknetError(Exception):
@@ -167,44 +168,33 @@ async def fetch_page(
     sleep_fn: Callable[[float], Awaitable[object]] = asyncio.sleep,
     random_fn: Callable[[float, float], float] = random.uniform,
 ) -> list[dict[str, object]]:
-    """One page of real records, retried on the real, live-confirmed
-    `{"error": "Rate limit exceeded"}` shape (HTTP 200, so detected by
-    body inspection, not status code)."""
-    params: dict[str, str] = {
-        "api-key": api_key,
-        "format": "json",
-        "offset": str(offset),
-        "limit": str(limit),
-    }
+    """One page of real records - thin, Agmarknet-specific wrapper over
+    `app.pipeline.data_gov_in.fetch_page` (shared retry/User-Agent
+    mechanics), translating this module's own filter kwargs and
+    exception types."""
+    filters: dict[str, str] = {}
     if commodity is not None:
-        params["filters[Commodity]"] = commodity
+        filters["Commodity"] = commodity
     if state is not None:
-        params["filters[State]"] = state
+        filters["State"] = state
     if district is not None:
-        params["filters[District]"] = district
+        filters["District"] = district
 
-    last_error = "no attempt made"
-    for attempt_index in range(len(_RATE_LIMIT_RETRY_SCHEDULE_SECONDS) + 1):
-        if attempt_index > 0:
-            base = _RATE_LIMIT_RETRY_SCHEDULE_SECONDS[attempt_index - 1]
-            jitter = base * _JITTER_FRACTION
-            await sleep_fn(base + random_fn(-jitter, jitter))
-
-        response = await client.get(RESOURCE_PATH, params=params, headers=_REQUEST_HEADERS)
-        if response.status_code != 200:
-            raise AgmarknetError(f"status {response.status_code}: {response.text[:200]}")
-
-        body: dict[str, object] = response.json()
-        if "error" in body:
-            last_error = str(body["error"])
-            logger.warning("agmarknet_rate_limited", attempt=attempt_index, error=last_error)
-            continue
-
-        records = body.get("records", [])
-        assert isinstance(records, list)
-        return records
-
-    raise AgmarknetRateLimitedError(f"exhausted retry schedule: {last_error}")
+    try:
+        return await _generic_fetch_page(
+            client,
+            resource_path=RESOURCE_PATH,
+            api_key=api_key,
+            offset=offset,
+            limit=limit,
+            filters=filters,
+            sleep_fn=sleep_fn,
+            random_fn=random_fn,
+        )
+    except DataGovInRateLimitedError as exc:
+        raise AgmarknetRateLimitedError(str(exc)) from exc
+    except DataGovInError as exc:
+        raise AgmarknetError(str(exc)) from exc
 
 
 async def fetch_all_records(
