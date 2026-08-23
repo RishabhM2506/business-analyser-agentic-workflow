@@ -43,6 +43,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.pipeline.comtrade_mirror import INDIA_CODE
 from app.warehouse.schema import (
     normalized_trade_flows,
     raw_comtrade_records,
@@ -52,7 +53,20 @@ from app.warehouse.schema import (
 
 _UNMAPPED = "UNMAPPED"
 _DGCIS_DATASET_VERSION = "dgcis-annual-v1"
-_COMTRADE_DATASET_VERSION = "comtrade-mirror-v1"
+# Two distinct dataset_versions, not one - a real bug found before
+# mismatch.py could be built: a Query 1 row (India self-reporting, e.g.
+# reporter=699/partner=792/flow=export = "India's own claimed export to
+# Turkey") and a Query 2 row (reporter=792/partner=699/flow=export =
+# "Turkey's own claimed export to India", i.e. the mirror of India's
+# *import*) both normalize to the same (partner_country_code=792,
+# flow='export') pair - without a discriminator they collide on
+# normalized_trade_flows' unique key and one silently overwrites the
+# other via ON CONFLICT DO UPDATE. check_A needs only the reporter-shape
+# rows (partner_country_code='0', §10); check_B needs only the
+# partner-shape rows (the foreign country's own mirror figure) - keeping
+# them in separate dataset_version buckets keeps both queryable.
+_COMTRADE_DATASET_VERSION_REPORTER_ROLE = "comtrade-mirror-reporter-v1"
+_COMTRADE_DATASET_VERSION_PARTNER_ROLE = "comtrade-mirror-partner-v1"
 
 
 def _dgcis_fiscal_year_to_period_month(fiscal_year_label: str) -> tuple[int, date]:
@@ -193,6 +207,22 @@ async def normalize_comtrade_rows(
         value_inr_paise = int(value_usd * rate * 100) if value_usd is not None else None
         status = "NOT_REPORTED" if value_usd is None else ("ZERO" if value_usd == 0 else "OK")
         flow = "import" if raw["flow_code"] == "M" else "export"
+        # Query 1 (role="reporter") rows have reporter_code=699 (India) and
+        # partner_code = the real foreign country (or '0' for the World
+        # aggregate) - partner_code is already right. Query 2
+        # (role="partner") rows have partner_code=699 (India) fixed and
+        # reporter_code = the real foreign country instead - using
+        # partner_code there would wrongly store India as its own trade
+        # partner. Resolve whichever side isn't India (real bug found
+        # before mismatch.py could be built: check_B needs Query 2's
+        # foreign reporter identified correctly, not collapsed to '699').
+        is_reporter_role_row = raw["reporter_code"] == INDIA_CODE
+        partner_country_code = raw["partner_code"] if is_reporter_role_row else raw["reporter_code"]
+        dataset_version = (
+            _COMTRADE_DATASET_VERSION_REPORTER_ROLE
+            if is_reporter_role_row
+            else _COMTRADE_DATASET_VERSION_PARTNER_ROLE
+        )
         normalized_rows.append(
             {
                 "source": "comtrade",
@@ -202,11 +232,11 @@ async def normalize_comtrade_rows(
                 "flow": flow,
                 "period_month": date(year, 1, 1),
                 "calendar": "CY",
-                "partner_country_code": raw["partner_code"],
+                "partner_country_code": partner_country_code,
                 "basis": "CIF" if flow == "import" else "FOB",
                 "currency": "USD",
                 "universe": "un-comtrade-mirror",
-                "dataset_version": _COMTRADE_DATASET_VERSION,
+                "dataset_version": dataset_version,
                 "is_provisional": False,
                 "status": status,
                 "status_detail": None,

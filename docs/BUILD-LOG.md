@@ -384,3 +384,38 @@ integration). `mypy`/`ruff`/`black`: clean.
 **Next**: `app/report/mismatch.py` — checks A (DGCIS vs. India's own Comtrade submission, reporter role)
 and B (DGCIS vs. Turkey's Comtrade submission, partner role) are now directly computable with this real
 data.
+
+## Build sequence item 8, part 1 (continued): two real bugs found while designing `mismatch.py`, fixed in `normalize.py`
+
+While working out `mismatch.py`'s check B implementation against real data, found the initial
+`normalize_comtrade_rows` had two real correctness bugs — both would have silently corrupted check B, the
+opposite of the "traceability and factual correctness" the user explicitly required for this whole pipeline.
+Neither was caught by the first round of tests because those tests only exercised reporter-role
+(`role="reporter"`) raw rows.
+
+1. **`partner_country_code` used the wrong raw column for partner-role rows.** Comtrade's partner-role
+   query (`role="partner"`, §8) fixes `partnerCode=699` and varies `reporterCode` instead — so for those
+   rows, `raw_comtrade_records.partner_code` is always `'699'` (India itself), and the real foreign country
+   is in `reporter_code`. The original code used `raw["partner_code"]` unconditionally, which would have
+   stored India as its own trade partner for every partner-role row (confirmed live: 168 real rows affected
+   before the fix). Fixed by resolving whichever side isn't India:
+   `reporter_code if partner_code == INDIA_CODE else partner_code`.
+2. **Reporter-role and partner-role rows for the same (partner, flow) pair collide on the unique key.** A
+   reporter-role row ("India self-reports its own export to Turkey": `reporter=699, partner=792, flow=X`)
+   and a partner-role row ("Turkey self-reports its own export to India" — the mirror of India's *import*:
+   `reporter=792, partner=699, flow=X`) both resolve to `partner_country_code=792, flow='export'` after fix
+   #1 — an unintended collision on `normalized_trade_flows`' unique key, meaning one would silently overwrite
+   the other via `ON CONFLICT DO UPDATE`. Fixed by splitting `dataset_version` into
+   `comtrade-mirror-reporter-v1` / `comtrade-mirror-partner-v1` depending on which query shape produced the
+   row — `dataset_version` is part of the unique key, so this keeps both real, independent figures
+   queryable rather than one clobbering the other.
+
+**Verification performed**: two new regression tests
+(`test_normalize_comtrade_rows_resolves_partner_country_from_reporter_code`,
+`test_normalize_comtrade_rows_keeps_reporter_and_partner_role_rows_separate`) encode both bugs directly, per
+this project's established "found bug becomes the permanent regression test" pattern. Cleared and
+re-normalized all 363 real Comtrade rows for HS6 120791 with the fix; verified via `psql` that Turkey (792)
+now shows the reporter-role and partner-role figures as separate, independently-inspectable rows — e.g.
+2020 import (India's own claim, `comtrade-mirror-reporter-v1`) ₹344.71cr vs. 2020 export (Turkey's own
+claim, `comtrade-mirror-partner-v1`) ₹68.84cr — exactly the two real, distinct numbers check B needs to
+compare. `uv run pytest -q`: 418 passed (was 416; +2). `mypy`/`ruff`/`black`: clean.

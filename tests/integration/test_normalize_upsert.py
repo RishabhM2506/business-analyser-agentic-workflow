@@ -233,6 +233,127 @@ async def test_normalize_comtrade_rows_converts_fx_and_skips_unresolved_years(
     assert row["status"] == "OK"
 
 
+async def test_normalize_comtrade_rows_resolves_partner_country_from_reporter_code(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """Regression test for a real bug found before mismatch.py could be
+    built: a partner-role query (build_query_params(role="partner")) fixes
+    partner_code=699 (India) and varies reporter_code instead - naively
+    using raw partner_code as partner_country_code would store India as
+    its own trade partner and silently break check_B (which specifically
+    needs the foreign reporter's own export figure)."""
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(raw_comtrade_records).values(
+                fetched_at=datetime.now(UTC),
+                period=2023,
+                reporter_code="792",  # Turkey reporting its own export to India
+                partner_code="699",  # India, fixed by the partner-role query shape
+                flow_code="X",
+                cmd_code=_TEST_HS6,
+                primary_value_usd=Decimal("2000.00"),
+                net_weight_kg=Decimal("80.000"),
+                is_reported=True,
+                raw_payload={},
+            )
+        )
+
+    written = await normalize_comtrade_rows(
+        warehouse_engine,
+        hs6=_TEST_HS6,
+        fx_rates={2023: (Decimal("83.000000"), date(2023, 1, 1))},
+    )
+
+    assert written == 1
+    async with warehouse_engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    select(normalized_trade_flows).where(normalized_trade_flows.c.hs6 == _TEST_HS6)
+                )
+            )
+            .mappings()
+            .all()
+        )
+
+    assert len(rows) == 1
+    assert rows[0]["partner_country_code"] == "792"  # not '699' - India is never its own partner
+    assert rows[0]["flow"] == "export"
+    assert rows[0]["dataset_version"] == "comtrade-mirror-partner-v1"
+
+
+async def test_normalize_comtrade_rows_keeps_reporter_and_partner_role_rows_separate(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """Regression test for a second real bug found in the same
+    investigation: a reporter-role row (India self-reporting its own
+    export to Turkey: reporter=699/partner=792/flow=X) and a partner-role
+    row (Turkey self-reporting its own export to India, the mirror of
+    India's *import*: reporter=792/partner=699/flow=X) both resolve to
+    partner_country_code=792/flow='export' - without a dataset_version
+    discriminator they'd collide on normalized_trade_flows' unique key and
+    one would silently overwrite the other via ON CONFLICT DO UPDATE."""
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(raw_comtrade_records).values(
+                [
+                    {
+                        "fetched_at": datetime.now(UTC),
+                        "period": 2023,
+                        "reporter_code": "699",  # India self-reporting its own export
+                        "partner_code": "792",
+                        "flow_code": "X",
+                        "cmd_code": _TEST_HS6,
+                        "primary_value_usd": Decimal("1000.00"),
+                        "net_weight_kg": Decimal("50.000"),
+                        "is_reported": True,
+                        "raw_payload": {},
+                    },
+                    {
+                        "fetched_at": datetime.now(UTC),
+                        "period": 2023,
+                        "reporter_code": "792",  # Turkey self-reporting its own export
+                        "partner_code": "699",
+                        "flow_code": "X",
+                        "cmd_code": _TEST_HS6,
+                        "primary_value_usd": Decimal("2000.00"),
+                        "net_weight_kg": Decimal("80.000"),
+                        "is_reported": True,
+                        "raw_payload": {},
+                    },
+                ]
+            )
+        )
+
+    written = await normalize_comtrade_rows(
+        warehouse_engine,
+        hs6=_TEST_HS6,
+        fx_rates={2023: (Decimal("83.000000"), date(2023, 1, 1))},
+    )
+
+    assert written == 2  # not 1 - neither silently overwrote the other
+    async with warehouse_engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    select(normalized_trade_flows).where(normalized_trade_flows.c.hs6 == _TEST_HS6)
+                )
+            )
+            .mappings()
+            .all()
+        )
+
+    assert len(rows) == 2
+    by_dataset_version = {r["dataset_version"]: r for r in rows}
+    assert (
+        by_dataset_version["comtrade-mirror-reporter-v1"]["value_original_currency_paise"]
+        == 100_000
+    )
+    assert (
+        by_dataset_version["comtrade-mirror-partner-v1"]["value_original_currency_paise"] == 200_000
+    )
+
+
 async def _load_test_crosswalk(warehouse_engine: AsyncEngine) -> CountryCrosswalk:
     async with warehouse_engine.connect() as conn:
         rows = (await conn.execute(select(ref_country_crosswalk))).mappings().all()
