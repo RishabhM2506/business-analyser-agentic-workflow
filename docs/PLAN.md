@@ -789,6 +789,9 @@ GET {base}/data/v1/get/C/A/HS
   &period=2021,2022,2023,2024,2025   (comma-joined — verified live, §1)
   &cmdCode=<tracked hs6 list, comma-joined>   (verified live, §1: cmdCode itself also batches)
   &flowCode=M,X            (verified live, §1)
+  &partner2Code=0          (pin — see note below)
+  &motCode=0               (pin — see note below)
+  &customsCode=C00         (pin — see note below)
 
 Query 2 — India as PARTNER (feeds check B: each partner's own submission about trade with India):
 GET {base}/data/v1/get/C/A/HS
@@ -797,7 +800,19 @@ GET {base}/data/v1/get/C/A/HS
   &period=2021,2022,2023,2024,2025
   &cmdCode=<tracked hs6 list, comma-joined>
   &flowCode=M,X
+  &partner2Code=0
+  &motCode=0
+  &customsCode=C00
 ```
+**Real bug found live (build sequence item 5, `BUILD-LOG.md`), resolved**: without pinning
+`partner2Code`/`motCode`/`customsCode`, Comtrade returns multiple rows for the same
+`(period, reporterCode, partnerCode, flowCode, cmdCode)` — three extra breakdown dimensions
+(second/consignment partner, mode of transport, customs procedure) that `raw_comtrade_records`' unique key
+doesn't track, each defaulting to "every value of this dimension" unless constrained. Postgres's
+`ON CONFLICT DO UPDATE` correctly refused to upsert the same key twice in one statement, catching this
+before any silent data corruption. Pinning all three to their real, verified "aggregate/not broken down
+further" value (`0`, `0`, `C00` respectively) eliminates every duplicate — confirmed with a real response
+showing zero duplicate keys after all three were pinned together.
 Both write into the same `raw_comtrade_records` table (§4) — which query a row came from is always
 recoverable from whether `reporter_code` or `partner_code` equals `'699'`, no new column needed. Ranking
 (which partners matter) happens entirely in our own code from the returned rows — never a per-partner

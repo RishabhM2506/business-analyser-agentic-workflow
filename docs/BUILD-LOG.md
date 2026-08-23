@@ -303,3 +303,31 @@ not stress-tested against a live API without real need) — the token-bucket lim
 **Next**: build `app/pipeline/comtrade_mirror.py` against this now-fully-confirmed design — the D6 retry
 schedule (fixed `[30, 60, 120, 300]`, distinct from the existing single-lookup client's exponential
 backoff), the two query shapes, and the `raw_comtrade_records` upsert.
+
+## Build sequence item 5, continued: `app/pipeline/comtrade_mirror.py` built and live-verified
+
+**Files**: `app/pipeline/comtrade_mirror.py` (`_MirrorCircuitBreaker` — D6's specific "3 consecutive 429s"
+trigger, distinct from `app.tools.comtrade_client`'s generic any-failure breaker; `build_query_params` —
+the two verified query shapes; `fetch_with_retry` — D6's fixed schedule, ±20% jitter, `Retry-After`
+override; `upsert_comtrade_records` — idempotent bulk upsert), 15 new tests (12 unit, mocked transport +
+fake clock for the circuit breaker's time-based behavior; 3 integration, real Postgres).
+
+**Two real bugs found only by running the real end-to-end fetch against the real API, not by unit tests
+alone** (the mocked-transport tests couldn't have caught either — they use synthetic single-row responses):
+requesting Query 1 for 5 years across all partners returned a real
+`asyncpg.exceptions.CardinalityViolationError: ON CONFLICT DO UPDATE command cannot affect row a second
+time` — Postgres correctly refusing to upsert the same key twice in one statement. Investigated by diffing
+the two colliding real rows field-by-field rather than guessing: Comtrade's schema carries three extra
+breakdown dimensions `raw_comtrade_records`' unique key doesn't track — `partner2Code` (second/consignment
+partner), `motCode` (mode of transport), and `customsCode` (customs procedure) — each defaults to returning
+every value of that dimension unless explicitly constrained. Resolved iteratively, one dimension at a time,
+verifying zero duplicate keys remained in a real response after each fix, landing on pinning all three to
+their "aggregate/not broken down further" value (`partner2Code=0`, `motCode=0`, `customsCode=C00`).
+
+**Verification performed**: real end-to-end run against the live Comtrade API for both query shapes (HS6
+120791, 5 years, India as reporter and as partner) — 195 and 168 real rows respectively, written cleanly
+with zero conflicts after the fix. `uv run pytest -q`: 408 passed. `mypy`/`ruff`/`black`: clean.
+
+**Deliberately not yet built**: the actual mismatch-check computation (`app/report/mismatch.py`) that
+consumes this data — this unit is ingestion only, per the build sequence's own ordering (§17 item 8 comes
+after items 4-7).
