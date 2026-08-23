@@ -33,6 +33,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.budget import BudgetTracker
 from app.guardrails import extract_numbers
 from app.models import ModelClient
 from app.report.facts import Facts
@@ -304,7 +305,24 @@ def render_template_fallback(facts: Facts) -> str:
     return " ".join(sentences)
 
 
-async def generate_narrative(facts: Facts, *, model_client: ModelClient) -> NarrativeResult:
+async def generate_narrative(
+    facts: Facts,
+    *,
+    model_client: ModelClient,
+    budget_tracker: BudgetTracker,
+    thread_id: str,
+    tenant_id: str,
+) -> NarrativeResult:
+    """Budget is checked immediately before each real model call (matches
+    `app.search.service.search_products`'s identical "check right before
+    the spend it funds" sequencing for its own two-call retry path) — the
+    retry is a second real spend, not a free do-over. `BudgetExceededError`
+    is never caught here and propagates to the caller (matching
+    `search_products`'s own precedent: budget exhaustion is a distinct,
+    real failure the user should be told about via `BUDGET_EXCEEDED`, not
+    silently masked behind a degraded-quality template narrative — the
+    template fallback exists only for "the model tried and failed
+    grounding," a different real failure mode)."""
     system_prompt = _load_system_prompt(
         regulatory_note_missing_warning=facts.regulatory_note_missing_warning
     )
@@ -312,6 +330,7 @@ async def generate_narrative(facts: Facts, *, model_client: ModelClient) -> Narr
 
     sources: tuple[Literal["model", "model_retry"], ...] = ("model", "model_retry")
     for source in sources:
+        await budget_tracker.check_and_increment(thread_id=thread_id, tenant_id=tenant_id)
         result = await model_client.generate_structured(
             system_prompt=system_prompt, user_content=user_content, schema=NarrativeOutput
         )

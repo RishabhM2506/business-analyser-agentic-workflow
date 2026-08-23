@@ -13,6 +13,7 @@ from typing import TypeVar
 import pytest
 from pydantic import BaseModel
 
+from app.budget import BudgetExceededError, BudgetTracker
 from app.report.facts import (
     AllOtherPartnersFact,
     AnnualSeriesYear,
@@ -108,6 +109,10 @@ class _FixedModelClient:
         return schema.model_validate({"narrative": self._texts.pop(0)})
 
 
+def _budget_tracker(*, max_calls_per_thread: int = 100) -> BudgetTracker:
+    return BudgetTracker(max_calls_per_thread=max_calls_per_thread, max_calls_per_day=100)
+
+
 def test_flatten_facts_numbers_includes_both_paise_and_crore() -> None:
     grounded = flatten_facts_numbers(_facts())
 
@@ -177,7 +182,13 @@ async def test_generate_narrative_accepts_a_grounded_first_attempt() -> None:
     facts = _facts()
     client = _FixedModelClient(["In 2022, imports totalled ₹424.66 crore."])
 
-    result = await generate_narrative(facts, model_client=client)
+    result = await generate_narrative(
+        facts,
+        model_client=client,
+        budget_tracker=_budget_tracker(),
+        thread_id="t-1",
+        tenant_id="default",
+    )
 
     assert result.source == "model"
     assert "424.66" in result.narrative
@@ -192,7 +203,13 @@ async def test_generate_narrative_retries_once_then_accepts() -> None:
         ]
     )
 
-    result = await generate_narrative(facts, model_client=client)
+    result = await generate_narrative(
+        facts,
+        model_client=client,
+        budget_tracker=_budget_tracker(),
+        thread_id="t-1",
+        tenant_id="default",
+    )
 
     assert result.source == "model_retry"
 
@@ -203,10 +220,35 @@ async def test_generate_narrative_falls_back_to_template_after_two_ungrounded_at
         ["Imports grew by 37% that year.", "Exports fell by 12% year on year."]
     )
 
-    result = await generate_narrative(facts, model_client=client)
+    result = await generate_narrative(
+        facts,
+        model_client=client,
+        budget_tracker=_budget_tracker(),
+        thread_id="t-1",
+        tenant_id="default",
+    )
 
     assert result.source == "template_fallback"
     assert check_narrative_grounded(result.narrative, facts)
+
+
+async def test_generate_narrative_propagates_budget_exceeded_rather_than_degrading() -> None:
+    """Matches app.search.service.search_products's own precedent: budget
+    exhaustion is a distinct, real failure the caller (the route) tells the
+    user about via BUDGET_EXCEEDED - it must never be silently swallowed
+    into a degraded-quality template narrative, which exists only for "the
+    model tried and failed grounding," a different real failure mode."""
+    facts = _facts()
+    client = _FixedModelClient(["Imports grew by 37% that year."])  # never reached
+
+    with pytest.raises(BudgetExceededError):
+        await generate_narrative(
+            facts,
+            model_client=client,
+            budget_tracker=_budget_tracker(max_calls_per_thread=0),
+            thread_id="t-1",
+            tenant_id="default",
+        )
 
 
 def test_narrative_output_schema_rejects_empty_string() -> None:
