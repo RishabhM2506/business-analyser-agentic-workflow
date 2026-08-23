@@ -942,3 +942,40 @@ pattern) and D9's check C (`docs/PLAN.md` §10: `check_C(year) = (baci_fob_total
 dgcis_cif_total`) is not implemented in `mismatch.py` — both are real, substantial follow-up units in their
 own right, not squeezed into this one to keep the ingestion-vs-normalization-vs-check layering consistent
 with how DGCIS/Comtrade were each built as separate, checkpointed steps.
+
+## `normalize_baci_rows` + D9 check C — the two follow-ups from the prior unit, built and live-verified
+
+**`app/pipeline/normalize.py` gained a third normalizer**, `normalize_baci_rows`: `raw_baci_records` ->
+`normalized_trade_flows`, real FX conversion matching `normalize_comtrade_rows`'s exact pattern (caller-
+resolved `fx_rates`, a period with no rate skipped, never guessed at 1:1). Two real, source-specific design
+points, both stated explicitly in the module: `flow` has no raw column in BACI (unlike Comtrade's
+`flowCode`) and is derived from which side of the exporter/importer pair India (`699`, the same code
+Comtrade uses) is on; `basis='FOB'` for **every** row regardless of flow direction, deliberately never
+`'CIF'` for imports — unlike Comtrade/DGCIS's CIF-for-imports convention, BACI reports both directions on a
+FOB basis by construction (CEPII's own stated "already CIF/FOB-adjusted" methodology, `docs/PLAN.md` §1),
+so storing an import row as `'CIF'` would misdescribe what the number actually is. `BACI_DATASET_VERSION`
+is a fixed logic-version string (`"baci-v1"`), not a data-vintage encoding — matches the DGCIS/Comtrade
+constants' own convention; `raw_baci_records` itself keeps every historical vintage forever via its own
+real unique key, so nothing is lost when the normalized layer moves forward to a newer vintage.
+
+**`app/report/mismatch.py` gained check C** (`compute_check_c`, `CHECK_C = "C_dgcis_vs_baci"` — the DB's own
+`analytics_mismatch_checks` check constraint already listed this value from the original schema design,
+needing no migration): DGCIS's national total vs. BACI's own independently-reconciled total for the same
+`(hs6, flow)`, §10's exact formula. Refactored the DGCIS-total-summing logic (previously duplicated between
+check A and this) into a shared `_sum_partner_totals` helper — a real, small cleanup surfaced by writing
+the second consumer of the same logic, not a separate unit.
+
+**Verification performed**: real end-to-end run against the real database. Normalized all 150 real BACI
+records loaded in the prior unit (150/150, using real FX rates fetched live from Frankfurter — e.g.
+2022-06-15 -> 78.045, matching this session's established FX-verification pattern). Computed check C for
+both flows against HS6 120791: **import 2022 gap=11.61% (quiet)** — a real, tight, independent cross-check
+between DGCIS's customs total and BACI's CEPII-reconciled total; 2023/2024 correctly `SkippedCheck` (DGCIS's
+real total is `ZERO` those years, the same restriction pattern already documented, not a bug); **export 2022
+gap=43.44% (warning)**, **export 2023 gap=9.67% (quiet)**; export 2024 correctly `SkippedCheck`
+(`NOT_REPORTED` — BACI's HS22-revision file's own real 2022-2024 coverage boundary, not a fetch failure).
+All D9 checks (A, B, and now C) are real, tested, and live-verified for the canonical scenario for the first
+time in this session. `uv run pytest -q`: 520 passed (was 513; +7). `mypy app` (59 files)/`ruff`/`black`:
+clean.
+
+**This closes build sequence item 6 (BACI) as a real, working, end-to-end capability** — ingestion, real FX
+-aware normalization, and the D9 check it exists to power are all real and verified, not just scaffolded.

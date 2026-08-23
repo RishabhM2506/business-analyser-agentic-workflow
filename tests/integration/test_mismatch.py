@@ -13,6 +13,7 @@ from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.pipeline.normalize import (
+    BACI_DATASET_VERSION,
     COMTRADE_DATASET_VERSION_PARTNER_ROLE,
     COMTRADE_DATASET_VERSION_REPORTER_ROLE,
     DGCIS_DATASET_VERSION,
@@ -21,9 +22,11 @@ from app.report.mismatch import (
     ALL_PARTNERS,
     CHECK_A,
     CHECK_B,
+    CHECK_C,
     WORLD_AGGREGATE_PARTNER_CODE,
     compute_check_a,
     compute_check_b,
+    compute_check_c,
     upsert_mismatch_checks,
 )
 from app.warehouse.schema import analytics_mismatch_checks, normalized_trade_flows
@@ -251,3 +254,75 @@ async def test_upsert_mismatch_checks_with_no_results_writes_nothing(
     written = await upsert_mismatch_checks(warehouse_engine, [])
 
     assert written == 0
+
+
+async def test_compute_check_c_compares_dgcis_total_to_bacis_summed_total(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(normalized_trade_flows).values(
+                [
+                    _row(
+                        source="dgcis",
+                        dataset_version=DGCIS_DATASET_VERSION,
+                        year=2023,
+                        partner_country_code=_TEST_PARTNER,
+                        value_inr_paise=100_000_000_000,
+                    ),
+                    # BACI has no single World-aggregate row - two real
+                    # partner-pair rows must be summed into the total.
+                    _row(
+                        source="baci",
+                        dataset_version=BACI_DATASET_VERSION,
+                        year=2023,
+                        partner_country_code="156",
+                        value_inr_paise=60_000_000_000,
+                    ),
+                    _row(
+                        source="baci",
+                        dataset_version=BACI_DATASET_VERSION,
+                        year=2023,
+                        partner_country_code="792",
+                        value_inr_paise=35_000_000_000,
+                    ),
+                ]
+            )
+        )
+
+    results, skipped = await compute_check_c(
+        warehouse_engine, hs6=_TEST_HS6, flow="import", years=[2023]
+    )
+
+    assert skipped == []
+    assert len(results) == 1
+    assert results[0].check_name == CHECK_C
+    assert results[0].partner_country_code == ALL_PARTNERS
+    # baci_total=95bn vs dgcis_total=100bn -> gap = 5%, quiet
+    assert results[0].gap_pct == 5
+    assert results[0].severity == "quiet"
+
+
+async def test_compute_check_c_skips_a_year_with_no_baci_data(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(normalized_trade_flows).values(
+                _row(
+                    source="dgcis",
+                    dataset_version=DGCIS_DATASET_VERSION,
+                    year=2023,
+                    partner_country_code=_TEST_PARTNER,
+                    value_inr_paise=100_000_000_000,
+                )
+            )
+        )
+
+    results, skipped = await compute_check_c(
+        warehouse_engine, hs6=_TEST_HS6, flow="import", years=[2023]
+    )
+
+    assert results == []
+    assert len(skipped) == 1
+    assert "NOT_REPORTED" in skipped[0].reason

@@ -1,8 +1,10 @@
 """D9 mismatch checks (`docs/PLAN.md` §10) — check A (DGCIS's own national
-total vs. India's own Comtrade submission) and check B (DGCIS's per-partner
+total vs. India's own Comtrade submission), check B (DGCIS's per-partner
 figure vs. that partner's own Comtrade submission — real "mirror trade
-statistics" reconciliation). Check C (vs. BACI) is not implemented yet;
-BACI ingestion (build sequence item 6) hasn't been built.
+statistics" reconciliation), and check C (DGCIS's own national total vs.
+BACI's own reconciled total, §10: "expect BACI < DGCIS" — stated, not
+assumed: a real result outside that expectation is a real finding, never
+silently corrected).
 
 Owned by this module alone, run as part of the same ingestion pass that
 writes `analytics_partner_rankings` (§10: "always precomputed, never
@@ -32,6 +34,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.pipeline.normalize import (
+    BACI_DATASET_VERSION,
     COMTRADE_DATASET_VERSION_PARTNER_ROLE,
     COMTRADE_DATASET_VERSION_REPORTER_ROLE,
     DGCIS_DATASET_VERSION,
@@ -44,6 +47,7 @@ WORLD_AGGREGATE_PARTNER_CODE = "0"  # Comtrade's own "all partners" code, §8
 
 CHECK_A = "A_dgcis_vs_comtrade_india"
 CHECK_B = "B_dgcis_vs_partner_comtrade"
+CHECK_C = "C_dgcis_vs_baci"
 
 # §10: gap < 15% quiet, 15% <= gap < 40% flag, gap >= 40% warning — bands
 # are `<`/`>=`, not off-by-one (boundary-tested at 14.9/15.1/39.9/40.1%).
@@ -211,6 +215,62 @@ async def _fetch_dgcis_partner_totals(
     return by_partner
 
 
+def _sum_partner_totals(
+    by_partner: dict[str, dict[int, int | None]], *, years: list[int]
+) -> dict[int, int | None]:
+    """`{year: total}` summed across every partner in `by_partner` — a
+    year with no rows at all, or any partner `None` (`NOT_REPORTED`) that
+    year, makes the total `None` (never silently treated as that
+    partner's contribution being zero). Shared by check A and check C,
+    both of which need "DGCIS's national total for this year," not just
+    check B's per-partner figures."""
+    totals: dict[int, int | None] = {}
+    for year in years:
+        year_values = [
+            partner_years[year] for partner_years in by_partner.values() if year in partner_years
+        ]
+        if not year_values or any(v is None for v in year_values):
+            totals[year] = None
+        else:
+            totals[year] = sum(v for v in year_values if v is not None)
+    return totals
+
+
+async def _fetch_baci_totals(
+    engine: AsyncEngine, *, hs6: str, flow: str, years: list[int]
+) -> dict[int, int | None]:
+    """`{year: value_inr_paise}` — BACI's own total across every real
+    partner pair for `(hs6, flow)`, summed the same way `compute_check_a`
+    sums DGCIS's per-partner rows into one national total. Unlike
+    Comtrade, BACI has no explicit `'0'`-World-aggregate row — every real
+    partner-pair row must be summed here instead."""
+    async with engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    select(
+                        normalized_trade_flows.c.partner_country_code,
+                        normalized_trade_flows.c.period_month,
+                        normalized_trade_flows.c.value_inr_paise,
+                    ).where(
+                        normalized_trade_flows.c.hs6 == hs6,
+                        normalized_trade_flows.c.flow == flow,
+                        normalized_trade_flows.c.source == "baci",
+                        normalized_trade_flows.c.dataset_version == BACI_DATASET_VERSION,
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+    by_partner: dict[str, dict[int, int | None]] = {}
+    for row in rows:
+        by_partner.setdefault(row["partner_country_code"], {})[row["period_month"].year] = row[
+            "value_inr_paise"
+        ]
+    return _sum_partner_totals(by_partner, years=years)
+
+
 async def compute_check_a(
     engine: AsyncEngine, *, hs6: str, flow: str, years: list[int]
 ) -> tuple[list[MismatchResult], list[SkippedCheck]]:
@@ -220,17 +280,7 @@ async def compute_check_a(
     (`partner_country_code='0'`, the World aggregate row from the
     reporter-role query)."""
     dgcis_by_partner = await _fetch_dgcis_partner_totals(engine, hs6=hs6, flow=flow)
-    dgcis_totals: dict[int, int | None] = {}
-    for year in years:
-        year_values = [
-            partner_years[year]
-            for partner_years in dgcis_by_partner.values()
-            if year in partner_years
-        ]
-        if not year_values or any(v is None for v in year_values):
-            dgcis_totals[year] = None
-        else:
-            dgcis_totals[year] = sum(v for v in year_values if v is not None)
+    dgcis_totals = _sum_partner_totals(dgcis_by_partner, years=years)
 
     comtrade_india_totals = await _fetch_values(
         engine,
@@ -323,6 +373,45 @@ async def compute_check_b(
                 )
             else:
                 skipped.append(outcome)
+    return results, skipped
+
+
+async def compute_check_c(
+    engine: AsyncEngine, *, hs6: str, flow: str, years: list[int]
+) -> tuple[list[MismatchResult], list[SkippedCheck]]:
+    """DGCIS's national total vs. BACI's own independently-reconciled
+    total for the same `(hs6, flow)` — §10: `(baci_fob_total -
+    dgcis_cif_total) / dgcis_cif_total`, "expect BACI < DGCIS" (a stated
+    expectation to watch, not an assumption this function enforces — a
+    real result outside it is reported as-is, the same "never silently
+    prefer one side" discipline check A/B already follow)."""
+    dgcis_by_partner = await _fetch_dgcis_partner_totals(engine, hs6=hs6, flow=flow)
+    dgcis_totals = _sum_partner_totals(dgcis_by_partner, years=years)
+
+    baci_totals = await _fetch_baci_totals(engine, hs6=hs6, flow=flow, years=years)
+
+    results: list[MismatchResult] = []
+    skipped: list[SkippedCheck] = []
+    previous_signed_gap: Decimal | None = None
+    for year in sorted(years):
+        dgcis_value = dgcis_totals.get(year)
+        other_value = baci_totals.get(year)
+        outcome = _evaluate(
+            check_name=CHECK_C,
+            hs6=hs6,
+            flow=flow,
+            year=year,
+            partner_country_code=ALL_PARTNERS,
+            dgcis_value=dgcis_value,
+            other_value=other_value,
+            previous_signed_gap_pct=previous_signed_gap,
+        )
+        if isinstance(outcome, MismatchResult):
+            results.append(outcome)
+            assert dgcis_value is not None and other_value is not None
+            previous_signed_gap = _signed_gap_pct(dgcis_value=dgcis_value, other_value=other_value)
+        else:
+            skipped.append(outcome)
     return results, skipped
 
 

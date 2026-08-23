@@ -6,7 +6,7 @@ rather than skipping straight from raw tables to `report/mismatch.py`,
 which the plan explicitly says reads `normalized_trade_flows`, not the
 raw tables directly (§10: "Join is always normalized_trade_flows").
 
-Two normalizers, one per source built so far:
+Three normalizers, one per source built so far:
 
 - `normalize_dgcis_annual_rows`: `raw_dgcis_annual` -> `normalized_trade_flows`.
   DGCIS is natively INR (`fx_rate_used=NULL`, never round-tripped through
@@ -33,7 +33,15 @@ Two normalizers, one per source built so far:
   right coding scheme (Comtrade's own numeric codes) — no crosswalk
   needed for this source.
 
-Both derive status via the shared `_derive_status`: `'NOT_REPORTED'` when
+- `normalize_baci_rows`: `raw_baci_records` -> `normalized_trade_flows`.
+  BACI is USD and calendar-year native like Comtrade (same real FX
+  conversion pattern), but has no explicit flow column — `flow` is
+  derived from which side of the exporter/importer pair India is on.
+  `partner_country_code` is already the right coding scheme (BACI's own
+  numeric codes, verified live to be the *same* scheme Comtrade uses,
+  including India's own `699` — no crosswalk needed here either).
+
+All three derive status via the shared `_derive_status`: `'NOT_REPORTED'` when
 the value cell is genuinely blank/absent, `'ZERO'` when the source
 explicitly reported a numeric `0` — never conflated with `NOT_REPORTED`
 (D2) — `'QTY_MISSING'` when a real nonzero value is present but the
@@ -59,6 +67,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.pipeline.comtrade_mirror import INDIA_CODE
 from app.warehouse.schema import (
     normalized_trade_flows,
+    raw_baci_records,
     raw_comtrade_records,
     raw_dgcis_annual,
     ref_country_crosswalk,
@@ -80,6 +89,15 @@ DGCIS_DATASET_VERSION = "dgcis-annual-v1"
 # them in separate dataset_version buckets keeps both queryable.
 COMTRADE_DATASET_VERSION_REPORTER_ROLE = "comtrade-mirror-reporter-v1"
 COMTRADE_DATASET_VERSION_PARTNER_ROLE = "comtrade-mirror-partner-v1"
+# Fixed logic-version string, not a data-vintage encoding - matches how
+# DGCIS/Comtrade's own dataset_version constants version the normalizer's
+# logic, not the specific raw scrape/vintage that fed it. Re-normalizing
+# after a newer real BACI vintage is loaded intentionally overwrites these
+# rows in place (the normalized layer always reflects whichever vintage
+# was most recently normalized) - raw_baci_records itself keeps every
+# historical vintage forever (its own real unique key includes vintage),
+# so nothing is lost, only the normalized layer's view moves forward.
+BACI_DATASET_VERSION = "baci-v1"
 
 
 def _derive_status(*, value: int | None, quantity: Decimal | None) -> str:
@@ -278,6 +296,111 @@ async def normalize_comtrade_rows(
                 "fx_rate_used": rate,
                 "fx_rate_date": rate_date,
                 "quantity_kg": raw["net_weight_kg"],
+            }
+        )
+
+    if not normalized_rows:
+        return 0
+
+    async with engine.begin() as conn:
+        stmt = insert(normalized_trade_flows).values(normalized_rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                "source",
+                "hs6",
+                "hs8",
+                "flow",
+                "period_month",
+                "partner_country_code",
+                "dataset_version",
+            ],
+            set_={
+                "status": stmt.excluded.status,
+                "value_inr_paise": stmt.excluded.value_inr_paise,
+                "value_original_currency_paise": stmt.excluded.value_original_currency_paise,
+                "fx_rate_used": stmt.excluded.fx_rate_used,
+                "fx_rate_date": stmt.excluded.fx_rate_date,
+            },
+        )
+        await conn.execute(stmt)
+    return len(normalized_rows)
+
+
+async def normalize_baci_rows(
+    engine: AsyncEngine, *, hs6: str, fx_rates: dict[int, tuple[Decimal, date]]
+) -> int:
+    """Normalize every `raw_baci_records` row for `hs6` into
+    `normalized_trade_flows`. Same `fx_rates` contract as
+    `normalize_comtrade_rows` (caller-resolved via `app.fx`, a period with
+    no entry is skipped, never guessed at 1:1).
+
+    `flow` is derived from which side of the pair India is on (BACI has
+    no explicit flow column, unlike Comtrade's `flowCode`): `importer_code
+    == INDIA_CODE` means India importing, `exporter_code == INDIA_CODE`
+    means India exporting. The raw-layer filter that produced these rows
+    (`app.pipeline.baci.parse_baci_year_csv`) already guarantees India is
+    on at least one side of every row; a row with India on *neither* side
+    would be a real caller bug upstream, not a case this function guesses
+    at — skipped defensively rather than silently mis-flowed.
+
+    `basis='FOB'` for every row, deliberately never `'CIF'` even for
+    `flow='import'` — unlike Comtrade/DGCIS's CIF-for-imports/FOB-for-
+    exports convention, BACI reports **both** directions on a FOB basis by
+    construction (CEPII's own stated methodology: "already CIF/FOB
+    -adjusted", `docs/PLAN.md` §1) specifically so cross-country FOB
+    comparison is valid either way — storing it as `'CIF'` here would
+    misdescribe what the number actually is."""
+    async with engine.connect() as conn:
+        raw_rows = (
+            (await conn.execute(select(raw_baci_records).where(raw_baci_records.c.hs6 == hs6)))
+            .mappings()
+            .all()
+        )
+
+    if not raw_rows:
+        return 0
+
+    normalized_rows = []
+    for raw in raw_rows:
+        year = raw["year"]
+        if year not in fx_rates:
+            continue
+        if raw["importer_code"] == INDIA_CODE:
+            flow = "import"
+            partner_country_code = raw["exporter_code"]
+        elif raw["exporter_code"] == INDIA_CODE:
+            flow = "export"
+            partner_country_code = raw["importer_code"]
+        else:
+            continue  # defensive - the raw-layer filter should prevent this
+
+        rate, rate_date = fx_rates[year]
+        value_usd = raw["value_fob_usd"]
+        value_original_paise = int(value_usd * 100) if value_usd is not None else None
+        value_inr_paise = int(value_usd * rate * 100) if value_usd is not None else None
+        status = _derive_status(value=value_inr_paise, quantity=raw["quantity_kg"])
+        normalized_rows.append(
+            {
+                "source": "baci",
+                "hs6": raw["hs6"],
+                "hs8": None,
+                "hs_revision": raw["hs_revision"],
+                "flow": flow,
+                "period_month": date(year, 1, 1),
+                "calendar": "CY",
+                "partner_country_code": partner_country_code,
+                "basis": "FOB",
+                "currency": "USD",
+                "universe": "baci-reconciled",
+                "dataset_version": BACI_DATASET_VERSION,
+                "is_provisional": False,
+                "status": status,
+                "status_detail": None,
+                "value_inr_paise": value_inr_paise,
+                "value_original_currency_paise": value_original_paise,
+                "fx_rate_used": rate,
+                "fx_rate_date": rate_date,
+                "quantity_kg": raw["quantity_kg"],
             }
         )
 
