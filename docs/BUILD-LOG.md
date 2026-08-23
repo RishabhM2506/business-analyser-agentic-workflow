@@ -331,3 +331,56 @@ with zero conflicts after the fix. `uv run pytest -q`: 408 passed. `mypy`/`ruff`
 **Deliberately not yet built**: the actual mismatch-check computation (`app/report/mismatch.py`) that
 consumes this data — this unit is ingestion only, per the build sequence's own ordering (§17 item 8 comes
 after items 4-7).
+
+## Build sequence item 8, part 1: `app/pipeline/normalize.py` — raw -> normalized layer, built and live-verified
+
+**Real gap found while starting item 8**: `docs/PLAN.md` §10 requires `report/mismatch.py`'s checks to read
+from `normalized_trade_flows`, not the raw tables directly — but no module transforming
+`raw_dgcis_annual`/`raw_comtrade_records` into `normalized_trade_flows` rows existed yet. §3's module
+layout didn't name this step explicitly (it lists every `pipeline/*.py` ingestion job and every
+`report/*.py` consumer, but not the step between them). Built `app/pipeline/normalize.py` to close this
+gap before continuing to `mismatch.py`.
+
+**Prerequisite resolved first**: a real `ref_country_crosswalk` row was still needed to translate DGCIS's
+free-text partner name "TURKEY" into the coding scheme Comtrade uses. Resolved by querying the
+already-ingested `raw_comtrade_records` for the distinct partner codes present for HS6 120791/reporter 699
+(69 codes, including 792), then cross-referencing 792 against this repo's own pre-existing, already-verified
+`data/comtrade-partner-areas.csv` (`792,Türkiye,false`). Inserted the real row directly via `psql`:
+`INSERT INTO ref_country_crosswalk (dgcis_country_name, country_code) VALUES ('TURKEY', '792')`.
+
+**Files**: `app/pipeline/normalize.py` (`CountryCrosswalk`/`load_country_crosswalk`,
+`normalize_dgcis_annual_rows`, `normalize_comtrade_rows`), `tests/unit/test_normalize.py` (5 tests: fiscal-
+year-label parsing including the malformed-input raise, crosswalk UNMAPPED fallback),
+`tests/integration/test_normalize_upsert.py` (3 tests, real Postgres: DGCIS normalization incl.
+OK/ZERO/NOT_REPORTED + UNMAPPED-crosswalk cases, idempotency, Comtrade normalization incl. real FX
+conversion and skip-on-missing-fx-rate).
+
+**Design decisions**:
+- DGCIS is INR/FY-native (`fx_rate_used=NULL`, never round-tripped through USD per D8; `calendar='FY'`;
+  `period_month` = 1 Jan of the fiscal year's first calendar year). Comtrade is USD/CY-native
+  (`calendar='CY'`; real FX conversion via the already-built `app.fx` cache/client, injected into the
+  normalizer as a plain `{year: (rate, rate_date)}` dict so the transformation itself stays pure — the
+  caller resolves rates, this module never reaches into Redis/HTTP itself).
+- A Comtrade period with no resolved FX rate is **skipped**, not silently converted at a guessed rate or
+  dropped as ZERO — verified live via a deliberately-missing 2022 rate in the integration test.
+- `dataset_version` is a fixed per-source-and-logic-vintage string (`"dgcis-annual-v1"` /
+  `"comtrade-mirror-v1"`), not a scrape timestamp — since it's part of `normalized_trade_flows`' own unique
+  key, a timestamp-valued version would make every normalization run append fresh rows instead of
+  upserting; a fixed version keeps this layer idempotent like the raw tables.
+- OK/ZERO/NOT_REPORTED status logic (D1/D2: a present real value is OK, an explicit 0 is ZERO, a genuinely
+  absent value is NOT_REPORTED — never conflated) is the only status distinction populated by either
+  normalizer so far; finer statuses (`PROVISIONAL`, `QTY_MISSING`, ...) are a flagged, deliberate gap for a
+  later pass.
+
+**Verification performed**: real end-to-end run against the actual database — normalized all 5 real
+`raw_dgcis_annual` rows and all 363 real `raw_comtrade_records` rows for HS6 120791 (real FX rates fetched
+live from Frankfurter via the existing `FxCache`/`FrankfurterClient`, e.g. 2020-06-15 -> 75.999). Verified
+via `psql` that both sources now carry real, independently-sourced import figures for Turkey
+(`partner_country_code='792'`) side by side in `normalized_trade_flows` — DGCIS FY2020 ₹49.1cr vs. Comtrade
+CY2020 ₹344.7cr, DGCIS FY2022 ₹4246.6cr vs. Comtrade CY2022 ₹4216.8cr — real numbers, ready for
+`mismatch.py`'s check A/B computation next. `uv run pytest -q`: 416 passed (was 408; +5 unit +3
+integration). `mypy`/`ruff`/`black`: clean.
+
+**Next**: `app/report/mismatch.py` — checks A (DGCIS vs. India's own Comtrade submission, reporter role)
+and B (DGCIS vs. Turkey's Comtrade submission, partner role) are now directly computable with this real
+data.
