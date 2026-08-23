@@ -1253,3 +1253,25 @@ genericity is actually exercised by the test suite, not just assumed from readin
 document the real resolution. 577 tests passing (was 576; +1). `mypy app` (61 files)/`ruff`/`black`: clean.
 
 **All 5 items from the user's 2026-08-24 unblocking-round message are now complete.**
+
+## Follow-up: real ICEGATE AJAX endpoints found via the user's browser trace (2026-08-24)
+
+The user captured and shared a real browser network trace showing ICEGATE's actual AJAX endpoints, distinct
+from the `POST /Webappl/Tariff-head-details` form this session's earlier ICEGATE attempts had targeted (and
+which consistently 500'd). Live-verified both real endpoints (require a real session cookie plus
+`X-Requested-With: XMLHttpRequest` and a `Referer` header — the missing pieces earlier):
+`GET /Webappl/Desc_details?cth=<CTH>` (real JSON: `itc_code`, `itc_desc`, `uqc`, `itchs_policy`, `rta`, one
+row per CTH under the queried chapter) and `GET /Webappl/Desc_details_Notes?cth=<CTH>` (real chapter/section
+notes text). Confirmed for CTH `12079100`: description "Poppy seeds", unit "KGS", import policy "Free",
+`rta` (rate) `= 20` — exactly matching the user's own independently-observed browser value, and real,
+citable Chapter 12/Heading 1207 notes.
+
+Updated `ref_regulatory_notes` for HS6 `120791` with the real chapter notes, description, policy, and unit
+(all unambiguous, no component-attribution question). **Did not** upgrade `ref_duty_components`'s `BCD` row
+to `VERIFIED`: the JSON field is literally named `rta` with no explicit `BCD`/`basic_duty` label, and no
+separate duty-breakdown endpoint was found despite trying 6 plausible sibling names (`Duty_details`,
+`Duty_Calculator`, `Calculator_details`, `Tariff_details`, `CustomDuty_details`, `Rate_details` — all real
+HTTP 500s). Updated `BCD`'s `NOT_VERIFIED` notes with the full new evidence trail and asked the user
+directly to confirm the real rendered column header/tooltip for `rta` in their own browser session, per
+their own earlier explicit instruction not to assume this. No application code changed — pure data curation
+via the existing `scripts/record_duty_rate.py`/`record_regulatory_note.py`.
