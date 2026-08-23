@@ -14,9 +14,17 @@ Two normalizers, one per source built so far:
   `period_month` = 1 Jan of the fiscal year's first calendar year — the
   same "annual sources use Jan 1" convention `docs/PLAN.md` already
   documents for the normalized layer). `partner_country_code` resolves
-  through `ref_country_crosswalk` — an unmapped DGCIS country name
-  becomes `'UNMAPPED'` (§4's own documented policy), never a silent drop
-  or a guessed code.
+  through `ref_country_crosswalk` — an unmapped DGCIS country name becomes
+  `'UNMAPPED:<dgcis name>'` (§4's own documented policy, never a silent
+  drop or a guessed code), the name embedded rather than a bare
+  `'UNMAPPED'` constant: a real bug found live during the first
+  ~250-country run with genuinely many distinct unmapped countries at
+  once — a bare, shared sentinel collapsed every unmapped country in the
+  same `(hs6, flow, period_month)` scope onto the *same*
+  `normalized_trade_flows` unique key, raising a real
+  `CardinalityViolationError` on the bulk upsert (two rows for two
+  different real countries both proposing the same key in one statement).
+  Embedding the name keeps every real, distinct country its own row.
 
 - `normalize_comtrade_rows`: `raw_comtrade_records` -> `normalized_trade_flows`.
   Comtrade is USD and calendar-year native (`calendar='CY'`) — real FX
@@ -56,7 +64,7 @@ from app.warehouse.schema import (
     ref_country_crosswalk,
 )
 
-_UNMAPPED = "UNMAPPED"
+UNMAPPED_PREFIX = "UNMAPPED:"
 DGCIS_DATASET_VERSION = "dgcis-annual-v1"
 # Two distinct dataset_versions, not one - a real bug found before
 # mismatch.py could be built: a Query 1 row (India self-reporting, e.g.
@@ -110,7 +118,7 @@ class CountryCrosswalk:
     by_dgcis_name: dict[str, str]
 
     def resolve(self, dgcis_name: str) -> str:
-        return self.by_dgcis_name.get(dgcis_name, _UNMAPPED)
+        return self.by_dgcis_name.get(dgcis_name, UNMAPPED_PREFIX + dgcis_name)
 
 
 async def load_country_crosswalk(engine: AsyncEngine) -> CountryCrosswalk:

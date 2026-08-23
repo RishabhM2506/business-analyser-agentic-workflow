@@ -70,6 +70,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.knowledge.provider import get_taxonomy_entry
 from app.pipeline.duty_source import ManualDutySource
+from app.pipeline.normalize import UNMAPPED_PREFIX
 from app.report.landed_cost import LandedCostResult, compute_landed_cost
 from app.report.rankings import PartnerRanking, compute_hhi
 from app.warehouse.schema import (
@@ -84,7 +85,6 @@ from app.warehouse.schema import (
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PARTNER_AREAS_CSV = "data/comtrade-partner-areas.csv"
 _ALL_PARTNERS = "ALL_PARTNERS"
-_UNMAPPED = "UNMAPPED"
 
 # This module's own reasoned worse-status-wins ordering across cell_status's
 # 10 values (§5 defines each status's producing condition but not a total
@@ -121,8 +121,16 @@ def _load_partner_names(csv_path: str = _PARTNER_AREAS_CSV) -> dict[str, str]:
 
 
 def _display_name(partner_country_code: str) -> str:
-    if partner_country_code in (_ALL_PARTNERS, _UNMAPPED):
+    if partner_country_code == _ALL_PARTNERS:
         return partner_country_code
+    if partner_country_code.startswith(UNMAPPED_PREFIX):
+        # The real DGCIS country name is embedded in the code itself
+        # (app.pipeline.normalize's fix for a real bulk-upsert key
+        # collision when multiple distinct countries are unmapped at
+        # once) - surfacing it here means an unmapped partner is shown as
+        # itself, not lumped anonymously with every other unmapped one.
+        dgcis_name = partner_country_code.removeprefix(UNMAPPED_PREFIX)
+        return f"{dgcis_name} (unmapped)"
     return _load_partner_names().get(partner_country_code, partner_country_code)
 
 

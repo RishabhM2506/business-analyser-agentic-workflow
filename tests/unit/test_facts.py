@@ -34,8 +34,8 @@ def test_display_name_passes_through_the_all_partners_sentinel() -> None:
     assert _display_name("ALL_PARTNERS") == "ALL_PARTNERS"
 
 
-def test_display_name_passes_through_unmapped() -> None:
-    assert _display_name("UNMAPPED") == "UNMAPPED"
+def test_display_name_surfaces_the_real_country_name_for_an_unmapped_code() -> None:
+    assert _display_name("UNMAPPED:RURITANIA") == "RURITANIA (unmapped)"
 
 
 def test_display_name_falls_back_to_the_code_for_an_unknown_code() -> None:

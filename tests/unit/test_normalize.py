@@ -1,6 +1,6 @@
 """Unit tests for `app.pipeline.normalize`'s pure transformation logic —
-the fiscal-year-label parser and the crosswalk resolver's UNMAPPED
-fallback. The two async normalizer functions themselves are exercised
+the fiscal-year-label parser and the crosswalk resolver's per-country
+UNMAPPED fallback. The two async normalizer functions themselves are exercised
 against a real Postgres in `tests/integration/test_normalize_upsert.py`,
 matching this project's established split (see `test_comtrade_mirror.py`
 vs. `test_comtrade_mirror_upsert.py`).
@@ -69,7 +69,21 @@ def test_crosswalk_resolves_a_known_name() -> None:
 
 def test_crosswalk_falls_back_to_unmapped_for_an_unknown_name() -> None:
     """Never a silent drop, never a guessed code - the documented
-    ref_country_crosswalk policy (docs/PLAN.md §4)."""
+    ref_country_crosswalk policy (docs/PLAN.md §4). The real name is
+    embedded in the sentinel, not collapsed to a bare 'UNMAPPED' constant
+    - a real bug found live: two distinct unmapped countries sharing one
+    flat sentinel collide on normalized_trade_flows' unique key."""
     crosswalk = CountryCrosswalk(by_dgcis_name={"TURKEY": "792"})
 
-    assert crosswalk.resolve("RURITANIA") == "UNMAPPED"
+    assert crosswalk.resolve("RURITANIA") == "UNMAPPED:RURITANIA"
+
+
+def test_crosswalk_gives_distinct_unmapped_countries_distinct_codes() -> None:
+    """Regression test for the real collision bug: two different real,
+    unmapped countries must never resolve to the same code, or a bulk
+    upsert with both in the same batch raises a real
+    CardinalityViolationError (found live during the first ~250-country
+    DGCIS run, with genuinely many distinct unmapped countries at once)."""
+    crosswalk = CountryCrosswalk(by_dgcis_name={})
+
+    assert crosswalk.resolve("RURITANIA") != crosswalk.resolve("FREEDONIA")

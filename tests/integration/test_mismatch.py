@@ -187,7 +187,7 @@ async def test_compute_check_b_excludes_unmapped_partners(warehouse_engine: Asyn
                     source="dgcis",
                     dataset_version=DGCIS_DATASET_VERSION,
                     year=2023,
-                    partner_country_code="UNMAPPED",
+                    partner_country_code="UNMAPPED:RURITANIA",
                     value_inr_paise=50_000_000_000,
                 )
             )

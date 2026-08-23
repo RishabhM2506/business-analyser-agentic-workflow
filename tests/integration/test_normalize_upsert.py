@@ -130,7 +130,69 @@ async def test_normalize_dgcis_annual_rows_resolves_crosswalk_and_status(
 
     assert by_year[2025]["status"] == "NOT_REPORTED"
     assert by_year[2025]["value_inr_paise"] is None
-    assert by_year[2025]["partner_country_code"] == "UNMAPPED"  # unmapped name, never dropped
+    # unmapped name embedded in the code, never dropped and never
+    # collapsed onto a shared bare 'UNMAPPED' constant (a real bug found
+    # live: two distinct unmapped countries in the same batch collided on
+    # normalized_trade_flows' unique key under a flat sentinel).
+    assert by_year[2025]["partner_country_code"] == "UNMAPPED:UNKNOWNLAND"
+
+
+async def test_normalize_dgcis_annual_rows_does_not_collide_on_two_distinct_unmapped_countries(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """Regression test for a real CardinalityViolationError found live
+    during the first ~250-country DGCIS run: many distinct countries were
+    genuinely unmapped at once, and a bare shared 'UNMAPPED' sentinel made
+    every one of them propose the same normalized_trade_flows row within
+    a single bulk upsert statement."""
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(raw_dgcis_annual).values(
+                [
+                    {
+                        "scraped_at": datetime.now(UTC),
+                        "fiscal_year_label": "2023 - 2024",
+                        "hs8": _TEST_HS8,
+                        "flow": "import",
+                        "partner_country": "RURITANIA",
+                        "description": "TEST COMMODITY",
+                        "unit": "KGS",
+                        "value_inr_paise": 100,
+                        "raw_payload": {},
+                    },
+                    {
+                        "scraped_at": datetime.now(UTC),
+                        "fiscal_year_label": "2023 - 2024",
+                        "hs8": _TEST_HS8,
+                        "flow": "import",
+                        "partner_country": "FREEDONIA",
+                        "description": "TEST COMMODITY",
+                        "unit": "KGS",
+                        "value_inr_paise": 200,
+                        "raw_payload": {},
+                    },
+                ]
+            )
+        )
+
+    crosswalk = await _load_test_crosswalk(warehouse_engine)
+    written = await normalize_dgcis_annual_rows(
+        warehouse_engine, hs6=_TEST_HS6, crosswalk=crosswalk
+    )  # must not raise CardinalityViolationError
+
+    assert written == 2
+    async with warehouse_engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    select(normalized_trade_flows).where(normalized_trade_flows.c.hs6 == _TEST_HS6)
+                )
+            )
+            .mappings()
+            .all()
+        )
+    codes = {r["partner_country_code"] for r in rows}
+    assert codes == {"UNMAPPED:RURITANIA", "UNMAPPED:FREEDONIA"}
 
 
 async def test_normalize_dgcis_annual_rows_is_idempotent(warehouse_engine: AsyncEngine) -> None:

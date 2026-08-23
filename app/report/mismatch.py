@@ -35,6 +35,7 @@ from app.pipeline.normalize import (
     COMTRADE_DATASET_VERSION_PARTNER_ROLE,
     COMTRADE_DATASET_VERSION_REPORTER_ROLE,
     DGCIS_DATASET_VERSION,
+    UNMAPPED_PREFIX,
 )
 from app.warehouse.schema import analytics_mismatch_checks, normalized_trade_flows
 
@@ -290,7 +291,7 @@ async def compute_check_b(
     results: list[MismatchResult] = []
     skipped: list[SkippedCheck] = []
     for partner_country_code, dgcis_years in sorted(dgcis_by_partner.items()):
-        if partner_country_code == "UNMAPPED":
+        if partner_country_code.startswith(UNMAPPED_PREFIX):
             continue
         partner_comtrade_years = await _fetch_values(
             engine,

@@ -844,3 +844,59 @@ passed (was 499; +1, the rank-reshuffle regression test). `mypy`/`ruff`/`black`:
 only, matching this whole build's established focus); Comtrade partner-role (mirror) data was not fetched
 for the 20 new countries, so `check_B`/`unit_value.py` still only have real partner-role figures for Turkey
 — DGCIS-side breadth improved, Comtrade-side per-partner breadth did not, in this unit.
+
+## Real DGCIS export-flow run (all 251 countries) + a second real UNMAPPED-collision bug found and fixed
+
+**Checked why check_B "still only has Turkey" was actually a wrong assumption before acting on it**: live
+inspection showed Comtrade's own partner-role query (`role="partner"`) never filtered to Turkey specifically
+— it omits `reporterCode` entirely, so the original bulk fetch already returned every foreign reporter's own
+submission globally (confirmed live: 64 distinct real reporters already present in `raw_comtrade_records`
+for `partner_code='699'`). Germany's real 2022 `QTY_MISSING` DGCIS value correctly produces a `SkippedCheck`
+in check B not because data is missing, but because Comtrade only has Germany's own `import` partner-role
+row (Germany importing from India) — check B's mirror-pairing needs the `export` row (Germany exporting to
+India), which genuinely doesn't exist because Germany doesn't meaningfully export poppy seeds to India. A
+real, correct absence, not a fetch gap — no new Comtrade work was needed here, corrected in `docs/STATE.md`
+before it could send a future session chasing a non-problem.
+
+**Real DGCIS export-flow run**: same validate-small-batch-first discipline (15 countries, zero failures),
+then the full 251-country list via the checked-in `scripts/run_dgcis_country_batch.py --flow export`:
+**251/251 attempted, 0 failures, 98 real export destinations** (vs. 21 import sources — a genuinely wider,
+more diversified real export footprint, consistent with real-world poppy-seed trade: India imports bulk
+raw seed from a handful of growing regions but exports processed/re-exported product more broadly), 490
+rows, ~22 min.
+
+**A second real `UNMAPPED`-collision bug, found live while normalizing the export data**: re-running
+`normalize_dgcis_annual_rows` for export hit a real `CardinalityViolationError` — with 81 of the 98 export
+countries genuinely unmapped at once (vs. at most one or two in every prior test/run), the flat
+`_UNMAPPED = "UNMAPPED"` sentinel collapsed every one of them onto the *same* `normalized_trade_flows`
+unique key within a single bulk upsert, exactly the same shape of bug already fixed twice this session for
+different tables (`dataset_version` splitting, `NULLS NOT DISTINCT`) — a flat sentinel value used as part of
+a real uniqueness key is now a recognized recurring failure pattern in this codebase. **Fixed properly**:
+`CountryCrosswalk.resolve()` now returns `f"UNMAPPED:{dgcis_name}"` (`UNMAPPED_PREFIX` exported from
+`normalize.py`) — every real distinct unmapped country keeps its own identity and its own row, never
+collapsed. Updated the two call sites that exact-string-matched the old bare sentinel
+(`mismatch.py`'s check-B exclusion, now `.startswith(UNMAPPED_PREFIX)`) and improved `facts.py`'s
+`_display_name` to surface the real embedded country name (`"BAHARAIN IS (unmapped)"` instead of an
+anonymous, uninformative `"UNMAPPED"` — a real display improvement, not just a bug fix, since a reader can
+now see *which* country is unmapped). Two new regression tests reproduce the exact real shape: distinct
+unmapped countries must resolve to distinct codes, and a real batch with two of them together must not
+raise.
+
+**Built the real crosswalk for the 32 export destinations with genuine nonzero trade** (of 81 total unmapped
+— the remaining 49 have zero real trade in every ingested year, so crosswalking them has no analytical
+value and was deliberately skipped, not overlooked): Angola, Australia, Bhutan, Botswana, Canada (the
+largest real destination, ₹8.2-19.5cr/year), Congo (both the Republic and the Dem. Rep., real distinct
+codes 178/180 — DGCIS tracks them as two separate countries), Fiji, Gambia, Ghana, Israel, Italy, Kenya,
+Liberia, Malawi, Malaysia, Maldives, Mongolia, Mozambique, Nepal, Netherlands, New Zealand, Nigeria,
+Philippines, Qatar, Réunion, Rwanda, Seychelles, Sierra Leone, South Africa, Sweden, Zambia — 32 real,
+individually-verified rows against `data/comtrade-partner-areas.csv`, bringing the crosswalk to 53 total
+entries.
+
+**Verification performed**: re-ran `normalize_dgcis_annual_rows` (595 rows, both flows, zero collisions),
+`rankings`/`compute_hhi`, `mismatch.compute_check_a`/`compute_check_b`, and `coverage_gate.evaluate_coverage`
+for **both flows** against the real, final dataset. Real, coherent, distinct findings: export HHI (`0.16
+-0.25`) is genuinely much lower than import HHI (`0.52-0.53`) — real diversification, not an artifact;
+export coverage gate passes at `28.78%` `QTY_MISSING` (just under the 30% threshold, a close and honest
+real result, not engineered); export check A shows real gaps across 4 of 5 years (`10.16%`-`61.88%`); check
+B now has 43 real export comparisons (vs. 6 for import) across many genuinely-crosswalked countries.
+`uv run pytest -q`: 502 passed (was 500; +2). `mypy app` (58 files)/`ruff`/`black`: clean.
