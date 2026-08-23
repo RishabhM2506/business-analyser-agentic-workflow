@@ -554,3 +554,37 @@ This is the gate working as intended for the first time — refusing to certify 
 good enough for a `unit_value` metric, which is honestly true: most of DGCIS's real nonzero years for this
 product genuinely have no quantity figure. `uv run pytest -q`: 457 passed (was 440 at the last full-suite
 check; +17 across this fix and the item 8 completion above). `mypy app`/`ruff`/`black`: clean.
+
+## `app/report/rankings.py` — D14 partner-ranking precompute and HHI, built and live-verified
+
+Real gap found while starting `report/facts.py` (§14, the frozen LLM contract): `annual_series[].partners`
+needs `analytics_partner_rankings`, and `hhi_by_year` needs HHI — neither had a writer yet, and §3's module
+layout doesn't name one explicitly (the same kind of gap `normalize.py` filled earlier for the raw ->
+normalized step). Built `app/report/rankings.py` to close it before attempting `facts.py` itself.
+
+**Files**: `app/report/rankings.py` (`compute_partner_rankings`, `upsert_partner_rankings`, `compute_hhi`),
+5 unit tests (pure `compute_hhi` logic), 4 integration tests (real Postgres: ranking-by-value, tie-breaking,
+the `ZERO`/`QTY_MISSING`-are-rankable rule, upsert idempotency).
+
+**Design decisions**: rankings are always DGCIS-sourced (`source='dgcis'`), never Comtrade — the master
+prompt names DGCIS as this pipeline's backbone; Comtrade is `comtrade_mirror.py`'s own documented
+"mirror/benchmark only." Only rows with a real value (`OK`/`ZERO`/`QTY_MISSING`/`PROVISIONAL`/
+`UNIT_MISMATCH`) get an integer rank, matching §12's group-1/group-3 split; everything else gets
+`rank=NULL`, never approximated into the list. Ties break on `partner_country_code` ascending, satisfying
+`ix_apr_rank_where_present`'s uniqueness requirement on present ranks. `compute_hhi` returns `None` (never
+`0.0`) when the rankable total is zero or empty — a `0.0` HHI would falsely claim "perfectly
+unconcentrated" from data that doesn't support the claim either way.
+
+**Verification performed**: real end-to-end run for HS6 120791/import across 2020-2024 — 2020 (₹49.1cr,
+QTY_MISSING) and 2022 (₹4246.6cr, QTY_MISSING) both correctly rank Turkey #1 with HHI=1 (fully concentrated,
+honestly reflecting that only one country is ingested so far, the same real, already-flagged coverage
+limitation); 2021/2023/2024 (all real `ZERO` years) correctly produce `HHI=None`, not a fabricated `0.0`.
+All 5 real years upserted cleanly into `analytics_partner_rankings`. `uv run pytest -q`: 466 passed (was
+457; +9). `mypy app`/`ruff`/`black`: clean.
+
+**Next**: `report/facts.py` itself is still blocked on more precompute this session hasn't built yet —
+`analytics_unit_value_series` (CAGR/HHI-adjacent, D8's three-way FX decomposition already exists as a
+building block in `app/fx/decomposition.py` but nothing writes the per-year series table) and
+`analytics_monthly_current_year` (D15). `facts.py` will need to either wait for both or assemble a
+partial/degraded JSON that's honest about which sections are unavailable — a design decision to make
+explicitly when starting that module, not silently default.
