@@ -138,6 +138,18 @@ finding that changes the ingestion design:**
     (`'ALL_PARTNERS'`, matching the sentinel already used in `analytics_mismatch_checks`, §4) for rows
     sourced from the monthly national-total report, since that source genuinely has no partner dimension to
     record — not a gap in what was scraped, a property of what DGCIS itself publishes at that granularity.
+  - **Canonical scenario's first "verify in week one" check, resolved live**: does `120791` split into
+    multiple ITC-HS8 lines? **No.** Searching `searchTerm=120791` (bare HS6) and `searchTerm=12079100`
+    (the specific HS8) against the same country/year returned byte-for-byte identical values
+    (`4.91, 0.00, 424.66, 0.00, 0.00`) — the same single commodity master record either way. `12079100` is
+    the only ITC-HS8 line beneath `120791`, confirmed, not assumed — the `hs8_split_note` in §14's facts
+    JSON is a real, verified fact for this product, not a placeholder. (Also noted: searching by bare HS6
+    doesn't *resolve* to the canonical 8-digit code, it just echoes back whatever digit-length was
+    searched, and drops the `Unit` field — real API behavior worth remembering, not relied on as a
+    discovery mechanism for HS6→HS8 in general; the "HS Code Search" lookup modal, `hscode_fetch`/
+    `description_value`, found earlier but not yet explored, is the more likely real discovery path for a
+    tracked HS6 with genuinely multiple HS8 children.) `ref_hs6_hs8_crosswalk` has one real, live-verified
+    row: `(hs6='120791', hs8='12079100')`.
 - **Coverage is stated as Indian *fiscal* years ("2017-2018 to 2025-2026"), not calendar years** — the
   prompt's "Jan 2018 onward" is a simplification; FY2017-18 starts April 2017. `meidb`'s year dropdowns
   (verified live) actually start at 2018 (FY2018-19), one year later than the homepage's stated coverage —

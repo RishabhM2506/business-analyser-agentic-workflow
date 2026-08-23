@@ -266,3 +266,16 @@ at the normalized layer).
 **Verification performed**: `uv run pytest -q`: 393 passed (373 baseline + 20 across this and the prior
 DGCIS unit). `mypy`/`ruff`/`black`: clean. Real live smoke test as described above, with real data verified
 in the database via direct `psql` inspection, not just trusted from application logs.
+
+## Build sequence item 4: canonical scenario's first "verify in week one" check, resolved
+
+Live-tested `searchTerm=120791` (bare HS6) against the same report — returned byte-for-byte identical
+values to `searchTerm=12079100`. Confirms, doesn't assume: **HS6 120791 has exactly one ITC-HS8 child**.
+Inserted the real, verified `(hs6='120791', hs8='12079100')` row into `ref_hs6_hs8_crosswalk` directly
+(this table's intended production population path is automatic, as a byproduct of real ingestion runs —
+this one row is a manually-verified bootstrap fact for the canonical scenario, not a seed migration).
+`docs/PLAN.md` §1 updated with the full finding, including a secondary real behavior worth remembering:
+searching by bare HS6 doesn't resolve to the canonical 8-digit code, it just echoes back whatever
+digit-length was searched and drops the `Unit` field — not a reliable general HS6→HS8 discovery mechanism
+on its own; the site's separate "HS Code Search" lookup modal (found earlier, not yet explored) is the more
+likely real path for a tracked HS6 with genuinely multiple HS8 children.
