@@ -279,3 +279,27 @@ searching by bare HS6 doesn't resolve to the canonical 8-digit code, it just ech
 digit-length was searched and drops the `Unit` field — not a reliable general HS6→HS8 discovery mechanism
 on its own; the site's separate "HS Code Search" lookup modal (found earlier, not yet explored) is the more
 likely real path for a tracked HS6 with genuinely multiple HS8 children.
+
+## Build sequence item 5: UN Comtrade bulk-batching (D5), fully verified live
+
+Read-only investigation, using the real Comtrade key already in `.env`. Every batching dimension D5's
+design assumed was tested individually and combined, against the real live API
+(`GET /data/v1/get/C/A/HS`):
+- `period=2020,2021,2022,2023,2024` — confirmed, all 5 years in one response.
+- `flowCode=M,X` — confirmed, both flows in one response.
+- `reporterCode` omitted + `partnerCode=699` (Query 2, check B's shape) — confirmed, 34 distinct reporters
+  in one response.
+- `partnerCode` omitted + `reporterCode=699` (Query 1, check A's shape) — confirmed, multiple partner rows
+  including the `partnerCode=0` "World" aggregate.
+- All of the above combined in one call — confirmed, 265 rows in a single response.
+- **Bonus, not anticipated by D5's original framing**: `cmdCode` itself also accepts comma-separated
+  values — multiple tracked HS6 codes can batch into one request too. `docs/PLAN.md` §1/§8 updated; no
+  fallback needed, §8's two-query design is now confirmed as originally written, not just proposed.
+
+**Still open**: the per-minute rate-limit tier for this specific key hasn't been empirically found (deliberately
+not stress-tested against a live API without real need) — the token-bucket limiter's exact sizing remains a
+"confirm before assuming" item, same as before.
+
+**Next**: build `app/pipeline/comtrade_mirror.py` against this now-fully-confirmed design — the D6 retry
+schedule (fixed `[30, 60, 120, 300]`, distinct from the existing single-lookup client's exponential
+backoff), the two query shapes, and the `raw_comtrade_records` upsert.

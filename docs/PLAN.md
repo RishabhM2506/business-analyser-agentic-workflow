@@ -176,15 +176,23 @@ finding that changes the ingestion design:**
   (fixture-based unit tests can still be written against a guessed-but-labeled-as-guessed response shape
   in the meantime, clearly marked as such).
 
-**UN Comtrade bulk-batching (D5) — partially unverified:**
-- The existing `comtrade_client.py` confirms the base request/response shape but was written for
-  single-value params. Comtrade's public docs pages were not fetchable in this environment (404/JS-gated).
-  **D5's exact claim — one call carrying all reporters + all periods + both flows — must be proven with a
-  real live call in Step 3** (comma-separated `period`, `flowCode=M,X`, omitted/`all` `reporterCode`) before
-  the ingestion job is built assuming it works exactly that way. If the live API rejects one of those
-  batching dimensions, the fallback is to batch the largest dimension that *does* work and keep the others
-  single-valued — recorded in `BUILD-LOG.md`, not silently reverting to D5's forbidden per-country loop
-  without a note.
+**UN Comtrade bulk-batching (D5) — fully verified live, Step 3 (2026-08-23), using the real Comtrade key:**
+- Every batching dimension D5 assumed works, confirmed with real calls against `GET /data/v1/get/C/A/HS`:
+  - `period=2020,2021,2022,2023,2024` (5 years) — confirmed, all 5 periods returned in one response.
+  - `flowCode=M,X` — confirmed, both flows returned in one response.
+  - `reporterCode` omitted, `partnerCode=699` (Query 2, §8: every country's own reported trade with
+    India) — confirmed, 34 distinct reporters returned in one call.
+  - `partnerCode` omitted, `reporterCode=699` (Query 1, §8: India's own submission) — confirmed, multiple
+    partner rows (including the `partnerCode=0` "World" aggregate) returned in one call.
+  - Combining all of the above at once (`reporterCode=699`, `partnerCode` omitted, 5 comma-joined periods,
+    `flowCode=M,X`) — confirmed in a single call, 265 rows returned.
+  - **Bonus, not anticipated by D5's original framing**: `cmdCode` also accepts comma-separated values
+    (`cmdCode=120791,090111` returned both codes' rows in one call) — meaning *multiple tracked HS6 codes*
+    can batch into the same request too, not just periods/flows/reporters. Worth using once more than one
+    HS6 is actively tracked — not required for the single-product canonical scenario, so not built into §8's
+    request templates yet, but a real, verified option for later.
+- No fallback needed — every dimension D5 required works exactly as designed. §8's two-query templates are
+  now the confirmed, not just proposed, ingestion design.
 
 ## 2. Explicit non-goals
 
@@ -777,14 +785,14 @@ is *no per-country loop*, not *exactly one call ever*):
 Query 1 — India as REPORTER (feeds check A: India's own submission):
 GET {base}/data/v1/get/C/A/HS
   ?reporterCode=699
-  &partnerCode=          (omitted = all partners, to be confirmed live)
-  &period=2021,2022,2023,2024,2025   (comma-joined, to be confirmed live)
-  &cmdCode=<tracked hs6 list, comma-joined>
-  &flowCode=M,X            (to be confirmed live)
+  &partnerCode=          (omitted = all partners — verified live, §1)
+  &period=2021,2022,2023,2024,2025   (comma-joined — verified live, §1)
+  &cmdCode=<tracked hs6 list, comma-joined>   (verified live, §1: cmdCode itself also batches)
+  &flowCode=M,X            (verified live, §1)
 
 Query 2 — India as PARTNER (feeds check B: each partner's own submission about trade with India):
 GET {base}/data/v1/get/C/A/HS
-  ?reporterCode=          (omitted = all reporters, to be confirmed live)
+  ?reporterCode=          (omitted = all reporters — verified live, §1)
   &partnerCode=699
   &period=2021,2022,2023,2024,2025
   &cmdCode=<tracked hs6 list, comma-joined>
