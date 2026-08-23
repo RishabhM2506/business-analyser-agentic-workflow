@@ -1,0 +1,1137 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TRADESTAT</title>
+       <script type="text/javascript">
+         function noBack() { window.history.forward() }
+         noBack();
+         window.onload = noBack;
+         window.onpageshow = function (evt) { if (evt.persisted) noBack() }
+         window.onunload = function () { void (0) }
+    </script>
+    <script type="text/javascript">
+        window.history.forward(0);
+    </script>
+    <script type="text/javascript">
+        function preventBack() { window.history.forward(); }
+        setTimeout("preventBack()", 0);
+        window.onunload = function () { null };
+    </script> 
+<link rel="shortcut icon" href="https://tradestat.commerce.gov.in/assets/images/favicon.png">      
+<!-- Bootstrap CSS -->
+<link href="https://tradestat.commerce.gov.in/assets/Bootstrap/all.min.css" rel="stylesheet">
+<link href="https://tradestat.commerce.gov.in/assets/Bootstrap/bootstrap-select.css" rel="stylesheet">
+<link href="https://tradestat.commerce.gov.in/assets/Bootstrap/bootstrap.min.css" rel="stylesheet">
+<!-- <link href="https://tradestat.commerce.gov.in/assets/Bootstrap/fonts.min.css" rel="stylesheet"> -->
+<link href="https://tradestat.commerce.gov.in/assets/Bootstrap/select2.min.css" rel="stylesheet">
+<link href="https://tradestat.commerce.gov.in/assets/Bootstrap/stackpathbootstrap.min.css" rel="stylesheet">
+
+ <!-- Javascript CSS --> 
+ <script src="https://tradestat.commerce.gov.in/assets/js/jquery.min.js"></script>
+<script src="https://tradestat.commerce.gov.in/assets/js/bootstrap.bundle.min.js"></script>  
+<!-- <script src="https://tradestat.commerce.gov.in/assets/js/select.min.js"></script> -->
+<script src="https://tradestat.commerce.gov.in/assets/js/bundle.min.js"></script>
+
+<script src="https://tradestat.commerce.gov.in/assets/js/select2.min.js"></script>
+<script src="https://tradestat.commerce.gov.in/assets/js/jquery-3.6.3.js"></script>
+<!-- foe export excel -->
+<script src="https://tradestat.commerce.gov.in/assets/js/tableToExcel.js"></script>
+<!-- <script src="https://tradestat.commerce.gov.in/assets/js/jquery-3.7.1.js"></script>  -->
+
+
+
+    
+
+<script src="https://code.jquery.com/jquery-3.7.1.min.js" ></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.1/dist/js/bootstrap.bundle.min.js" ></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-select/1.14.0-beta2/js/bootstrap-select.min.js" ></script> 
+<script src="https://tradestat.commerce.gov.in/assets/js/bootstrap.min.js"></script>
+
+
+<style>
+  body {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  footer {
+    margin-top: auto;
+    background-color: #FFD580;
+    color: black;
+    text-align: center;
+    padding: 9px;
+    font-weight: bold;
+  }
+
+  p {
+    margin: 0 auto;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  .flex-wrap {
+    margin-bottom: -35px;
+  }
+
+  div.dataTables_wrapper div.dataTables_paginate {
+    margin-top: -25px;
+  }
+
+  .page-item.active .page-link {
+    z-index: 1;
+    color: #fff;
+    background-color: #5D78FF;
+    border-color: #5D78FF;
+  }
+
+  .th {
+    background-color: #6e0d38bd;
+  }
+</style>
+
+</head>
+
+<body oncopy="return false" ondrag="return false" onselectstart="return false" ondragstart="return false"  ondragenter="return false" onpaste="return false" oncontextmenu="return false" ondragenter="return false" ondragover="return false" ondragleave="return false">
+  <div class="container-fluid" style="background-color:#FEE7CE; border-width: 3px; border-color: #ffe7ce; border-style: solid;">
+    <div class="row" style="background-color:#ffe7ce; padding: 8px; color:black;">
+      <div class="col-lg-1">
+        <img src="https://tradestat.commerce.gov.in/assets/images/logo.png" alt="Logo" style="width: 70px; height: 93px; margin-left: 38px;">
+      </div>
+      <div class="col-sm-3">
+        <h4> Government of India</h4>
+        <h5> Ministry of Commerce and Industry</h5>
+        <h6> DEPARTMENT OF COMMERCE</h6>
+      </div>
+      <div class="col-lg-8">    
+        <a class="btn" style="background-color:#6e0d38bd; color:white;" href="https://tradestat.commerce.gov.in/eidb/commodity_wise_export"><b>EIDB</b></a>
+        <a class="btn btn-secondary" href="https://tradestat.commerce.gov.in/meidb/commoditywise_export"><b>MEIDB</b></a>
+        <a class="btn btn-secondary" href="https://tradestat.commerce.gov.in/ftpa/export_commodity_group_new"><b>FTPA</b></a>
+        <a class="btn btn-secondary" href="https://tradestat.commerce.gov.in/ftspcc/export_commodity_wise"><b>FTSPCC</b></a>
+        
+        <br>
+        <a class="btn" style="background-color:#6e0d38bd; color:white;">SYSTEM ON INDIA's Export&nbsp;Import&nbsp;(DATA BANK-TRADESTAT)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</a>
+        <!-- <h4 style="padding-top: 7px;">EIDB->SYSTEM ON INDIA's Export&nbsp;Import&nbsp;(DATA BANK-TRADESTAT)</h4> -->
+        <p style="margin-bottom: 0px;">Data available 2017-2018 to 2025-2026   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;  Last data updated on 07/08/2026 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </p>
+      </div>
+
+      <!-- <div class="col-sm-8">
+        <a class="btn" style="background-color:#9f3d68bd; color:white;" href="https://tradestat.commerce.gov.in/eidb/commodity_wise_export"><b>EIDB</b></a>
+        <a class="btn" style="background-color:#29d; color:white;" href="https://tradestat.commerce.gov.in/meidb/commoditywise_export"><b>MEIDB</b></a>
+        <a class="btn" style="background-color:#686c16; color:white;" href="https://tradestat.commerce.gov.in/ftpa/export_commodity_group_new"><b>FTPA</b></a>
+        <a class="btn btn-primary" href="https://tradestat.commerce.gov.in/ftspcc/export_commodity_wise"><b>FTSPCC</b></a>
+        <a class="btn" style="background-color:#ad5533; color:white;" href="https://tradestat.commerce.gov.in/tag/annual_trade_rs"><b>TRADE AT A GLANCE</b></a>
+        <h4 style="padding-top: 7px;">EIDB->SYSTEM ON INDIA's Export&nbsp;Import&nbsp;(DATA BANK-TRADESTAT)</h4>
+        <p style="padding-top: 10px;">Data available 2017-2018 to 2025-2026 (Apr-Aug)  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;  Last data updated on 07/08/2026</p>
+        
+      </div> -->
+      <!-- <div class="col-md-4">
+        <h4>SYSTEM ON INDIA's Export&nbsp;Import&nbsp;</h4>
+        <h6>(DATA BANK Version 7.2-TRADESTAT)</h6>
+      </div> -->
+    </div>
+  </div>
+  <section class="border">
+    <div class="container-fluid">
+      <div class="row">
+        <div class="col-md-7">
+          <label class="mt-2">
+            <h6><b>Trade Type: </b></h6>
+          </label> &nbsp;
+          
+          <a href="https://tradestat.commerce.gov.in/eidb/commodity_wise_export" class="btn btn-secondary mt-2">EXPORTS</a>
+          <a href="https://tradestat.commerce.gov.in/eidb/commodity_wise_import" class="btn mt-2" style="background-color:#6e0d38bd; color:white;">IMPORTS</a>
+          <a href="https://tradestat.commerce.gov.in/eidb/country_wise_ttrade" class="btn btn-secondary mt-2">TOTAL TRADE</a>
+        </div>
+        <div class="col-md-3 mt-2" id="exportdropdown" style="display: flex;">
+          <label class="mt-2">
+            <h6><b>Reports: </b></h6>
+          </label> &nbsp; &nbsp;
+          <div class="dropdown" style="width: 100%; max-width: 300px; margin-left: 0px; ">
+
+            <button type="button" class="btn btn-md dropdown-toggle d-flex justify-content-between" style="background-color:#6e0d38bd; color:white;" id="dropdownMenuButton" data-bs-toggle="dropdown" aria-expanded="false" style="width: 100%;">
+                            Commodity x Country-wise
+                          </button>
+            <ul class="dropdown-menu" aria-labelledby="dropdownMenuButton">
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/commodity_wise_import">Commodity-wise</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/chapter_wise_all_commodities_import">Chapter-wise all commodities</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/commodity_wise_all_countries_import">Commodity-wise all Countries</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/commodityx_countries_wise_import">Commodity x Country-wise</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/country_wise_import">Country-wise</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/country_wise_all_commodities_import">Country-wise all Commodities</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/region_wise_import">Region-wise</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/region_wise_all_countries_import">Region-wise all Countries</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/region_wise_all_commodities_import">Region-wise all Commodities</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/predefined_group_of_countries_import">Predefined Group of Countries</a></li>
+              <li><a class="dropdown-item" href="https://tradestat.commerce.gov.in/eidb/customised_group_of_countries_import">Customised Group of Countries</a>
+
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  <div class="container-fluid">
+    <style type="text/css">
+        /* Absolute Center Spinner */
+        .loading {
+            position: fixed;
+            z-index: 999;
+            height: 2em;
+            width: 2em;
+            overflow: show;
+            margin: auto;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            right: 0;
+        }
+
+        /* Transparent Overlay */
+        .loading:before {
+            content: '';
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(rgba(20, 20, 20, .8), rgba(0, 0, 0, .8));
+
+            background: -webkit-radial-gradient(rgba(20, 20, 20, .8), rgba(0, 0, 0, .8));
+        }
+
+        /* :not(:required) hides these rules from IE9 and below */
+        .loading:not(:required) {
+            /* hide "loading..." text */
+            font: 0/0 a;
+            color: transparent;
+            text-shadow: none;
+            background-color: transparent;
+            border: 0;
+        }
+
+        .loading:not(:required):after {
+            content: '';
+            display: block;
+            font-size: 10px;
+            width: 1em;
+            height: 1em;
+            margin-top: -0.5em;
+            -webkit-animation: spinner 150ms infinite linear;
+            -moz-animation: spinner 150ms infinite linear;
+            -ms-animation: spinner 150ms infinite linear;
+            -o-animation: spinner 150ms infinite linear;
+            animation: spinner 150ms infinite linear;
+            border-radius: 0.5em;
+            -webkit-box-shadow: rgba(255, 255, 255, 0.75) 1.5em 0 0 0, rgba(255, 255, 255, 0.75) 1.1em 1.1em 0 0, rgba(255, 255, 255, 0.75) 0 1.5em 0 0, rgba(255, 255, 255, 0.75) -1.1em 1.1em 0 0, rgba(255, 255, 255, 0.75) -1.5em 0 0 0, rgba(255, 255, 255, 0.75) -1.1em -1.1em 0 0, rgba(255, 255, 255, 0.75) 0 -1.5em 0 0, rgba(255, 255, 255, 0.75) 1.1em -1.1em 0 0;
+            box-shadow: rgba(255, 255, 255, 0.75) 1.5em 0 0 0, rgba(255, 255, 255, 0.75) 1.1em 1.1em 0 0, rgba(255, 255, 255, 0.75) 0 1.5em 0 0, rgba(255, 255, 255, 0.75) -1.1em 1.1em 0 0, rgba(255, 255, 255, 0.75) -1.5em 0 0 0, rgba(255, 255, 255, 0.75) -1.1em -1.1em 0 0, rgba(255, 255, 255, 0.75) 0 -1.5em 0 0, rgba(255, 255, 255, 0.75) 1.1em -1.1em 0 0;
+        }
+
+        /* Animation */
+
+        @-webkit-keyframes spinner {
+            0% {
+                -webkit-transform: rotate(0deg);
+                -moz-transform: rotate(0deg);
+                -ms-transform: rotate(0deg);
+                -o-transform: rotate(0deg);
+                transform: rotate(0deg);
+            }
+
+            100% {
+                -webkit-transform: rotate(360deg);
+                -moz-transform: rotate(360deg);
+                -ms-transform: rotate(360deg);
+                -o-transform: rotate(360deg);
+                transform: rotate(360deg);
+            }
+        }
+
+        @-moz-keyframes spinner {
+            0% {
+                -webkit-transform: rotate(0deg);
+                -moz-transform: rotate(0deg);
+                -ms-transform: rotate(0deg);
+                -o-transform: rotate(0deg);
+                transform: rotate(0deg);
+            }
+
+            100% {
+                -webkit-transform: rotate(360deg);
+                -moz-transform: rotate(360deg);
+                -ms-transform: rotate(360deg);
+                -o-transform: rotate(360deg);
+                transform: rotate(360deg);
+            }
+        }
+
+        @-o-keyframes spinner {
+            0% {
+                -webkit-transform: rotate(0deg);
+                -moz-transform: rotate(0deg);
+                -ms-transform: rotate(0deg);
+                -o-transform: rotate(0deg);
+                transform: rotate(0deg);
+            }
+
+            100% {
+                -webkit-transform: rotate(360deg);
+                -moz-transform: rotate(360deg);
+                -ms-transform: rotate(360deg);
+                -o-transform: rotate(360deg);
+                transform: rotate(360deg);
+            }
+        }
+
+        @keyframes spinner {
+            0% {
+                -webkit-transform: rotate(0deg);
+                -moz-transform: rotate(0deg);
+                -ms-transform: rotate(0deg);
+                -o-transform: rotate(0deg);
+                transform: rotate(0deg);
+            }
+
+            100% {
+                -webkit-transform: rotate(360deg);
+                -moz-transform: rotate(360deg);
+                -ms-transform: rotate(360deg);
+                -o-transform: rotate(360deg);
+                transform: rotate(360deg);
+            }
+        }
+
+        td {
+            text-align: right;
+        }
+    </style>
+    <div id="loadingModal" style="display: none;">
+        <div class="loading">Loading&#8230;</div>
+        <div class="content"></div>
+
+        <!--<button class="btn btn-primary" type="button" disabled>
+      <span class="spinner-grow spinner-grow-sm" role="status" aria-hidden="true"></span>
+      Loading...
+    </button>-->
+    </div>
+
+
+    <script>
+        function openLoader() {
+            document.getElementById("loadingModal").style.display = "block";
+        }
+    </script>
+    <!-- <form wire:submit.prevent="search"> -->
+    <!-- Title -->
+    <div class="row">
+        <div class="col-md-12 text-center">
+            <h5><b>Import :: Commodity x Country-wise</b></h5>
+        </div>
+    </div>
+    <form method="post" action="https://tradestat.commerce.gov.in/eidb/commodityx_countries_wise_import" onsubmit="openLoader()">
+    <input type="hidden" name="_token" value="hSvDpDqHLnBELnejqNsrOr913MjW5ZbbS4cnlnSF" autocomplete="off">
+    <!-- Search and Filter Controls -->
+    <div class="row">
+        <!-- HS Code Search Input -->
+        <div class="col-sm-12 col-md-3 col-lg-3">
+            
+                <label class="me-2"><b>HS Code:</b></label>
+                                <input type="search" value="12079100" name="searchTerm" name="searchTerm" wire:model="searchTerm"  maxLength="8" class="form-control rounded" placeholder="HS Code" aria-label="Search"  onkeydown="return isNumeric(event.keyCode);" onkeyup="keyUP(event.keyCode)"/>
+                                <button type="button" class="btn btn-link" data-bs-toggle="modal" data-bs-target="#exampleModal">Search&nbsp;HS Code</button>
+                <!-- <span class="input-group-text border-0" style="background-color:#ffffff; cursor: pointer;" wire:click="toggleVisibility">
+                    <i class="fas fa-search"></i>
+                </span> -->
+            
+        </div>
+
+        <!-- Search Button -->
+        <!-- <div class="col-md-1">
+            <button class="btn btn-primary" wire:click="openModal">Search</button>
+        </div> -->
+        <div class="col-sm-12 col-md-3 col-lg-3">
+            <label class="mt-2"><strong>Year:</strong></label>&nbsp;
+            <select class="form-select" name="ContEidbyi" id="ContEidbyi" wire:model="ContEidbyi" required>
+                
+                                                                                                    <option value="2025" >2025-2026</option>
+                    
+                                                                                                    <option value="2024" selected>2024-2025</option>
+                    
+                                                                                                    <option value="2023" >2023-2024</option>
+                    
+                                                                                                    <option value="2022" >2022-2023</option>
+                    
+                                                                                                    <option value="2021" >2021-2022</option>
+                    
+                                                                                                    <option value="2020" >2020-2021</option>
+                    
+                                                                                                    <option value="2019" >2019-2020</option>
+                    
+                                                                                                    <option value="2018" >2018-2019</option>
+                    
+                                                    </select>
+        </div>
+
+        <!-- Country/Region Dropdown -->
+        <div class="col-sm-12 col-md-3 col-lg-3">
+            <label class="mt-1 me-2"><strong>Country/Region:</strong></label>
+            <select class="form-select" name="ContEidbi" id="ContEidbi" wire:model="ContEidbi" required>
+                <!-- <option>--Select--</option> -->
+                                                <option value="1" >AFGHANISTAN</option>
+                                <option value="3" >ALBANIA</option>
+                                <option value="5" >ALGERIA</option>
+                                <option value="7" >AMERI SAMOA</option>
+                                <option value="9" >ANDORRA</option>
+                                <option value="11" >ANGOLA</option>
+                                <option value="12" >ANGUILLA</option>
+                                <option value="14" >ANTARTICA</option>
+                                <option value="13" >ANTIGUA</option>
+                                <option value="15" >ARGENTINA</option>
+                                <option value="16" >ARMENIA</option>
+                                <option value="20" >ARUBA</option>
+                                <option value="17" >AUSTRALIA</option>
+                                <option value="19" >AUSTRIA</option>
+                                <option value="21" >AZERBAIJAN</option>
+                                <option value="23" >BAHAMAS</option>
+                                <option value="25" >BAHARAIN IS</option>
+                                <option value="27" >BANGLADESH PR</option>
+                                <option value="29" >BARBADOS</option>
+                                <option value="55" >BELARUS</option>
+                                <option value="33" >BELGIUM</option>
+                                <option value="31" >BELIZE</option>
+                                <option value="35" >BENIN</option>
+                                <option value="37" >BERMUDA</option>
+                                <option value="38" >BHUTAN</option>
+                                <option value="39" >BOLIVIA</option>
+                                <option value="40" >BOSNIA-HRZGOVIN</option>
+                                <option value="41" >BOTSWANA</option>
+                                <option value="45" >BR VIRGN IS</option>
+                                <option value="43" >BRAZIL</option>
+                                <option value="4" >BRITISH INDIAN </option>
+                                <option value="47" >BRUNEI</option>
+                                <option value="49" >BULGARIA</option>
+                                <option value="50" >BURKINA FASO</option>
+                                <option value="53" >BURUNDI</option>
+                                <option value="67" >C AFRI REP</option>
+                                <option value="56" >CAMBODIA</option>
+                                <option value="57" >CAMEROON</option>
+                                <option value="59" >CANADA</option>
+                                <option value="61" >CANARY IS</option>
+                                <option value="63" >CAPE VERDE IS</option>
+                                <option value="65" >CAYMAN IS</option>
+                                <option value="69" >CHAD</option>
+                                <option value="71" >CHANNEL IS</option>
+                                <option value="73" >CHILE</option>
+                                <option value="77" >CHINA P RP</option>
+                                <option value="79" >CHRISTMAS IS.</option>
+                                <option value="81" >COCOS IS</option>
+                                <option value="83" >COLOMBIA</option>
+                                <option value="85" >COMOROS</option>
+                                <option value="459" >CONGO D. REP.</option>
+                                <option value="87" >CONGO P REP</option>
+                                <option value="89" >COOK IS</option>
+                                <option value="91" >COSTA RICA</option>
+                                <option value="199" >COTE D&#039; IVOIRE</option>
+                                <option value="92" >CROATIA</option>
+                                <option value="93" >CUBA</option>
+                                <option value="276" >CURACAO</option>
+                                <option value="95" >CYPRUS</option>
+                                <option value="98" >CZECH REPUBLIC</option>
+                                <option value="101" >DENMARK</option>
+                                <option value="102" >DJIBOUTI</option>
+                                <option value="103" >DOMINIC REP</option>
+                                <option value="105" >DOMINICA</option>
+                                <option value="109" >ECUADOR</option>
+                                <option value="111" >EGYPT A RP</option>
+                                <option value="113" >EL SALVADOR</option>
+                                <option value="117" >EQUTL GUINEA</option>
+                                <option value="116" >ERITREA</option>
+                                <option value="114" >ESTONIA</option>
+                                <option value="115" >ETHIOPIA</option>
+                                <option value="123" >FALKLAND IS</option>
+                                <option value="121" >FAROE IS.</option>
+                                <option value="127" >FIJI IS</option>
+                                <option value="125" >FINLAND</option>
+                                <option value="131" >FR GUIANA</option>
+                                <option value="133" >FR POLYNESIA</option>
+                                <option value="135" >FR S ANT TR</option>
+                                <option value="129" >FRANCE</option>
+                                <option value="141" >GABON</option>
+                                <option value="143" >GAMBIA</option>
+                                <option value="145" >GEORGIA</option>
+                                <option value="147" >GERMANY</option>
+                                <option value="149" >GHANA</option>
+                                <option value="151" >GIBRALTAR</option>
+                                <option value="155" >GREECE</option>
+                                <option value="157" >GREENLAND</option>
+                                <option value="159" >GRENADA</option>
+                                <option value="161" >GUADELOUPE</option>
+                                <option value="163" >GUAM</option>
+                                <option value="165" >GUATEMALA</option>
+                                <option value="124" >GUERNSEY</option>
+                                <option value="167" >GUINEA</option>
+                                <option value="169" >GUINEA BISSAU</option>
+                                <option value="171" >GUYANA</option>
+                                <option value="175" >HAITI</option>
+                                <option value="176" >HEARD MACDONALD</option>
+                                <option value="177" >HONDURAS</option>
+                                <option value="179" >HONG KONG</option>
+                                <option value="181" >HUNGARY</option>
+                                <option value="185" >ICELAND</option>
+                                <option value="187" >INDONESIA</option>
+                                <option value="2" >INSTALLATIONS IN INTERNATIONAL WATERS   </option>
+                                <option value="189" >IRAN</option>
+                                <option value="191" >IRAQ</option>
+                                <option value="193" >IRELAND</option>
+                                <option value="195" >ISRAEL</option>
+                                <option value="197" >ITALY</option>
+                                <option value="203" >JAMAICA</option>
+                                <option value="205" >JAPAN</option>
+                                <option value="122" >JERSEY         </option>
+                                <option value="207" >JORDAN</option>
+                                <option value="212" >KAZAKHSTAN</option>
+                                <option value="213" >KENYA</option>
+                                <option value="214" >KIRIBATI REP</option>
+                                <option value="215" >KOREA DP RP</option>
+                                <option value="217" >KOREA RP</option>
+                                <option value="219" >KUWAIT</option>
+                                <option value="216" >KYRGHYZSTAN</option>
+                                <option value="223" >LAO PD RP</option>
+                                <option value="224" >LATVIA</option>
+                                <option value="225" >LEBANON</option>
+                                <option value="227" >LESOTHO</option>
+                                <option value="229" >LIBERIA</option>
+                                <option value="231" >LIBYA</option>
+                                <option value="233" >LIECHTENSTEIN</option>
+                                <option value="234" >LITHUANIA</option>
+                                <option value="235" >LUXEMBOURG</option>
+                                <option value="239" >MACAO</option>
+                                <option value="240" >MACEDONIA</option>
+                                <option value="241" >MADAGASCAR</option>
+                                <option value="243" >MALAWI</option>
+                                <option value="245" >MALAYSIA</option>
+                                <option value="247" >MALDIVES</option>
+                                <option value="249" >MALI</option>
+                                <option value="251" >MALTA</option>
+                                <option value="252" >MARSHALL ISLAND</option>
+                                <option value="253" >MARTINIQUE</option>
+                                <option value="255" >MAURITANIA</option>
+                                <option value="257" >MAURITIUS</option>
+                                <option value="34" >MAYOTTE</option>
+                                <option value="259" >MEXICO</option>
+                                <option value="256" >MICRONESIA</option>
+                                <option value="260" >MOLDOVA</option>
+                                <option value="262" >MONACO</option>
+                                <option value="261" >MONGOLIA</option>
+                                <option value="356" >MONTENEGRO</option>
+                                <option value="263" >MONTSERRAT</option>
+                                <option value="265" >MOROCCO</option>
+                                <option value="267" >MOZAMBIQUE</option>
+                                <option value="258" >MYANMAR</option>
+                                <option value="294" >N. MARIANA IS.</option>
+                                <option value="269" >NAMIBIA</option>
+                                <option value="271" >NAURU RP</option>
+                                <option value="273" >NEPAL</option>
+                                <option value="275" >NETHERLAND</option>
+                                <option value="277" >NETHERLANDANTIL</option>
+                                <option value="279" >NEUTRAL ZONE</option>
+                                <option value="281" >NEW CALEDONIA</option>
+                                <option value="285" >NEW ZEALAND</option>
+                                <option value="287" >NICARAGUA</option>
+                                <option value="289" >NIGER</option>
+                                <option value="291" >NIGERIA</option>
+                                <option value="293" >NIUE IS</option>
+                                <option value="295" >NORFOLK IS</option>
+                                <option value="297" >NORWAY</option>
+                                <option value="301" >OMAN</option>
+                                <option value="307" >PACIFIC IS</option>
+                                <option value="309" >PAKISTAN IR</option>
+                                <option value="310" >PALAU</option>
+                                <option value="313" >PANAMA C Z</option>
+                                <option value="311" >PANAMA REPUBLIC</option>
+                                <option value="315" >PAPUA N GNA</option>
+                                <option value="317" >PARAGUAY</option>
+                                <option value="319" >PERU</option>
+                                <option value="323" >PHILIPPINES</option>
+                                <option value="321" >PITCAIRN IS.</option>
+                                <option value="325" >POLAND</option>
+                                <option value="327" >PORTUGAL</option>
+                                <option value="331" >PUERTO RICO</option>
+                                <option value="335" >QATAR</option>
+                                <option value="339" >REUNION</option>
+                                <option value="343" >ROMANIA</option>
+                                <option value="344" >RUSSIA</option>
+                                <option value="345" >RWANDA</option>
+                                <option value="347" >SAHARWI A.DM RP</option>
+                                <option value="447" >SAMOA</option>
+                                <option value="346" >SAN MARINO</option>
+                                <option value="349" >SAO TOME</option>
+                                <option value="351" >SAUDI ARAB</option>
+                                <option value="353" >SENEGAL</option>
+                                <option value="352" >SERBIA</option>
+                                <option value="355" >SEYCHELLES</option>
+                                <option value="357" >SIERRA LEONE</option>
+                                <option value="359" >SINGAPORE</option>
+                                <option value="278" >SINT MAARTEN (DUTCH PART)</option>
+                                <option value="358" >SLOVAK REP</option>
+                                <option value="360" >SLOVENIA</option>
+                                <option value="361" >SOLOMON IS</option>
+                                <option value="363" >SOMALIA</option>
+                                <option value="365" >SOUTH AFRICA</option>
+                                <option value="382" >SOUTH SUDAN </option>
+                                <option value="367" >SPAIN</option>
+                                <option value="369" >SRI LANKA DSR</option>
+                                <option value="371" >ST HELENA</option>
+                                <option value="373" >ST KITT N A</option>
+                                <option value="375" >ST LUCIA</option>
+                                <option value="377" >ST PIERRE</option>
+                                <option value="379" >ST VINCENT</option>
+                                <option value="196" >STATE OF PALEST</option>
+                                <option value="381" >SUDAN</option>
+                                <option value="383" >SURINAME</option>
+                                <option value="6" >SVALLBARD AND J</option>
+                                <option value="385" >SWAZILAND</option>
+                                <option value="387" >SWEDEN</option>
+                                <option value="389" >SWITZERLAND</option>
+                                <option value="391" >SYRIA</option>
+                                <option value="75" >TAIWAN</option>
+                                <option value="393" >TAJIKISTAN</option>
+                                <option value="395" >TANZANIA REP</option>
+                                <option value="397" >THAILAND</option>
+                                <option value="329" >TIMOR LESTE</option>
+                                <option value="399" >TOGO</option>
+                                <option value="401" >TOKELAU IS</option>
+                                <option value="403" >TONGA</option>
+                                <option value="999" >Trade to Unspecified Countries</option>
+                                <option value="405" >TRINIDAD</option>
+                                <option value="407" >TUNISIA</option>
+                                <option value="409" selected>TURKEY</option>
+                                <option value="410" >TURKMENISTAN</option>
+                                <option value="411" >TURKS C IS</option>
+                                <option value="413" >TUVALU</option>
+                                <option value="419" >U ARAB EMTS</option>
+                                <option value="421" >U K</option>
+                                <option value="423" >U S A</option>
+                                <option value="417" >UGANDA</option>
+                                <option value="422" >UKRAINE</option>
+                                <option value="354" >UNION OF SERBIA &amp; MONTENEGRO</option>
+                                <option value="599" >UNSPECIFIED</option>
+                                <option value="427" >URUGUAY</option>
+                                <option value="424" >US MINOR OUTLYING ISLANDS               </option>
+                                <option value="430" >UZBEKISTAN</option>
+                                <option value="431" >VANUATU REP</option>
+                                <option value="198" >VATICAN CITY</option>
+                                <option value="433" >VENEZUELA</option>
+                                <option value="437" >VIETNAM SOC REP</option>
+                                <option value="439" >VIRGIN IS US</option>
+                                <option value="443" >WALLIS F IS</option>
+                                <option value="453" >YEMEN REPUBLC</option>
+                                <option value="461" >ZAMBIA</option>
+                                <option value="463" >ZIMBABWE</option>
+                                            </select>
+        </div>
+        <!-- Currency Dropdown -->
+        <div class="col-sm-12 col-md-3 col-lg-3">
+            <label class="mt-1 me-2"><b>Values&nbsp;in:</b></label>
+            <select class="form-select" name="ReportEidbi" id="ReportEidbi" wire:model="ReportEidbi" required>
+                                <option value="2" >US $ Million</option>
+                <option value="1" selected>₹ Crore</option>
+                                
+            </select>
+        </div>
+        <!-- <div class="col-md-1 mt-2" >
+     <button type="submit" style="background-color:#6e0d38bd; color: #fff;">Submit</button>
+   </div> -->
+        <!-- <div class="col-md-1 mt-2 justify-content-end">
+      <button type="button" class="btn" style="background-color:#6e0d38bd; color: #fff;" id="excel" data-kt-menu-trigger="click" data-kt-menu-placement="bottom-end">Excel</button>&nbsp;
+      <button class="btn" style="background-color:#6e0d38bd; color: #fff;" type="button" onclick="window.print()">Print</button>
+    </div> -->
+    </div>
+    <div class="row text-center">
+            <div class="col-sm-12" >
+                <center>
+                <button type="submit" class="btn" style="background-color:#6e0d38bd; color: #fff;">Submit</button>
+                </center>
+            </div>
+        </div>
+    </form>
+    <div>
+        <div class="row">
+            <div class="col-md-1 mt-2 justify-content-end">
+      <button type="button" class="btn" style="background-color:#6e0d38bd; color: #fff;" id="excel" data-kt-menu-trigger="click" data-kt-menu-placement="bottom-end">Excel</button>&nbsp;
+      <button class="btn" style="background-color:#6e0d38bd; color: #fff;" type="button" onclick="window.print()">Print</button>
+    </div>
+        </div>
+
+        <div class="row">
+            <div class="col-md-12">
+                <table class="table table-bordered table-responsiv" id="example" class="display">
+                                        <tr>
+                        <td class="border border-primary" colspan="10" style="text-align:left;">Country:&nbsp;<b><span>TURKEY</span></b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; HSCODE:                    
+                         <span><b>12079100</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Description:&nbsp;<b>POPPY SEEDS W/N BROKEN</b> </span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Unit:&nbsp;<b>KGS</b> 
+                         <p style="float: right;">
+                                Report Date: <b>23 Aug 2026</b>||                       
+                       Values in ₹ Crore
+                                                    </p>
+                        </td>
+                        
+                        <!-- <td colspan="5">
+                            
+                        </td> -->
+                    </tr>
+                    <tr style="background: #6e0d38bd; color: #fff; text-align:center;">
+                        <th class="border border-primary">S.No.</th>
+                        <th class="border border-primary">Year</th>
+                                                <th class="border border-primary">2020 - 2021</th>
+                        <th class="border border-primary">2021 - 2022</th>
+                        <th class="border border-primary">2022 - 2023</th>
+                        <th class="border border-primary">2023 - 2024</th>
+                        <th class="border border-primary">2024 - 2025</th>
+                    </tr>
+                    
+                                        
+                    <tr>
+                        <td class="border border-primary" style="text-align: center;">1</td> 
+                                               
+                        <td class="border border-primary" style="text-align: left;">Values in ₹ Crore</td>
+                                                
+                        <td class="border border-primary">4.91</td>
+                        <td class="border border-primary">0.00</td>
+                        <td class="border border-primary">424.66</td>
+                        <td class="border border-primary">0.00</td>
+                        <td class="border border-primary">0.00</td>
+                    </tr>
+                    <tr>
+                        <td class="border border-primary" style="text-align: center;">2</td>
+                        <td class="border border-primary" style="text-align: left;">%Growth</td>
+                        <td class="border border-primary"></td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                    </tr>
+                                        <tr>
+                        <td class="border border-primary" style="text-align: center;">3</td>
+                        <td class="border border-primary" style="text-align: left;">Total import of commodity</td>
+                        <td class="border border-primary">
+                                                        13.11
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                        642.50
+                                                    </td>
+                        <td class="border border-primary">
+                                                        0.00
+                                                    </td>
+                        <td class="border border-primary">
+                                                        0.00
+                                                    </td>
+
+
+                    </tr>
+                                        <tr>
+                        <td class="border border-primary" style="text-align: center;">4</td>
+                        <td class="border border-primary" style="text-align: left;">%Growth</td>
+                        <td class="border border-primary"></td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                        -100.00
+                                                    </td>
+                        <td class="border border-primary">
+                                                        3,076.44
+                                                    </td>
+                    </tr>
+
+                    <tr>
+                        <td class="border border-primary" style="text-align: center;">5</td>
+                        <td class="border border-primary" style="text-align: left;">%Share of country (1 of 3)</td>
+                        <td class="border border-primary">
+                                                        37.47
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                        66.09
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                        100.00
+                                                    </td>
+                    </tr>
+                                        <tr>
+                        <td class="border border-primary" style="text-align: center;">6</td>
+                        <td class="border border-primary" style="text-align: left;">Total import to country</td>
+                        <td class="border border-primary">
+                                                        10,879.03
+                                                    </td>
+                        <td class="border border-primary">
+                                                        14,881.12
+                                                    </td>
+                        <td class="border border-primary">
+                                                        33,797.78
+                                                    </td>
+                        <td class="border border-primary">
+                                                        31,321.33
+                                                    </td>
+                        <td class="border border-primary">
+                                                        25,236.50
+                                                    </td>
+                    </tr>
+                                        <tr>
+                        <td class="border border-primary" style="text-align: center;">7</td>
+                        <td class="border border-primary" style="text-align: left;">%Growth</td>
+                        <td class="border border-primary"></td>
+                        <td class="border border-primary">
+                                                        36.79
+                                                    </td>
+                        <td class="border border-primary">
+                                                        127.12
+                                                    </td>
+                        <td class="border border-primary">
+                                                        -7.33
+                                                    </td>
+                        <td class="border border-primary">
+                                                        -19.43
+                                                    </td>
+                    </tr>
+                    <tr>
+                        <td class="border border-primary" style="text-align: center;">8</td>
+                        <td class="border border-primary" style="text-align: left;">%Share of commodity (1 of 6)</td>
+                        <td class="border border-primary">
+                                                        0.05
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                        1.26
+                                                    </td>
+                        <td class="border border-primary">
+                                                    </td>
+                        <td class="border border-primary">
+                                                        0.00
+                                                    </td>
+                    </tr>
+                                                        </table>
+            </div>
+        </div>
+        
+    </div>
+              <p style="color:red;">* ITC HS Code of the Commodity is either dropped or re-allocated and the unit of the commodity may be changed from April 2026.</p>
+         <!-- Modal -->
+<div class="modal fade" id="exampleModal" tabindex="-1" aria-labelledby="exampleModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h1 class="modal-title fs-5" id="exampleModalLabel">HS Code Search</h1>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+       
+            <div class="row" >
+                <div class="col-md-5">
+                    <label>HS Code:</label>
+                    <input type="text" id="hscode_value" class="form-control" name="hscode_value" placeholder="Enter HS Code" onkeydown="return isNumeric(event.keyCode);" onkeyup="keyUP(event.keyCode)" maxlength="8">
+                </div>
+                <div class="col-md-5">
+                    <label>Description:</label>
+                    <input type="text" id="description_value" class="form-control" name="description_value" placeholder="Enter Description">
+                </div>
+                <div class="col-md-2">
+                    <br>                    
+                    <button type="button" id="hscode_fetch"  class="btn btn-primary">Search</button>
+                </div>
+                <p style="color:red;">* ITC HS Code of the Commodity is either dropped or re-allocated and the unit of the commodity may be changed from April 2026.</p>
+                <div id="data"></div>
+
+                
+            </div>
+               
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+        
+      </div>
+    </div>
+  </div>
+</div>
+<meta name="csrf-token" content="hSvDpDqHLnBELnejqNsrOr913MjW5ZbbS4cnlnSF">
+<script type="text/javascript">
+$(document).on('click', '#hscode_fetch', function (e) {
+    e.preventDefault();
+
+    // First get new token
+    $.get('/refresh-csrf', function(res) {
+
+        $.ajax({
+            url: "https://tradestat.commerce.gov.in/meidb/hscode",
+            type: "POST",
+            headers: {
+                'X-CSRF-TOKEN': res.token
+            },
+            data: {
+                _token: res.token,
+                hscode: $('#hscode_value').val(),
+                description: $('#description_value').val()
+            },
+            success: function(response) {
+
+    $('#data').empty();
+
+    if (!response || response.length === 0) {
+        $('#data').html(
+            '<div class="alert alert-warning">No records found.</div>'
+        );
+        return;
+    }
+
+    let html = '<table class="table table-bordered">';
+    html += '<tr><th>HSCode</th><th>Unit</th><th>Description</th></tr>';
+
+    $.each(response, function(i, item) {
+        html += '<tr>';
+        html += '<td style="text-align:left;">' + item.HSCODE + '</td>';
+        html += '<td style="text-align:left;">' + item.UNIT + '</td>';
+        html += '<td style="text-align:left;">' + item.DESCRiption + '</td>';
+        html += '</tr>';
+    });
+
+    html += '</table>';
+
+    $('#data').html(html);
+}
+        });
+
+    });
+
+});
+//     $(document).ready(function () {
+//     $("#hscode_fetch").click(function () {
+
+//         var hscode = document.getElementById('hscode_value').value;
+//         var description = document.getElementById('description_value').value;
+
+//         if (hscode || description) {
+//             $.ajaxSetup({
+//     headers: {
+//         'X-CSRF-TOKEN': $('meta[name="csrf-token"]').attr('content')
+//     }
+// });
+
+//             $.ajax({
+//                 url: "https://tradestat.commerce.gov.in/meidb/hscode",
+//                 method: 'POST',
+//                 data: {
+                    
+//                     hscode: hscode,
+//                     description: description
+//                 },
+//                 success: function (response) {
+
+//                     $('#data').empty();
+
+//                     let table = $('<table>').addClass('table table-bordered');
+//                     let thead = $('<thead>');
+//                     let tbody = $('<tbody>');
+
+//                     thead.append(
+//                         $('<tr>')
+//                             .append($('<th>').text('HSCode'))
+//                             .append($('<th>').text('Unit'))
+//                             .append($('<th>').text('Description'))
+//                     );
+
+//                     response.forEach(function (item) {
+//                         let row = $('<tr>')
+//                             .append($('<td>').text(item.HSCODE))
+//                             .append($('<td>').text(item.UNIT))
+//                             .append($('<td>').addClass('text-start').text(item.DESCRiption));
+//                         tbody.append(row);
+//                     });
+
+//                     table.append(thead).append(tbody);
+//                     $('#data').append(table);
+//                 },
+//                 error: function (xhr, status, error) {
+//                     console.log("Error: " + error);
+//                 }
+//             });
+//         }
+//     });
+// });
+</script>
+    <script>
+        function isNumeric(keyCode) {
+        if (keyCode == 16)
+            //NumLock = false;
+            isShift = true;
+        return ((keyCode >= 48 && keyCode <= 57) || keyCode == 86 || keyCode == 8 || keyCode == 46 || (keyCode >= 96 && keyCode <= 105))
+    }
+        $(document).ready(function() {
+        $("#excel").click(function() {
+            let table = document.getElementsByTagName("table");
+            console.log(table);
+            debugger;
+            TableToExcel.convert(table[0], {
+                name: `eidb-commoditiyx-countrieswise-import.xlsx`,
+                sheet: {
+                    name: 'eidb-commoditiyx-countrieswise-import'
+                }
+            });
+        });
+    });
+</script>
+
+    <!-- CSS for Table -->
+    <style>
+        td {
+            text-align: right;
+        }
+    </style>
+</div>
+<!-- <div class="container-fluid" style="margin-top: auto; color: black; padding-top: auto; ">
+    <div class="row">
+      <div class="col-md-12">
+        <p>NOTE:  1. India’s Imports/Exports include re-imports/re-exports also.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;2. Imports/Exports from unspecified country includes</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(a) Trade transactions where country of origin/consignment/destination is not specified or invalid country codes have been assigned in the customs declaration.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(b) All re-imported/re-exported transactions which fulfill condition (a) above.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3. Trade figures in US$ from the year 2006-07 onwards are addition of monthly US$ figures.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;4. Where periods are not mentioned with year, it is yearly data from April to March e.g. 2012-2013 means Apr'2012 to Mar'2013</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;5.Quantity is shown as "quantity in thousands" means figures shows in x1000 irrespective of unit name eg.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;1. if figure is 1000 and unit is ton then it means figure is1000000 ton.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;2. if figure is 1000 and unit is kgs then it means figure is1000000 kgs.</p>
+        <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3. if figure is 1000 and unit is mtr then it means figure is1000000 mtr.</p>
+      </div>
+    </div>
+  </div> -->
+    <div class="container-fluid" style=" margin-top: auto; background-color: white; color: white; text-align: center;padding-top: 10px; padding-bottom: 10px;">
+    <div class="row">
+      <div class="col-md-12">        
+<button type="button" class="btn btn-link"   id="liveAlertBtn">Data Source</button>
+<button type="button" class="btn btn-link"  id="Metadata">Metadata on DGCI&S</button>
+<button type="button" class="btn btn-link"  id="Ownership">Ownership</button>
+<button type="button" class="btn btn-link"  id="feedback">feedback</button>
+<button type="button" class="btn btn-link"  id="Disclaimer">Disclaimer</button>
+<button type="button" class="btn btn-link"  id="help">help</button>
+<div id="liveAlertPlaceholder"></div>
+<script type="text/javascript">
+const alertPlaceholder = document.getElementById('liveAlertPlaceholder');
+
+const appendAlert = (message, type) => {
+  // Clear any existing alert before adding a new one
+  alertPlaceholder.innerHTML = '';
+
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = `
+    <div style="background-color: white; color: black;" class="alert alert-${type} alert-dismissible" role="alert">
+      <div style="background-color: white; color: black; text-align: left;">${message}</div>
+      <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+    </div>
+  `;
+
+  alertPlaceholder.append(wrapper);
+};
+
+const alertTrigger = document.getElementById('liveAlertBtn');
+if (alertTrigger) {
+  alertTrigger.addEventListener('click', () => {
+    appendAlert('<b>Data Source:</b>&nbsp;DGCI&S, Kolkata (<a href="https://www.dgciskol.gov.in" target="_blank">https://www.dgciskol.gov.in)</a>', 'success');
+  });
+}
+
+
+const alertMetadata = document.getElementById('Metadata')
+if (alertMetadata) {
+  alertMetadata.addEventListener('click', () => {
+    appendAlert('<b>Metadata on DGCI&S:</b>&nbsp;(<a href="https://www.dgciskol.gov.in/writereaddata/Downloads/20251010175904NMDS.pdf" target="_blank">https://www.dgciskol.gov.in/writereaddata/Downloads/20251010175904NMDS.pdf </a>)', 'success')
+  })
+}
+const alertOwnership = document.getElementById('Ownership')
+if (alertOwnership) {
+  alertOwnership.addEventListener('click', () => {
+    appendAlert('<b>Ownership :</b> Website belongs to Department of Commerce. Designed ,Developed & Hosted by National Informatics Centre', 'success')
+  })
+}
+const alertfeedback = document.getElementById('feedback')
+if (alertfeedback) {
+  alertfeedback.addEventListener('click', () => {
+    appendAlert('<b>Feedback/Suggestions:</b> itcell-doc[at]gov[dot]in', 'success')
+  })
+}
+
+const alertDisclaimer = document.getElementById('Disclaimer')
+if (alertDisclaimer) {
+  alertDisclaimer.addEventListener('click', () => {
+    appendAlert('<b>Disclaimer:</b> The data refrenced in the system do not have any legal sanctity and is for general refrence only. The user may like to verify official publications for DGCI&S, Kolkata for any further refrence', 'success')
+  })
+}
+
+const alerthelp = document.getElementById('help')
+const note = `1. Following are clarifications for ITC HS Code and UNIT of commodities:<br>
+(a) ITC HS Code of the Commodity is from latest HS Code Directory provided by DGCIS Kolkata on April 2024.<br>
+(b) The UNIT of the commodity may be changed from April 2024 onward (e.g. If the unit of a commodity is KGS in April 2024, it might be TON before April 2024)<br>
+(c) Unit of commodity is available only at 8 digit level.<br>
+(d) The old HS Code may be either dropped or re-allocated.<br>
+(e) Commodity Description prefixed with * represents that the commodity is dropped from HS Code Directory from April 2024 onwards.<br><br>
+
+2. India’s Imports/Exports include re-imports/re-exports also.<br><br>
+
+3. Imports/Exports from unspecified country includes:<br>
+(a) Trade transactions where country of origin/consignment/destination is not specified or invalid country codes have been assigned in the customs declaration.<br>
+(b) All re-imported/re-exported transactions which fulfill condition (a) above.<br><br>
+
+4. Search Specific Commodity: Click on Search link<br><br>
+
+5. Search on HS Code:<br>
+(a) For Searching all HS Code and Commodities under a 2 digit code, enter desired 2 digit code and click Submit button.<br>
+(b) For Searching all HS Code and Commodities under a 4 digit code, enter desired 4 digit code and click Submit button.<br>
+(c) For Searching all HS Code and Commodities under a 6 digit code, enter desired 6 digit code and click Submit button.<br><br>
+
+6. Search on Description: For searching any commodity, enter a string (3 or more characters) in the description field and click the Submit button.
+All commodities with their HS Code which contain the given string in their description will be displayed.<br><br>
+
+7. Where Periods are not mentioned with Year, it is yearly data from April to March e.g 2024–2025 means Apr-2024 to Mar-2025.<br><br>
+
+8. If current data is partial (i.e. quarterly) then %Growth is not available.`;
+if (alerthelp) {
+  alerthelp.addEventListener('click', () => {
+    appendAlert(note, 'success')
+  })
+}
+</script>
+      </div>
+      
+    </div>
+  </div>
+
+  <!-- <div class="container-fluid" style="margin-top: auto; background-color:#6e0d38bd; color: white; text-align: center;  font-weight: bold; padding-top: 10px; padding-bottom: 10px;">
+    <div class="row">
+
+      <div class="col-md-4">Data Source : DGCI&S, Kolkata(https://www.dgciskol.gov.in)</div>
+      <div class="col-md-4"><p>Ownership Information: Website belongs to Department of Commerce.<br>
+    Designed ,Developed & Hosted by<br>
+    National Informatics Centre<br>
+    Suggestions/Feedback: itcell-doc[at]gov[dot]in</p></div>
+    <div class="col-md-4"><a style="color: white;" href="https://tradestat.commerce.gov.in/eidb/help">Help</a></div>
+    <div class="col-md-12">Disclaimer:
+The data refrenced in the system do not have any legal sanctity and is for general refrence only.
+The user may like to verify official publications for DGCI&S, Kolkata for any further refrence</div>
+    </div>
+  </div> -->
+  
+  
+</body>
+
+</html>

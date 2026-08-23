@@ -182,12 +182,51 @@ not what the form actually submits — the real field differs by page (`Eidb_hsc
 `searchTerm`, all verified separately). A scraper built against the visible label instead of the real
 submitted field name would have silently returned the wrong page's default content, not an obvious error.
 
-**Left open, not yet resolved**: whether a "one country, all commodities at 8-digit level" report exists
-that would let one request per (country, period) cover every tracked HS8 code via local filtering, instead
-of paying the per-country cost once per tracked code. Flagged as the next concrete thing to check before
-writing `app/pipeline/dgcis.py`'s real request loop — not guessed here.
+**Resolved, positively**: `commodityx_countries_wise_import`/`_export` (annual only — confirmed no `meidb`
+sibling exists, `404`) returns a full **5-year annual series per (country, HS8) in one call**, not one year
+— real POST for HS `12079100` x Turkey returned FY2020-21 through FY2024-25 side by side, plus the reported
+unit ("KGS") in the response header. This revises the real request volume down to **~250 requests total
+per tracked HS8 code** for the full annual window (one per partner country), not ~250 per period.
+
+The apparent "monthly needs per-country too" tension resolved cleanly on closer reading of what each report
+section actually requires: the annual "by partner" series and D15's month-wise *trend* section were never
+meant to share one partner-broken-down monthly table. DGCIS's two real report types map directly onto the
+two real sections needed — annual/per-partner and monthly/national-total — with no gap. `docs/PLAN.md` §1/§7
+updated accordingly; `raw_dgcis_monthly`'s `partner_country` will use the same `'ALL_PARTNERS'` sentinel
+`analytics_mismatch_checks` already established for exactly this "no partner dimension in this source"
+case.
 
 **Verification performed**: real GET+POST round trips against the live site for `eidb/commodity_wise_import`,
 `meidb/commoditywise_import`, `meidb/country_wise_import`, `eidb/commodityx_countries_wise_export/import`,
-`meidb/country_wise_all_commodities_export/import`, each with a real captured CSRF token/session cookie and
-real form field values, response tables inspected directly (not assumed from field/report names).
+`meidb/country_wise_all_commodities_export/import`, `meidb/principal_commodity_wise_all_HSCode_export`,
+`meidb/country_wise_principal_commoditywiseall_hscode_export`, each with a real captured CSRF token/session
+cookie and real form field values, response tables inspected directly (not assumed from field/report
+names). The winning report's real response was captured to disk as this repo's first golden DGCIS fixture.
+
+## Build sequence item 4, continued: DGCIS client + parser (`app/pipeline/dgcis.py`)
+
+**Files**: `app/pipeline/dgcis.py` (`DgcisClient` — the real GET-token/POST-with-419-retry mechanics;
+`parse_annual_country_response` — parses `commodityx_countries_wise_import`/`_export`'s real table
+structure into a `DgcisAnnualRecord`), `tests/fixtures/dgcis/poppy_seed_turkey_import_annual.html` (the
+first golden DGCIS fixture, byte-for-byte, per this project's Testing standard), `tests/unit/test_dgcis_parser.py`,
+`tests/unit/test_dgcis_client.py` (9 new tests). New deps: `beautifulsoup4`, `lxml` — real HTML parsing,
+not regex, given the site's structure (verified: mypy accepts bs4 without needing extra stub configuration).
+
+**A real bug caught by testing the parser against the real fixture, not by inspection**: the response's own
+context header row ("Country: TURKEY ... Values in ₹ Crore") contains the substring "Values in" in its own
+trailer text — a naive "find the row whose text contains 'Values in ₹ Crore'" search matched that header
+row instead of the actual data row two rows later, silently returning an empty `values_by_year`. Fixed by
+matching only the real data row's own label cell (`td[1]`, after the S.No. column) rather than searching
+the row's full concatenated text — verified by re-running against the fixture and getting the real,
+independently-known values (`4.91, 0.00, 424.66, 0.00, 0.00`) instead of `{}`. The same header-row trailer
+text was also bleeding into the parsed `report_date` field for the same underlying reason; fixed with the
+same boundary-marker approach already used for the other header labels.
+
+**Deliberately not yet built** (next unit, not this one): the ~250-country loop, rate limiting/backoff
+sized to that real volume, normalization into `raw_dgcis_monthly`/`ref_hs6_hs8_crosswalk`
+/`ref_country_crosswalk`, and the monthly national-total path (`meidb/commoditywise_import`) for D15.
+
+**Verification performed**: `parse_annual_country_response` run directly against the real fixture and
+manually cross-checked field-by-field against the known-real values from the live investigation (country,
+HS8, description, unit, report date, and all 5 years' figures) before writing the formal pytest tests.
+`uv run pytest -q`: 386 passed. `mypy`/`ruff`/`black`: clean.

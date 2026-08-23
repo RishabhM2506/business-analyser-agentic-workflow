@@ -105,18 +105,39 @@ finding that changes the ingestion design:**
   - `meidb/country_wise_all_commodities_export/import`: same pattern — its country field
     (`cwcexallcount`, 252 options) also has no "all" choice.
   - **Conclusion**: getting "HS8 code X, broken down by every partner country" requires looping over
-    India's ~250 real trading-partner country codes (a bounded, enumerable, already-captured list) per
-    (HS8, period) — not the single clean call originally hoped for. This is a real, structural fact about
-    this government portal, not a scraper design shortcut to fix later. **Ingestion job design consequence
-    (§7)**: the DGCIS job's request volume is ~250× a naive per-code estimate, and needs its own
-    rate-limit/backoff design proportional to that, not assumed free like a single well-batched API call.
-  - **Not yet checked, the most promising remaining lead**: whether requesting one country with "all
-    commodities at 8-digit level" (rather than one specific HS code) returns every commodity for that
-    country in a single response — if so, one request per (country, period) could cover *every* tracked
-    HS8 code at once via local filtering, amortizing cost across the whole tracked set instead of
-    multiplying by it. `country_wise_import` (checked) has no commodity-level selector at all, so this
-    needs a still-unverified report page, flagged for the next work session on this item rather than
-    guessed here.
+    India's ~250 real trading-partner country codes (a bounded, enumerable, already-captured list, real
+    codes verified: e.g. Turkey=409) — not the single clean call originally hoped for. This is a real,
+    structural fact about this government portal, not a scraper design shortcut to fix later.
+  - **Good news, verified after closing the "no cross-tab" question**: `commodityx_countries_wise_import`
+    (real fields verified: `searchTerm`=HS8 code, `ContEidbi`=country code, `ContEidbyi`=year,
+    `ReportEidbi`=value-type) returns a **5-year annual time series in one response**, not one year — a
+    real POST for HS `12079100` x Turkey returned FY2020-21 through FY2024-25 side by side in a single
+    table, plus the reported unit ("KGS") directly in the response header (feeds D10's unit-consistency
+    check for free). This meaningfully revises the volume estimate down: **~250 requests total per tracked
+    HS8 code** (one per country, each yielding 5 years of annual data), not ~250 *per period*. **Ingestion
+    job design consequence (§7)**: still real, non-trivial volume for a portal with no documented rate
+    limit — needs its own rate-limit/backoff design — but far more tractable than initially feared, and an
+    annual refresh (not monthly) can cover the full window in one pass per country per tracked code.
+  - Real data sanity check: Turkey/poppy-seed values across the 5 years were `4.91, 0.00, 424.66, 0.00,
+    0.00` (₹ Crore) — a genuinely volatile, non-monotonic real pattern, consistent with India's actual,
+    real on-again/off-again restrictions on Turkish poppy-seed imports over narcotic-content compliance
+    (a real regulatory story, not scraper noise) — exactly the kind of pattern D12's regulatory-note field
+    exists to explain.
+  - **Resolved, and cleanly**: checked whether `meidb` has a `commodityx_countries_wise_import` sibling —
+    it does not (`404`, confirmed live). **DGCIS's per-partner-country breakdown is only available at
+    annual granularity; monthly data is only available as a national total (no country dimension).** Read
+    again against what the two report sections actually need (not what `raw_dgcis_monthly`'s schema
+    assumed): the canonical scenario's "annual import series... by partner" section and D15's "current-year
+    month-wise" section were never meant to share one partner-broken-down monthly table — D15 only asks for
+    a month-by-month *trend*, which is exactly what the national-total monthly report already is. The two
+    real DGCIS report types map cleanly onto the two real report sections:
+    - `commodityx_countries_wise_import`/`_export` (annual, per-partner, 5-year batches) → the annual,
+      by-partner series (§12/D14).
+    - `commoditywise_import` (monthly, national total only) → D15's month-wise section.
+    `raw_dgcis_monthly`'s `partner_country` column needs one addition to reflect this: a sentinel value
+    (`'ALL_PARTNERS'`, matching the sentinel already used in `analytics_mismatch_checks`, §4) for rows
+    sourced from the monthly national-total report, since that source genuinely has no partner dimension to
+    record — not a gap in what was scraped, a property of what DGCIS itself publishes at that granularity.
 - **Coverage is stated as Indian *fiscal* years ("2017-2018 to 2025-2026"), not calendar years** — the
   prompt's "Jan 2018 onward" is a simplification; FY2017-18 starts April 2017. `meidb`'s year dropdowns
   (verified live) actually start at 2018 (FY2018-19), one year later than the homepage's stated coverage —
@@ -695,12 +716,15 @@ through USD, per D8's explicit `BLOCKER`).
 | Agmarknet | Daily | Upsert on `(price_date, commodity, market)` | Same dead-letter pattern; **blocked on a real API key (§1)** |
 
 **DGCIS's real request volume, per §1's live findings**: no report returns a commodity×country cross-tab
-in one call — the job loops over India's ~250 real partner-country codes per (tracked HS8, period), unless
-the still-unverified "one country, all commodities at 8-digit level" lead (§1) pans out and lets one
-request per (country, period) cover every tracked code via local filtering. Either way, this is materially
-more requests than a single well-batched API call (the Comtrade mirror's D5 pattern) — the DGCIS job needs
-its own rate-limit/backoff design sized to this real volume (a token-bucket limiter + the same fixed-
-schedule-retry idea as D6, tuned empirically against the live site's actual tolerance, not assumed free).
+in one call — the annual job loops over India's ~250 real partner-country codes per tracked HS8 code, via
+`commodityx_countries_wise_import`/`_export` (real, verified fields:
+`searchTerm`/`ContEidbi`/`ContEidbyi`/`ReportEidbi`). Each of those ~250 requests returns a full 5-year
+annual series in one response (verified live), so the annual refresh is **~250 requests per tracked HS8
+code, not per period** — materially more tractable than first feared, though still real, non-trivial
+volume for a portal with no documented rate limit, needing its own rate-limit/backoff design (a
+token-bucket limiter + the same fixed-schedule-retry idea as D6, tuned empirically against the live site's
+actual tolerance, not assumed free). The monthly refresh (D15's current-year section) still needs its own
+batching-behavior verification before assuming the same generous multi-period-per-call pattern.
 
 Every job proves idempotency with a "run twice, assert identical row count and content" test (§10).
 
