@@ -340,6 +340,12 @@ CREATE TABLE ref_hs_revision_notes (
 );
 
 -- ── Raw layer: immutable, append-only, mirrors source shape ──────────────
+-- [2026-08-23, corrected via real Step 3 investigation] DGCIS genuinely
+-- publishes two different shapes (§1/§7) — this table is now specifically
+-- for the MONTHLY, national-total-only report (meidb/commoditywise_import,
+-- not yet built); partner_country here is always the 'ALL_PARTNERS'
+-- sentinel (that source has no partner dimension to record). The
+-- per-partner ANNUAL data lives in raw_dgcis_annual, below.
 CREATE TABLE raw_dgcis_monthly (
   id               BIGSERIAL PRIMARY KEY,
   scraped_at       TIMESTAMPTZ NOT NULL,
@@ -347,12 +353,32 @@ CREATE TABLE raw_dgcis_monthly (
   calendar_month   DATE NOT NULL,           -- first-of-month, derived from fiscal_year + month label
   hs8              TEXT NOT NULL,
   flow             TEXT NOT NULL CHECK (flow IN ('import','export')),
-  partner_country  TEXT NOT NULL,           -- DGCIS's own country name string, not yet normalized
+  partner_country  TEXT NOT NULL,           -- 'ALL_PARTNERS' for this source (see note above)
   value_inr_paise  BIGINT,                  -- NULL if the source cell itself was blank/dash
   quantity         NUMERIC(18,3),
   unit             TEXT,
   raw_payload      JSONB NOT NULL,          -- full scraped row, for replay/debugging
   UNIQUE (fiscal_year, calendar_month, hs8, flow, partner_country)
+);
+
+-- Mirrors app.pipeline.dgcis.DgcisAnnualRecord exactly — one row per
+-- (fiscal_year_label, hs8, flow, partner_country), real per-partner data
+-- from commodityx_countries_wise_import/_export. No quantity column: this
+-- report only ever returns value, never quantity (verified live) —
+-- QTY_MISSING is the correct status for every row from this source, not
+-- an ingestion gap.
+CREATE TABLE raw_dgcis_annual (
+  id                 BIGSERIAL PRIMARY KEY,
+  scraped_at         TIMESTAMPTZ NOT NULL,
+  fiscal_year_label  TEXT NOT NULL,          -- DGCIS's own label verbatim, e.g. "2020 - 2021"
+  hs8                TEXT NOT NULL,
+  flow               TEXT NOT NULL CHECK (flow IN ('import','export')),
+  partner_country    TEXT NOT NULL,          -- DGCIS's own country name string, not yet normalized
+  description        TEXT,
+  unit               TEXT,
+  value_inr_paise    BIGINT,                 -- NULL if the source cell itself was blank/unparseable
+  raw_payload        JSONB NOT NULL,
+  UNIQUE (fiscal_year_label, hs8, flow, partner_country)
 );
 
 CREATE TABLE raw_comtrade_records (

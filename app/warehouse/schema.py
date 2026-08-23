@@ -172,6 +172,15 @@ ref_hs_revision_notes = Table(
 
 # ── Raw layer: immutable, append-only, mirrors source shape ─────────────
 
+# [2026-08-23 revision, found via real Step 3 investigation, docs/PLAN.md
+# §1/§7] DGCIS genuinely publishes two different shapes, not one: an
+# ANNUAL report broken down by partner country (raw_dgcis_annual, below —
+# app/pipeline/dgcis.py's commodityx_countries_wise_import/_export), and a
+# MONTHLY report with no partner dimension at all (this table,
+# meidb/commoditywise_import — not yet built). partner_country here will
+# use the 'ALL_PARTNERS' sentinel already established in
+# analytics_mismatch_checks, since that source structurally has none to
+# record — not a scraping gap.
 raw_dgcis_monthly = Table(
     "raw_dgcis_monthly",
     metadata,
@@ -194,6 +203,33 @@ raw_dgcis_monthly = Table(
         "flow",
         "partner_country",
         name="uq_raw_dgcis_monthly",
+    ),
+)
+
+# [2026-08-23, new] Mirrors commodityx_countries_wise_import/_export's real
+# shape exactly (app/pipeline/dgcis.py's DgcisAnnualRecord): one row per
+# (fiscal_year, hs8, flow, partner_country) — DGCIS's own fiscal-year
+# label stored verbatim (e.g. "2020 - 2021"), not yet reframed to a
+# calendar month/year (that happens at the normalized layer, D7). No
+# `quantity` column: this report only ever returns value, never quantity
+# (verified live — QTY_MISSING is the correct status for every row from
+# this source, not an omission).
+raw_dgcis_annual = Table(
+    "raw_dgcis_annual",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("scraped_at", DateTime(timezone=True), nullable=False),
+    Column("fiscal_year_label", Text, nullable=False),
+    Column("hs8", Text, nullable=False),
+    Column("flow", Text, nullable=False),
+    Column("partner_country", Text, nullable=False),
+    Column("description", Text, nullable=True),
+    Column("unit", Text, nullable=True),
+    Column("value_inr_paise", BigInteger, nullable=True),
+    Column("raw_payload", JSONB, nullable=False),
+    CheckConstraint("flow IN ('import','export')", name="ck_raw_dgcis_annual_flow"),
+    UniqueConstraint(
+        "fiscal_year_label", "hs8", "flow", "partner_country", name="uq_raw_dgcis_annual"
     ),
 )
 
@@ -477,6 +513,7 @@ __all__ = [
     "raw_agmarknet_prices",
     "raw_baci_records",
     "raw_comtrade_records",
+    "raw_dgcis_annual",
     "raw_dgcis_monthly",
     "ref_country_crosswalk",
     "ref_duty_component_conflicts",

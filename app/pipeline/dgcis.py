@@ -31,19 +31,42 @@ import/export respectively), `ContEidbyi`/`ContEidbey` (year, e.g. "2024"
 for FY2024-25), `ReportEidbi`/`ReportEidbe` (`"1"` = ₹ Crore, `"2"` =
 US $ Million).
 
-**Not yet built**: the ~250-country loop, rate limiting, normalization
-into `raw_dgcis_monthly`/`ref_hs6_hs8_crosswalk`, and the monthly
-national-total path (`meidb/commoditywise_import`) for D15. This module
-is the client + parser slice; the loop/normalizer is the next unit.
+`fetch_all_countries_annual` loops over every country in
+`data/dgcis-country-codes.csv` (251 real codes, captured live 2026-08-23 —
+`get_dgcis_countries`, same `lru_cache`d CSV-loading pattern as
+`app.knowledge.provider._load_taxonomy`) for one (hs8, flow, year),
+pacing requests with a real delay — this portal has no documented rate
+limit, so `_DEFAULT_DELAY_SECONDS` is a conservative, unverified starting
+point (flagged, not empirically tuned, matching this project's honesty
+convention for other untuned thresholds). `upsert_annual_records` writes
+parsed records into `raw_dgcis_annual` (`docs/PLAN.md` §4).
+
+**Not yet built**: the monthly national-total path
+(`meidb/commoditywise_import`) for D15, and `ref_hs6_hs8_crosswalk`
+population (derived from these same responses — the crosswalk needs
+`hs6`, which requires a real taxonomy join not yet wired in here).
 """
 
 from __future__ import annotations
 
+import asyncio
+import csv
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
+from pathlib import Path
 
 import httpx
+import structlog
 from bs4 import BeautifulSoup, Tag
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from app.warehouse.schema import raw_dgcis_annual
+
+logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 
 BASE_URL = "https://tradestat.commerce.gov.in"
 ANNUAL_IMPORT_PATH = "/eidb/commodityx_countries_wise_import"
@@ -51,6 +74,12 @@ ANNUAL_EXPORT_PATH = "/eidb/commodityx_countries_wise_export"
 
 _TOKEN_FIELD = "_token"
 _SESSION_EXPIRED_STATUS = 419
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_COUNTRY_CODES_PATH = "data/dgcis-country-codes.csv"
+# No documented rate limit on this portal - conservative and unverified,
+# flagged for empirical tuning once a real ~250-request run has been
+# observed for real throttling/blocking behavior.
+_DEFAULT_DELAY_SECONDS = 1.0
 
 
 class DgcisRequestError(Exception):
@@ -237,3 +266,160 @@ class DgcisClient:
             return response.text
 
         raise DgcisRequestError(f"POST {path}: session expired twice in a row")
+
+
+@dataclass(frozen=True)
+class DgcisCountry:
+    """One row of the checked-in DGCIS country-code reference
+    (`data/dgcis-country-codes.csv`) — DGCIS's own code/name pair, real,
+    captured live 2026-08-23. Not yet cross-walked to a UN M49 code
+    (`ref_country_crosswalk`, `docs/PLAN.md` §4) - that only matters at the
+    normalized layer; the raw layer stores DGCIS's own identity verbatim
+    (D7)."""
+
+    code: str
+    name: str
+
+
+def _resolve_path(csv_path: str) -> Path:
+    path = Path(csv_path)
+    return path if path.is_absolute() else _REPO_ROOT / path
+
+
+@lru_cache(maxsize=2)
+def _load_countries(resolved_path: Path) -> list[DgcisCountry]:
+    with resolved_path.open(encoding="utf-8", newline="") as fh:
+        return [
+            DgcisCountry(code=row["dgcis_country_code"], name=row["dgcis_country_name"])
+            for row in csv.DictReader(fh)
+        ]
+
+
+def get_dgcis_countries(*, path: str = _DEFAULT_COUNTRY_CODES_PATH) -> list[DgcisCountry]:
+    """Every real DGCIS country code/name pair from the checked-in
+    reference CSV — matches `app.knowledge.provider.get_hs6_taxonomy_entries`'s
+    exact `lru_cache`d-loader pattern."""
+    return _load_countries(_resolve_path(path))
+
+
+@dataclass(frozen=True)
+class DgcisFetchFailure:
+    """One country's fetch attempt failed - the caller decides whether to
+    dead-letter it; this module never silently drops a failure."""
+
+    country: DgcisCountry
+    error: str
+
+
+async def fetch_all_countries_annual(
+    client: DgcisClient,
+    *,
+    path: str,
+    hs8: str,
+    year: str,
+    countries: Iterable[DgcisCountry] | None = None,
+    delay_seconds: float = _DEFAULT_DELAY_SECONDS,
+) -> AsyncIterator[DgcisAnnualRecord | DgcisFetchFailure]:
+    """Loop over every tracked country for one (hs8, flow, year), pacing
+    requests with `delay_seconds` between them. Yields a `DgcisAnnualRecord`
+    per country that returned real data, or a `DgcisFetchFailure` for one
+    that didn't — never raises for a single country's failure (that would
+    abort the whole ~250-country run over one bad response), matching
+    `docs/PLAN.md` §7's "job continues to next country... rather than
+    aborting the batch" contract. A response with no matching table
+    (`parse_annual_country_response` returns `None`) is *not* treated as a
+    failure — it's a country DGCIS genuinely has nothing to report for,
+    logged but not dead-lettered (the "no data" response shape is still
+    unverified live, `docs/PLAN.md` §1 - flagged, not guessed)."""
+    country_list = list(countries) if countries is not None else get_dgcis_countries()
+    for index, country in enumerate(country_list):
+        if index > 0:
+            await asyncio.sleep(delay_seconds)
+        try:
+            html = await client.fetch_annual(
+                path=path, hs8=hs8, country_code=country.code, year=year
+            )
+        except DgcisRequestError as exc:
+            logger.warning(
+                "dgcis.annual_fetch_failed", country=country.name, hs8=hs8, error=str(exc)
+            )
+            yield DgcisFetchFailure(country=country, error=str(exc))
+            continue
+
+        record = parse_annual_country_response(html)
+        if record is None:
+            logger.info("dgcis.annual_no_table_in_response", country=country.name, hs8=hs8)
+            continue
+        yield record
+
+
+def _row_from_record(
+    record: DgcisAnnualRecord, *, flow: str, scraped_at: datetime
+) -> dict[str, object]:
+    return {
+        "scraped_at": scraped_at,
+        "fiscal_year_label": None,  # set per-year by the caller, see upsert_annual_records
+        "hs8": record.hs8,
+        "flow": flow,
+        "partner_country": record.country,
+        "description": record.description,
+        "unit": record.unit,
+        "value_inr_paise": None,
+        "raw_payload": {
+            "country": record.country,
+            "hs8": record.hs8,
+            "description": record.description,
+            "unit": record.unit,
+            "report_date": record.report_date,
+            "value_type": record.value_type,
+            "values_by_year": {
+                k: (str(v) if v is not None else None) for k, v in record.values_by_year.items()
+            },
+        },
+    }
+
+
+async def upsert_annual_records(
+    engine: AsyncEngine, records: Iterable[DgcisAnnualRecord], *, flow: str
+) -> int:
+    """Bulk-upsert every year in every record's `values_by_year` into
+    `raw_dgcis_annual` — one row per (fiscal_year_label, hs8, flow,
+    partner_country), matching that table's real unique key (`docs/PLAN.md`
+    §4). Re-running with the same records is idempotent by construction
+    (`ON CONFLICT ... DO UPDATE`, keyed on the same real unique constraint
+    the table enforces) - never a second, duplicate row for a re-scraped
+    combination. `value_inr_paise` is stored in **paise**, converted here
+    once from DGCIS's ₹-Crore-denominated figures (1 crore = 10,000,000
+    rupees = 1,000,000,000 paise) - money is never a float (D8): the
+    conversion multiplies the parsed `Decimal` by an exact integer, then
+    rounds to the nearest paisa once, at the boundary into storage.
+    """
+    scraped_at = datetime.now(UTC)
+    rows: list[dict[str, object]] = []
+    for record in records:
+        base = _row_from_record(record, flow=flow, scraped_at=scraped_at)
+        for year_label, value_crore in record.values_by_year.items():
+            row = dict(base)
+            row["fiscal_year_label"] = year_label
+            row["value_inr_paise"] = (
+                int(value_crore * Decimal(1_000_000_000)) if value_crore is not None else None
+            )
+            rows.append(row)
+
+    if not rows:
+        return 0
+
+    async with engine.begin() as conn:
+        stmt = insert(raw_dgcis_annual).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["fiscal_year_label", "hs8", "flow", "partner_country"],
+            set_={
+                "scraped_at": stmt.excluded.scraped_at,
+                "description": stmt.excluded.description,
+                "unit": stmt.excluded.unit,
+                "value_inr_paise": stmt.excluded.value_inr_paise,
+                "raw_payload": stmt.excluded.raw_payload,
+            },
+        )
+        await conn.execute(stmt)
+    return len(rows)

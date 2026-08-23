@@ -230,3 +230,39 @@ sized to that real volume, normalization into `raw_dgcis_monthly`/`ref_hs6_hs8_c
 manually cross-checked field-by-field against the known-real values from the live investigation (country,
 HS8, description, unit, report date, and all 5 years' figures) before writing the formal pytest tests.
 `uv run pytest -q`: 386 passed. `mypy`/`ruff`/`black`: clean.
+
+## Build sequence item 4, continued: country loop + real `raw_dgcis_annual` writer
+
+**Real schema correction, found while designing the writer, not guessed upfront**: the original
+`raw_dgcis_monthly` table conflated two genuinely different DGCIS shapes discovered during the live
+investigation — annual data broken down by partner country, and monthly data with no partner dimension at
+all. Split into two tables: `raw_dgcis_monthly` (kept, now specifically for the not-yet-built monthly
+national-total path, `partner_country` always `'ALL_PARTNERS'`) and a new `raw_dgcis_annual` (mirrors
+`DgcisAnnualRecord` exactly). New migration, verified with the same downgrade/upgrade round-trip discipline
+as every prior schema change — checkpoint tables confirmed untouched.
+
+**Files**: `data/dgcis-country-codes.csv` (new committed reference — all 251 real DGCIS country codes,
+captured live 2026-08-23, same pattern as `data/harmonized-system.csv`), `app/pipeline/dgcis.py` extended
+with `DgcisCountry`/`get_dgcis_countries` (same `lru_cache`d CSV-loader pattern as
+`app.knowledge.provider`), `fetch_all_countries_annual` (the per-country loop — yields a record or a
+`DgcisFetchFailure` per country, one bad country never aborts the batch), `upsert_annual_records` (bulk
+`ON CONFLICT DO UPDATE` into `raw_dgcis_annual`, ₹-Crore-to-paise conversion done once at the storage
+boundary). 7 new tests (mocked-transport loop tests + real-Postgres upsert/idempotency tests).
+
+**Real end-to-end smoke test** (not just unit tests): ran `fetch_all_countries_annual` against 2 real
+countries (Turkey, China) for HS `12079100`, live — Turkey returned the exact same 5-year series already
+captured in the golden fixture (`4.91, 0.00, 424.66, 0.00, 0.00` ₹ crore), China correctly produced no
+record (logged, not treated as a failure) rather than crashing on an empty response. `upsert_annual_records`
+then wrote 5 real rows to the real local Postgres — verified directly via `psql` that the paise conversion
+is exact (`₹424.66cr` → `424,660,000,000` paise) and every column matches. This real data was left in the
+database (not test pollution — a real, correctly-ingested row for a real HS8 code).
+
+**Deliberately not yet built**: the full ~250-country run (only smoke-tested with 2, to avoid hammering the
+live site unnecessarily before the rate-limit design is tuned), `ref_hs6_hs8_crosswalk` population, the
+monthly national-total path for D15, and `ref_country_crosswalk` population (DGCIS's own 251 codes need
+mapping to UN M49 — not required for this raw-layer slice, D7's layering means the crosswalk only matters
+at the normalized layer).
+
+**Verification performed**: `uv run pytest -q`: 393 passed (373 baseline + 20 across this and the prior
+DGCIS unit). `mypy`/`ruff`/`black`: clean. Real live smoke test as described above, with real data verified
+in the database via direct `psql` inspection, not just trusted from application logs.
