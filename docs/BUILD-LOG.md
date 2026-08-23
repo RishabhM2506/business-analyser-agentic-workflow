@@ -900,3 +900,45 @@ export coverage gate passes at `28.78%` `QTY_MISSING` (just under the 30% thresh
 real result, not engineered); export check A shows real gaps across 4 of 5 years (`10.16%`-`61.88%`); check
 B now has 43 real export comparisons (vs. 6 for import) across many genuinely-crosswalked countries.
 `uv run pytest -q`: 502 passed (was 500; +2). `mypy app` (58 files)/`ruff`/`black`: clean.
+
+## `app/pipeline/baci.py` — real BACI (CEPII) bulk-ZIP ingestion, build sequence item 6, live-verified
+
+**Real investigation before building** (per this session's "verify, don't assume" discipline): fetched the
+real, current BACI download page live. Confirmed URLs (`https://www.cepii.fr/DATA_DOWNLOAD/baci/data/BACI_HS{02,07,12,17,22,92,96}_V202601.zip`,
+current vintage `V202601`, released 2026-01-22 — matches `docs/PLAN.md` §1's own earlier-noted "202601"
+guess exactly), real file sizes via `HEAD` (`HS22`=301,386,611 bytes, the smallest/most current revision;
+`HS17`=794,583,540 bytes), and the real internal format via the ZIP's own `Readme.txt` and a live-downloaded
+`country_codes_V202601.csv`: columns `t,i,j,k,v,q` (year, exporter, importer, HS6, value in **thousand
+USD**, quantity in **metric tons**) — and, critically, **India's BACI code is `699`, the same code Comtrade
+uses** — correcting an earlier, unverified guess in `docs/PLAN.md` (that BACI might use a different UN M49
+numeric scheme) before any code was written against it.
+
+**A real, flagged coverage gap, not a bug**: the `HS22`-revision ZIP only contains years **2022-2024** (HS22
+became the active nomenclature that year) — it does not cover 2020-2021, part of this pipeline's canonical
+2020-2024 window. Covering the earlier years would need the larger `HS17` file too, not downloaded in this
+unit — a real, open follow-up, stated explicitly rather than silently narrowing the window.
+
+**Files**: `app/pipeline/baci.py` (`parse_baci_year_csv` — streams a ZIP member directly, never fully
+extracted to disk or loaded whole into memory, since each real year's CSV is ~11 million rows / ~360MB
+uncompressed, confirmed live; `load_baci_zip`; `upsert_baci_records`), `scripts/load_baci_zip.py` (the
+curator-facing load CLI — BACI has no API, so this is a load step only, not a fetcher), 7 unit tests (real
+verified format, the thousand-USD/metric-ton -> whole-USD/kg conversion, the India-involvement filter, the
+blank-value-is-`None`-never-`0` rule extended from D2, the missing-column structural error), 4 integration
+tests (real Postgres, idempotency, distinct-importer rows staying distinct).
+
+**Verification performed**: downloaded the real `BACI_HS22_V202601.zip` (301,386,611 bytes, byte-exact match
+to the live `HEAD` size) and ran the real, checked-in loader against it for HS6 `120791`, years 2022-2024 —
+**150 real India-involving records** parsed and upserted (23.4s to stream all three years' ~33M total rows).
+Spot-checked the very first real row against an independent `awk`-based check of the raw CSV before writing
+any code: China(156)->India(699) 2022, value `23,685,927` USD (`23685.927` thousand USD x 1000, exact),
+quantity `8,047,400` kg (`8047.4` metric tons x 1000, exact) — matches exactly. Re-ran the loader a second
+time to confirm real idempotency (150 written both times, no duplicates). `uv run pytest -q`: 513 passed
+(was 502; +11). `mypy app` (59 files)/`ruff`/`black`: clean.
+
+**Deliberately not done in this unit**: `raw_baci_records` is not yet normalized into `normalized_trade_flows`
+(no `normalize_baci_rows` function exists yet — a third normalizer alongside the DGCIS/Comtrade ones,
+needing real FX conversion since BACI values are USD, matching `normalize_comtrade_rows`'s existing
+pattern) and D9's check C (`docs/PLAN.md` §10: `check_C(year) = (baci_fob_total - dgcis_cif_total) /
+dgcis_cif_total`) is not implemented in `mismatch.py` — both are real, substantial follow-up units in their
+own right, not squeezed into this one to keep the ingestion-vs-normalization-vs-check layering consistent
+with how DGCIS/Comtrade were each built as separate, checkpointed steps.
