@@ -507,3 +507,50 @@ end-to-end report for the canonical scenario — coverage gate, mismatch checks 
 all now real and computable for HS6 120791. Still open before a true end-to-end report: populating
 `QTY_MISSING` in the DGCIS normalizer (a real, flagged gap above), `report/landed_cost.py`'s real duty-rate
 citation (still pending from the user), `report/narrative.py`, and `route/trade_report.py`.
+
+## Follow-up: populate QTY_MISSING in both normalizers, and a serious real duplication bug found while doing it
+
+**Fix 1 (the planned follow-up)**: `normalize.py` gained a shared `_derive_status(value, quantity)` helper
+implementing §5's full value/quantity slice — `NOT_REPORTED` (no value) > `ZERO` (explicit zero value, which
+trivially has no meaningful quantity to be "missing") > `QTY_MISSING` (real nonzero value, no quantity) >
+`OK`. Both `normalize_dgcis_annual_rows` (quantity is always `None` — `raw_dgcis_annual` has no quantity
+column at all) and `normalize_comtrade_rows` (quantity is `raw["net_weight_kg"]`, genuinely nullable in real
+Comtrade responses) now use it, replacing the old two-state `NOT_REPORTED`/`ZERO`/`OK`-only logic.
+
+**Fix 2 (found only by trying to re-run the fix live)**: re-normalizing HS6 120791's real data to pick up
+the new status logic revealed a serious, previously-undiscovered bug: `normalized_trade_flows`' unique
+constraint had no real idempotency guarantee for Comtrade rows specifically. Comtrade is HS6-level only, so
+`hs8` is always `NULL` on every Comtrade-sourced row — and standard SQL treats `NULL` as distinct from
+`NULL` even inside a `UNIQUE` constraint, so `ON CONFLICT` never actually matched two otherwise-identical
+Comtrade rows. Every prior re-run of `normalize_comtrade_rows` had been silently *duplicating* the entire
+Comtrade slice rather than upserting in place — confirmed live: 363 real rows had silently grown to 726
+after one extra normalization run earlier in this session, undetected because no test had ever actually
+called `normalize_comtrade_rows` twice and checked the row count (the DGCIS idempotency test existed;
+its Comtrade counterpart did not — a real, now-closed test-coverage gap, not just a code gap).
+
+**Fix**: `app/warehouse/schema.py`'s `normalized_trade_flows` unique constraint gained
+`postgresql_nulls_not_distinct=True` (Postgres 15+, real Postgres 16.15 confirmed live), making `NULL`
+compare equal to `NULL` for this constraint only — closing the gap without inventing a sentinel non-`NULL`
+`hs8` value that would have meant something false ("this row has an HS8" when it structurally doesn't).
+Migration `971cfa94fae9` (autogenerate correctly detected the constraint change; hand-stripped of the usual
+LangGraph checkpoint-table noise). Verified with a real `alembic upgrade head` / `downgrade -1` / `upgrade
+head` round-trip. The 726 duplicate rows were deleted and Comtrade re-normalized cleanly under the new
+constraint; then verified true idempotency for real by calling `normalize_comtrade_rows` twice in a row and
+confirming the database still held exactly 363 rows both times.
+
+**New regression tests**: `test_derive_status_*` (4, unit), `test_normalize_comtrade_rows_sets_qty_missing_when_value_present_but_no_weight`
+and, critically, `test_normalize_comtrade_rows_is_idempotent` (integration — calls the normalizer twice
+against a real Postgres and asserts the row count doesn't double; this is the exact test that was missing
+and would have caught the bug immediately).
+
+**Real, corrected downstream results** — recomputing `mismatch.py`'s check A/B and `coverage_gate.py`
+against the cleaned, correctly-statused data: check A/B gap percentages are numerically **unchanged** from
+before (the duplicate rows held identical values, so `SELECT`-based reads were never numerically wrong, only
+wasteful) — 2020 check A 1126.65%, check B 40.21%; 2022 check A 50.24%, check B 24.26%, same as previously
+recorded. `coverage_gate.py`'s result **did** change, and meaningfully: `qty_missing_cells=2`,
+`qty_missing_pct=40.0%`, **`gate_passed=False`** (previously the gate showed a misleadingly clean
+`qty_missing_pct=0%`/`gate_passed=True`, an artifact of `QTY_MISSING` never having been populated at all).
+This is the gate working as intended for the first time — refusing to certify HS6 120791's coverage as
+good enough for a `unit_value` metric, which is honestly true: most of DGCIS's real nonzero years for this
+product genuinely have no quantity figure. `uv run pytest -q`: 457 passed (was 440 at the last full-suite
+check; +17 across this fix and the item 8 completion above). `mypy app`/`ruff`/`black`: clean.

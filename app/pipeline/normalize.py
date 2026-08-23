@@ -25,12 +25,17 @@ Two normalizers, one per source built so far:
   right coding scheme (Comtrade's own numeric codes) — no crosswalk
   needed for this source.
 
-Both write `status='OK'` when a real value is present and `'ZERO'` when
-the source explicitly reported a numeric `0` — never conflated (D2) — and
-`'NOT_REPORTED'` when the source cell was genuinely blank/absent. Finer
-status distinctions (`PROVISIONAL`, `QTY_MISSING`, ...) are not yet
-populated by either normalizer — flagged as a real, deliberate gap, not
-guessed at.
+Both derive status via the shared `_derive_status`: `'NOT_REPORTED'` when
+the value cell is genuinely blank/absent, `'ZERO'` when the source
+explicitly reported a numeric `0` — never conflated with `NOT_REPORTED`
+(D2) — `'QTY_MISSING'` when a real nonzero value is present but the
+source has no quantity for that cell (§5's table: "value present,
+quantity null" — true for every `raw_dgcis_annual` row, since that report
+never returns a quantity at all, and true for some real
+`raw_comtrade_records` rows where `net_weight_kg` is null), and `'OK'`
+only when both a real value and a real quantity are present. Finer status
+distinctions (`PROVISIONAL`, ...) are not yet populated by either
+normalizer — flagged as a real, deliberate gap, not guessed at.
 """
 
 from __future__ import annotations
@@ -67,6 +72,23 @@ DGCIS_DATASET_VERSION = "dgcis-annual-v1"
 # them in separate dataset_version buckets keeps both queryable.
 COMTRADE_DATASET_VERSION_REPORTER_ROLE = "comtrade-mirror-reporter-v1"
 COMTRADE_DATASET_VERSION_PARTNER_ROLE = "comtrade-mirror-partner-v1"
+
+
+def _derive_status(*, value: int | None, quantity: Decimal | None) -> str:
+    """§5's status table, the value/quantity slice: `NOT_REPORTED` (no
+    value at all) takes priority over everything else - a genuinely absent
+    cell is never "zero" or "missing quantity". `ZERO` is checked before
+    `QTY_MISSING`: a real zero-value trade flow trivially has no
+    meaningful quantity to be missing, so a null quantity on a zero-value
+    row isn't a data gap - only a real nonzero value with no quantity is
+    (`QTY_MISSING`)."""
+    if value is None:
+        return "NOT_REPORTED"
+    if value == 0:
+        return "ZERO"
+    if quantity is None:
+        return "QTY_MISSING"
+    return "OK"
 
 
 def _dgcis_fiscal_year_to_period_month(fiscal_year_label: str) -> tuple[int, date]:
@@ -124,7 +146,10 @@ async def normalize_dgcis_annual_rows(
     for raw in raw_rows:
         _year, period_month = _dgcis_fiscal_year_to_period_month(raw["fiscal_year_label"])
         value = raw["value_inr_paise"]
-        status = "NOT_REPORTED" if value is None else ("ZERO" if value == 0 else "OK")
+        # raw_dgcis_annual has no quantity column at all - this report
+        # never returns one (verified live, §1) - so quantity is always
+        # None here, meaning every real nonzero-value row is QTY_MISSING.
+        status = _derive_status(value=value, quantity=None)
         normalized_rows.append(
             {
                 "source": "dgcis",
@@ -205,7 +230,7 @@ async def normalize_comtrade_rows(
         value_usd = raw["primary_value_usd"]
         value_original_paise = int(value_usd * 100) if value_usd is not None else None
         value_inr_paise = int(value_usd * rate * 100) if value_usd is not None else None
-        status = "NOT_REPORTED" if value_usd is None else ("ZERO" if value_usd == 0 else "OK")
+        status = _derive_status(value=value_inr_paise, quantity=raw["net_weight_kg"])
         flow = "import" if raw["flow_code"] == "M" else "export"
         # Query 1 (role="reporter") rows have reporter_code=699 (India) and
         # partner_code = the real foreign country (or '0' for the World

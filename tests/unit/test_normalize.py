@@ -9,12 +9,35 @@ vs. `test_comtrade_mirror_upsert.py`).
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
-from app.pipeline.normalize import CountryCrosswalk, _dgcis_fiscal_year_to_period_month
+from app.pipeline.normalize import (
+    CountryCrosswalk,
+    _derive_status,
+    _dgcis_fiscal_year_to_period_month,
+)
 
 pytestmark = pytest.mark.unit
+
+
+def test_derive_status_not_reported_when_value_is_none() -> None:
+    assert _derive_status(value=None, quantity=Decimal("10")) == "NOT_REPORTED"
+
+
+def test_derive_status_zero_takes_priority_over_missing_quantity() -> None:
+    """A real zero-value flow has no meaningful quantity to be missing -
+    ZERO, not QTY_MISSING."""
+    assert _derive_status(value=0, quantity=None) == "ZERO"
+
+
+def test_derive_status_qty_missing_when_value_present_but_quantity_absent() -> None:
+    assert _derive_status(value=1000, quantity=None) == "QTY_MISSING"
+
+
+def test_derive_status_ok_when_both_value_and_quantity_present() -> None:
+    assert _derive_status(value=1000, quantity=Decimal("50")) == "OK"
 
 
 def test_dgcis_fiscal_year_label_parses_the_first_year() -> None:

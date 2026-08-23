@@ -340,6 +340,14 @@ normalized_trade_flows = Table(
     CheckConstraint("calendar IN ('CY','FY')", name="ck_ntf_calendar"),
     CheckConstraint("basis IN ('CIF','FOB')", name="ck_ntf_basis"),
     CheckConstraint("currency IN ('INR','USD')", name="ck_ntf_currency"),
+    # nulls_not_distinct=True: a real bug found live - Comtrade rows
+    # always have hs8=NULL (it's HS6-level only), and standard SQL treats
+    # NULL as distinct from NULL even in a unique constraint, so ON
+    # CONFLICT never matched two otherwise-identical Comtrade rows -
+    # every re-normalization run silently duplicated the entire Comtrade
+    # slice instead of upserting in place. Postgres 15+'s NULLS NOT
+    # DISTINCT makes NULL compare equal to NULL for this constraint only,
+    # closing the gap without inventing a sentinel non-null hs8 value.
     UniqueConstraint(
         "source",
         "hs6",
@@ -349,6 +357,7 @@ normalized_trade_flows = Table(
         "partner_country_code",
         "dataset_version",
         name="uq_normalized_trade_flows",
+        postgresql_nulls_not_distinct=True,
     ),
 )
 Index(

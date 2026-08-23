@@ -114,7 +114,10 @@ async def test_normalize_dgcis_annual_rows_resolves_crosswalk_and_status(
         )
 
     by_year = {r["period_month"].year: r for r in rows}
-    assert by_year[2023]["status"] == "OK"
+    # QTY_MISSING, not OK - raw_dgcis_annual has no quantity column at
+    # all (this report never returns one), so every real nonzero-value
+    # DGCIS row is QTY_MISSING per §5's status table.
+    assert by_year[2023]["status"] == "QTY_MISSING"
     assert by_year[2023]["value_inr_paise"] == 424_660_000_000
     assert by_year[2023]["partner_country_code"] == "792"
     assert by_year[2023]["calendar"] == "FY"
@@ -231,6 +234,91 @@ async def test_normalize_comtrade_rows_converts_fx_and_skips_unresolved_years(
     assert row["value_original_currency_paise"] == 100_000
     assert row["value_inr_paise"] == 8_300_000
     assert row["status"] == "OK"
+
+
+async def test_normalize_comtrade_rows_is_idempotent(warehouse_engine: AsyncEngine) -> None:
+    """Regression test for a real bug found live: normalized_trade_flows'
+    unique constraint didn't have NULLS NOT DISTINCT, and every Comtrade
+    row has hs8=NULL (Comtrade is HS6-level only) - standard SQL treats
+    NULL as distinct from NULL even in a unique constraint, so ON
+    CONFLICT never matched two otherwise-identical Comtrade rows and every
+    re-run silently duplicated the whole slice (confirmed live: 363 real
+    rows had grown to 726 after one extra run, undetected until this test
+    was written). Fixed with a migration adding
+    postgresql_nulls_not_distinct=True to the constraint."""
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(raw_comtrade_records).values(
+                fetched_at=datetime.now(UTC),
+                period=2023,
+                reporter_code="699",
+                partner_code="792",
+                flow_code="M",
+                cmd_code=_TEST_HS6,
+                primary_value_usd=Decimal("1000.00"),
+                net_weight_kg=Decimal("50.000"),
+                is_reported=True,
+                raw_payload={},
+            )
+        )
+
+    fx_rates = {2023: (Decimal("83.000000"), date(2023, 1, 1))}
+    first = await normalize_comtrade_rows(warehouse_engine, hs6=_TEST_HS6, fx_rates=fx_rates)
+    second = await normalize_comtrade_rows(warehouse_engine, hs6=_TEST_HS6, fx_rates=fx_rates)
+
+    assert first == second == 1
+    async with warehouse_engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    select(normalized_trade_flows).where(normalized_trade_flows.c.hs6 == _TEST_HS6)
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert len(rows) == 1  # not 2 - same real unique key (NULL hs8 included), not a duplicate
+
+
+async def test_normalize_comtrade_rows_sets_qty_missing_when_value_present_but_no_weight(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """§5: 'value present, quantity null' -> QTY_MISSING, not OK - real
+    Comtrade rows can have a value with no net_weight_kg."""
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(raw_comtrade_records).values(
+                fetched_at=datetime.now(UTC),
+                period=2023,
+                reporter_code="699",
+                partner_code="792",
+                flow_code="M",
+                cmd_code=_TEST_HS6,
+                primary_value_usd=Decimal("1000.00"),
+                net_weight_kg=None,
+                is_reported=True,
+                raw_payload={},
+            )
+        )
+
+    await normalize_comtrade_rows(
+        warehouse_engine,
+        hs6=_TEST_HS6,
+        fx_rates={2023: (Decimal("83.000000"), date(2023, 1, 1))},
+    )
+
+    async with warehouse_engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    select(normalized_trade_flows).where(normalized_trade_flows.c.hs6 == _TEST_HS6)
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0]["status"] == "QTY_MISSING"
 
 
 async def test_normalize_comtrade_rows_resolves_partner_country_from_reporter_code(
