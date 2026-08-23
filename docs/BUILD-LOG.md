@@ -1027,3 +1027,51 @@ correctly (March 2022 lands in FY "2021 - 2022", distinct from June/September 20
 MoM/YoY computation from these raw rows, plus D15's "always write all 12 months, including
 `NOT_YET_PUBLISHED` future ones" requirement) — a real, separate follow-up, kept out to preserve the same
 raw-ingestion-then-analytics-writer sequencing already used for DGCIS annual and BACI.
+
+## D15 closed — `analytics_monthly_current_year` writer (`app/report/monthly_current_year.py`)
+
+Reads `raw_dgcis_monthly` directly (never `normalized_trade_flows` — §13 states this section is its own
+analytics table, "written by the DGCIS ingestion job as part of its normal monthly run", not part of the
+D9 mismatch-check pipeline). `compute_monthly_current_year(engine, *, hs6, flow, year)` **always returns
+exactly 12 rows** (Jan-Dec), even for months with no raw row at all — at this read-only layer, a month the
+ingestion job hasn't fetched yet is structurally indistinguishable from a month DGCIS genuinely hasn't
+published, so both correctly read `NOT_YET_PUBLISHED` here (real fetch failures stay tracked separately via
+`dead_letter_ingestion`, never conflated with this status).
+
+`mom_change_pct`/`yoy_same_month_pct` are computed deterministically from `raw_dgcis_monthly` — never
+trusting DGCIS's own displayed "%Growth" figure (D8's "we compute derived numbers ourselves" discipline).
+January's month-over-month comparison correctly reaches into the *prior* year's December row; every
+month's year-over-year comparison reaches into the same month one year prior — both required fetching two
+full years of raw data (`year-1` and `year`), not just the requested year.
+
+A real HS6 with more than one active HS8 line for the same month sums `value_inr_paise` (money is always
+addable) but deliberately leaves `quantity_kg` as `None` (forcing `QTY_MISSING`) rather than summing
+quantities across lines without confirming they share a unit — D10's own concern, not re-litigated here,
+just never silently assumed safe. `status`/`is_provisional` are orthogonal signals: a month can be a real,
+reported `ZERO` while still `is_provisional=True` (an "(F)" Flash-marked zero not yet finalized) —
+confirmed live for March 2022's real `ZERO`/finalized "(R)" row.
+
+The first draft used 3 `type: ignore` comments to satisfy mypy on `dict[str, object]`-derived raw-payload
+values — caught as violating this codebase's standing "never `type: ignore`" convention and refactored:
+`_RawCell` instances are now built eagerly with explicit `assert value is None or isinstance(value, int)` /
+`assert quantity is None or isinstance(quantity, Decimal)` narrowing, and the multi-HS8 value sum uses a
+generator-filtered `sum(v for v in values if v is not None)` — zero `type: ignore`, clean mypy.
+
+**Verification performed**: 18 new tests (11 unit — `_pct_change`/`_status_for_cell` pure-function cases,
+including the zero-denominator/None and orthogonal-status/provisional cases; 7 integration against real
+Postgres — always-12-rows, real MoM delta, the January-crosses-into-prior-December case, real YoY, the
+multi-HS8 sum-value-never-quantity case, upsert idempotency, empty-rows no-op). Live-verified end to end
+against the real `raw_dgcis_monthly` rows already ingested for HS6 `120791`/import/2022 (March/June/
+September, from the prior unit's real DGCIS scrape): `compute_monthly_current_year` reproduced the exact
+stored values (March `ZERO`/`0` paise; June `OK`/`166500000000` paise, matching the site's real
+₹166.50cr; September `OK`/`38120000000` paise, matching ₹381.20cr) with the other 9 months of 2022 all
+correctly `NOT_YET_PUBLISHED` (genuinely un-fetched, not un-published) and all `mom_change_pct`/
+`yoy_same_month_pct` correctly `None` since no adjacent months have raw data yet; `upsert_monthly_current_
+year` wrote and was confirmed via `psql` to have written all 12 rows to `analytics_monthly_current_year`.
+`uv run pytest -q`: 554 passed (was 536; +18). `mypy app` (60 files)/`ruff`/`black`: clean.
+
+**D15 is now fully closed** — this was the last major code-only remaining item across the whole build.
+Everything left is either blocked on the user (real HS 120791 duty-rate/regulatory-note citations,
+Agmarknet's `data.gov.in` API key) or optional/lower-value (the `HS17` BACI file for 2020-2021 coverage; a
+full real 12-month DGCIS monthly run for 2026, the actual current year, now that the analytics writer
+exists to consume it).
