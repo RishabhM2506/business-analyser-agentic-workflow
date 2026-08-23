@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -108,6 +108,18 @@ async def compute_partner_rankings(
 
 
 async def upsert_partner_rankings(engine: AsyncEngine, rankings: list[PartnerRanking]) -> int:
+    """Delete-then-insert per `(hs6, flow, year)`, not a plain
+    `ON CONFLICT` upsert — a real bug found live: when a re-run changes
+    *relative* ranks (e.g. a newly-ingested country outranks the
+    previously-#1 partner), the fresh batch can transiently collide with
+    `ix_apr_rank_where_present` (the partial unique index on `rank`)
+    against a row that's still sitting at its *old* rank value, even
+    though `ON CONFLICT (hs6, flow, year, partner_country_code)` correctly
+    targets the primary key — a plain `ON CONFLICT` clause only suppresses
+    the one named constraint's violations, not a different unique index's.
+    Clearing every row for the affected years first means the fresh batch
+    is inserted into an empty slate, never colliding with stale rank
+    assignments from a prior run."""
     if not rankings:
         return 0
     rows = [
@@ -122,17 +134,18 @@ async def upsert_partner_rankings(engine: AsyncEngine, rankings: list[PartnerRan
         }
         for r in rankings
     ]
+    hs6 = rankings[0].hs6
+    flow = rankings[0].flow
+    years = {r.year for r in rankings}
     async with engine.begin() as conn:
-        stmt = insert(analytics_partner_rankings).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["hs6", "flow", "year", "partner_country_code"],
-            set_={
-                "rank": stmt.excluded.rank,
-                "value_inr_paise": stmt.excluded.value_inr_paise,
-                "status": stmt.excluded.status,
-            },
+        await conn.execute(
+            delete(analytics_partner_rankings).where(
+                analytics_partner_rankings.c.hs6 == hs6,
+                analytics_partner_rankings.c.flow == flow,
+                analytics_partner_rankings.c.year.in_(years),
+            )
         )
-        await conn.execute(stmt)
+        await conn.execute(insert(analytics_partner_rankings).values(rows))
     return len(rows)
 
 

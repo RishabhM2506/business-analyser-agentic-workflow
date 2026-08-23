@@ -783,3 +783,64 @@ rankings/HHI/unit-value precompute, the frozen facts contract, a grounded narrat
 endpoint returning all of it. Still open, not blocking this milestone: real duty-rate/regulatory-note
 citations (pending the user), Agmarknet/BACI ingestion (items 6-7), the D15 monthly section, and the full
 ~250-country DGCIS run.
+
+## Real, full ~250-country DGCIS run for HS6 120791 — the previously-flagged highest-leverage gap, closed
+
+**Rate-limit empirical tuning (open item since the DGCIS build)**: ran a 15-country validation batch first
+at the existing conservative `_DEFAULT_DELAY_SECONDS=1.0` — zero failures, zero throttling/blocking observed,
+~2.7s/country real end-to-end (GET+POST pair, real network latency included). Confirmed safe to proceed to
+the full list.
+
+**Full run**: all 251 tracked countries, real GET+POST pairs against `tradestat.commerce.gov.in`, HS8
+`12079100`, import flow, FY2020-21..2024-25 window (same `year="2024"` ending year as the already-ingested
+Turkey data). Result: **251/251 attempted, 0 failures, 21 real countries with actual trade** (Afghanistan,
+Bosnia-Herzegovina, China, Czechia, France, Germany, Hong Kong, Japan, South Korea, Lithuania, Pakistan,
+Poland, Singapore, Spain, Sri Lanka, Tanzania, Thailand, Turkey, UAE, UK, USA), 105 real rows, 687s total
+(~11.5 min). Failures (0 of them) would have gone to `dead_letter_ingestion` via a direct insert in the
+driver script — the first real write to that table this session, though the full `dead_letter.py` shared
+module (§3's planned file) still doesn't exist as reusable code.
+
+**Real country crosswalk built for all 20 new countries** — each DGCIS name resolved to its real Comtrade
+numeric code by cross-referencing the exact partner-country strings from the database against
+`data/comtrade-partner-areas.csv` (e.g. `CZECH REPUBLIC` -> `203` "Czechia", Comtrade's current official
+name post-2016 rename; `U S A` -> `842`, Comtrade's own real reporting code, not the `840` UN M49 code;
+`KOREA RP` -> `410` "Rep. of Korea", explicitly not `408` "Dem. People's Rep. of Korea"). Inserted via
+`psql`, matching the existing Turkey crosswalk row's precedent. Zero `UNMAPPED` rows remain after
+re-normalizing.
+
+**A real, second bug found live while re-running `rankings.py` against this now-richer dataset**:
+`upsert_partner_rankings`'s plain `ON CONFLICT (hs6, flow, year, partner_country_code) DO UPDATE` raised a
+real `UniqueViolationError` on `ix_apr_rank_where_present` (the partial unique index on `rank`) — a country
+newly outranking the previous #1 (China overtaking Turkey for 2020 once real data existed for both)
+collided with the *old* row still sitting at its stale rank, since `ON CONFLICT` only suppresses violations
+of the one named constraint, not a different unique index. Fixed by deleting every row for the affected
+`(hs6, flow, year)` set before inserting the fresh batch, so the insert never collides with stale rank
+state. New regression test reproduces the exact real shape (a second partner ingested later that outranks
+the first).
+
+**Real, dramatic before/after on every downstream module, now demonstrating genuine national-scope
+fidelity instead of a Turkey-only proxy**:
+- HHI: `1.0` (artificial — one country) -> real `~0.52-0.53` for 2020/2022 (genuinely concentrated but
+  multi-partner).
+- Check A (DGCIS total vs. Comtrade India-self-reported total): 2022's gap tightened from a nonsensical
+  `50.24%` (DGCIS undercounted by omitting 20 real countries) to a real `0.70%` — DGCIS's total, now summed
+  across all 21 tracked partners, and Comtrade's independently-reported World total for the same year are
+  now in close real agreement, a genuine cross-source validation this pipeline exists to produce. 2020's
+  real gap (`359.41%`) and both years' `direction_flip_yoy=True` (`severity=untrustworthy`) are real,
+  unexplained findings — flagged, not investigated further in this unit.
+- Coverage gate: `qty_missing_pct` dropped from the previous unit's honest `40%` (Turkey-only, `gate_passed
+  =False`) to a real `6.67%` (`98/105` cells present across 21 real tracked partners) — **`gate_passed=True`
+  for the first time**, a genuine pass earned by real breadth, not a relaxed threshold.
+- `annual_series`/`hhi_by_year`/`mismatch_checks` in the full facts JSON now show real country names
+  (China, Sri Lanka, Czechia, Lithuania, ...) instead of Turkey alone at every rank.
+
+**Verification performed**: re-ran `normalize_dgcis_annual_rows`, `rankings.compute_partner_rankings`/
+`upsert_partner_rankings`, `mismatch.compute_check_a`/`compute_check_b`, `coverage_gate.evaluate_coverage`,
+and a full `assemble_facts` call for HS6 120791/import/2020-2024 against the real, expanded dataset — all
+real numbers shown above pulled directly from these live runs, not projected. `uv run pytest -q`: 500
+passed (was 499; +1, the rank-reshuffle regression test). `mypy`/`ruff`/`black`: clean.
+
+**Not done in this unit, real remaining gaps**: export flow was not re-run for these 21 countries (import
+only, matching this whole build's established focus); Comtrade partner-role (mirror) data was not fetched
+for the 20 new countries, so `check_B`/`unit_value.py` still only have real partner-role figures for Turkey
+— DGCIS-side breadth improved, Comtrade-side per-partner breadth did not, in this unit.
