@@ -70,20 +70,61 @@ live at `POST /threads/{id}/messages` and `POST /threads/{id}/search`). It does 
   today = expire at end of day IST, one call/day max, fallback to most recent cached value + `FX_STALE` +
   the cached rate's own date on failure.
 
-**DGCIS Tradestat — verified, form-based, no API:**
-- Confirmed: no documented public API; a form-driven HTML report generator
-  (`tradestat.commerce.gov.in`). Report types include commodity-wise (2/4/6/8-digit), country-wise,
-  commodity×country cross-tabs, values in USD/INR/quantity.
+**DGCIS Tradestat — verified live, Step 3 (2026-08-23), full mechanics confirmed and one major structural
+finding that changes the ingestion design:**
+
+- **Real request mechanics, fully verified with live GET+POST round-trips**: a Laravel application.
+  `GET` a report page → parse the CSRF token out of `<input name="_token">` and capture the
+  `Set-Cookie: indiatrade-session=...` (15-minute `Max-Age`, `httponly`, `secure`, `samesite=lax`) →
+  `POST` back to the *same URL* with the token, the session cookie, and the form fields, within that
+  15-minute window. Verified this actually works end to end: a real POST for HS `12079100` (poppy seeds)
+  returned a real table containing "POPPY SEEDS W/N BROKEN" and real figures.
+- **Field names are not standardized across report pages — verified by finding the actual bug live**: the
+  visible "Enter HS Code" text input (`name="hscode_value"`) is **not** the field the form actually
+  submits — it belongs to a separate "Search HSCode" lookup-assist modal. The real field is a different,
+  initially-`disabled` input tied to the "specific commodity" radio button, and its name differs *per
+  report page* (`Eidb_hscodeCwi` on one report, `comval` on another, `searchTerm` on a third — all verified
+  live). Every report page needs its own one-time field-name verification; there is no shared convention
+  to assume.
+- **Two parallel sections exist**: `/eidb/*` (annual figures, fiscal year only — confirming the "coverage
+  is FY not CY" finding below) and `/meidb/*` ("Monthly Export Import Data Bank" — real monthly figures,
+  and its `ddReportYear`/`imddReportYear` select offers **"Financial Year" or "Calendar Year" directly**,
+  verified live with a real Calendar Year request. This resolves the FY/CY ambiguity flagged below: request
+  in Calendar Year mode and DGCIS itself does the FY→CY reframing, no client-side conversion needed.
+- **Major finding — no report returns a commodity×country cross-tab in one call, despite report names
+  suggesting otherwise**: exhaustively checked every plausible candidate live:
+  - `eidb/commodity_wise_import` / `meidb/commoditywise_import` ("commodity-wise"): a **national total**,
+    two-period time comparison (e.g. Jun-2023 vs Jun-2024 + %growth) — no country dimension at all.
+  - `meidb/country_wise_import`: the mirror image — **one country's total across all commodities**, no
+    commodity dimension at all (verified live for Turkey, June 2024: table header is just "Country", one
+    row, no per-commodity breakdown).
+  - `eidb/commodityx_countries_wise_import` (the name that most strongly suggested "one commodity, all
+    countries"): its country field (`ContEidbe`, 251 real country options, verified) is **`required` with
+    no "all countries" option** — this report also returns exactly one country per request, despite the
+    name.
+  - `meidb/country_wise_all_commodities_export/import`: same pattern — its country field
+    (`cwcexallcount`, 252 options) also has no "all" choice.
+  - **Conclusion**: getting "HS8 code X, broken down by every partner country" requires looping over
+    India's ~250 real trading-partner country codes (a bounded, enumerable, already-captured list) per
+    (HS8, period) — not the single clean call originally hoped for. This is a real, structural fact about
+    this government portal, not a scraper design shortcut to fix later. **Ingestion job design consequence
+    (§7)**: the DGCIS job's request volume is ~250× a naive per-code estimate, and needs its own
+    rate-limit/backoff design proportional to that, not assumed free like a single well-batched API call.
+  - **Not yet checked, the most promising remaining lead**: whether requesting one country with "all
+    commodities at 8-digit level" (rather than one specific HS code) returns every commodity for that
+    country in a single response — if so, one request per (country, period) could cover *every* tracked
+    HS8 code at once via local filtering, amortizing cost across the whole tracked set instead of
+    multiplying by it. `country_wise_import` (checked) has no commodity-level selector at all, so this
+    needs a still-unverified report page, flagged for the next work session on this item rather than
+    guessed here.
 - **Coverage is stated as Indian *fiscal* years ("2017-2018 to 2025-2026"), not calendar years** — the
-  prompt's "Jan 2018 onward" is a simplification. FY2017-18 starts April 2017. The exact first available
-  *calendar* month must be confirmed against a real scrape in Step 3, not assumed as Jan 2018.
-- **Directly confirms D10/CODE_RETIRED is not hypothetical**: the site itself states "ITC HS Code of the
-  Commodity is either dropped or re-allocated and the unit of the commodity may be changed from April
-  2026" — i.e. an HS-line/unit revision is already in effect as of this plan's date. The scraper and
-  normalizer must handle a mid-series code change from day one, not as a later hardening pass.
-- Scrape mechanics (exact form fields, session/cookie handling, pagination, response format — HTML table
-  vs. downloadable CSV/XLS) are **not yet verified against the live form flow** and must be a first Step 3
-  task, recorded in `BUILD-LOG.md` — not guessed here.
+  prompt's "Jan 2018 onward" is a simplification; FY2017-18 starts April 2017. `meidb`'s year dropdowns
+  (verified live) actually start at 2018 (FY2018-19), one year later than the homepage's stated coverage —
+  worth reconciling when the real ingestion job is built, not assumed either way.
+- **Directly confirms D10/CODE_RETIRED is not hypothetical**: the live `eidb/commodity_wise_import`
+  response itself renders the footnote "ITC HS Code of the Commodity is either dropped or re-allocated and
+  the unit of the commodity may be changed from April 2026" — confirmed present in real rendered output,
+  not just marketing copy.
 
 **BACI (CEPII) — verified:**
 - Direct ZIP download, no registration/login. Most recent vintage (`202601`, released Jan 2026) covers
@@ -647,11 +688,19 @@ through USD, per D8's explicit `BLOCKER`).
 
 | Source | Cadence | Idempotency | Failure handling |
 |---|---|---|---|
-| DGCIS | Monthly (scheduled) | Upsert on `(fiscal_year, calendar_month, hs8, flow, partner_country)` — re-running a month overwrites `raw_dgcis_monthly` for that key, never appends duplicates | Per-request failures → `dead_letter_ingestion`, job continues to next HS8/month rather than aborting the batch |
+| DGCIS | Monthly (scheduled) | Upsert on `(fiscal_year, calendar_month, hs8, flow, partner_country)` — re-running a month overwrites `raw_dgcis_monthly` for that key, never appends duplicates | Per-request failures → `dead_letter_ingestion`, job continues to next country/month rather than aborting the batch |
 | Comtrade mirror | Nightly, tracked HS6 codes only | Upsert on `(period, reporter_code, partner_code, flow_code, cmd_code)` | D6 retry schedule + circuit breaker; exhausted retries → dead-letter, `FETCH_FAILED` cell |
 | BACI | Annual (new vintage detection — check CEPII page for a new vintage id before downloading) | Upsert on `(vintage, year, exporter_code, importer_code, hs6)`; a vintage is immutable once loaded | Download failure → dead-letter, prior vintage stays authoritative until a retry succeeds |
-| Duty table | On file change (`data/duty-rates.csv`, committed reference, loaded at deploy) | Upsert on `(hs8, effective_from)` | Validation failure (malformed row) fails the load loudly, does not partially apply |
+| Duty table | Manual, curator-driven (`scripts/record_duty_rate.py`, §4a) — not an ingestion job at all | N/A — one row inserted per curator action, closing out the previous current row atomically | N/A — CLI validation rejects malformed input before touching the database |
 | Agmarknet | Daily | Upsert on `(price_date, commodity, market)` | Same dead-letter pattern; **blocked on a real API key (§1)** |
+
+**DGCIS's real request volume, per §1's live findings**: no report returns a commodity×country cross-tab
+in one call — the job loops over India's ~250 real partner-country codes per (tracked HS8, period), unless
+the still-unverified "one country, all commodities at 8-digit level" lead (§1) pans out and lets one
+request per (country, period) cover every tracked code via local filtering. Either way, this is materially
+more requests than a single well-batched API call (the Comtrade mirror's D5 pattern) — the DGCIS job needs
+its own rate-limit/backoff design sized to this real volume (a token-bucket limiter + the same fixed-
+schedule-retry idea as D6, tuned empirically against the live site's actual tolerance, not assumed free).
 
 Every job proves idempotency with a "run twice, assert identical row count and content" test (§10).
 

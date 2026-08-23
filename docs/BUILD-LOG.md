@@ -154,3 +154,40 @@ invocation for HS 12079100 needs a real citation from ICEGATE/CBIC, still pendin
 **Next**: build sequence item 4 (`app/pipeline/dgcis.py`) — needs real scrape-mechanics verification against
 the live DGCIS form first (`docs/PLAN.md` §1's flagged unknown), or item 5/6 (Comtrade mirror / BACI) if
 DGCIS's live form turns out to need more investigation than fits in one sitting.
+
+## Build sequence item 4 (in progress): DGCIS scrape-mechanics investigation
+
+Read-only live investigation against the real `tradestat.commerce.gov.in` site (real `curl` requests, not
+`WebFetch` — `WebFetch` summarizes HTML through a small model and loses exactly the raw form/field detail
+needed here; verified this directly by comparing what each tool returned for the same page). No scraper
+code written yet — the investigation surfaced a real, load-bearing design question that needed resolving
+first (see below) rather than writing a parser against a guessed report shape.
+
+**Confirmed, working mechanics**: Laravel CSRF token + session cookie, GET-then-POST, live-verified with a
+real successful round trip returning real data for HS 12079100 ("POPPY SEEDS W/N BROKEN"). Full detail in
+`docs/PLAN.md` §1's rewritten DGCIS section.
+
+**The real finding that changed the plan**: exhaustively checked every report page whose name suggested a
+commodity×country cross-tab (`commodity_wise_import`, `commoditywise_import`, `country_wise_import`,
+`country_wise_all_commodities_export`, `commodityx_countries_wise_import` — the last one's name was the
+most misleading: despite being named "commodity **x countries**," its country field is `required` with no
+"all countries" option, so it too returns exactly one country per request). None return a full country
+breakdown for one HS8 code in a single call. Updated `docs/PLAN.md` §1 and §7 to reflect the real ~250-
+request-per-period volume this implies, rather than the single-batched-call design D5 established for
+Comtrade (a different, much smaller-cardinality API).
+
+**Also caught live, twice, why "verify the actual field names, don't infer from the visible label" matters
+per report page**: the visible "Enter HS Code" input on multiple pages is a *lookup-assist modal* field,
+not what the form actually submits — the real field differs by page (`Eidb_hscodeCwi`, `comval`,
+`searchTerm`, all verified separately). A scraper built against the visible label instead of the real
+submitted field name would have silently returned the wrong page's default content, not an obvious error.
+
+**Left open, not yet resolved**: whether a "one country, all commodities at 8-digit level" report exists
+that would let one request per (country, period) cover every tracked HS8 code via local filtering, instead
+of paying the per-country cost once per tracked code. Flagged as the next concrete thing to check before
+writing `app/pipeline/dgcis.py`'s real request loop — not guessed here.
+
+**Verification performed**: real GET+POST round trips against the live site for `eidb/commodity_wise_import`,
+`meidb/commoditywise_import`, `meidb/country_wise_import`, `eidb/commodityx_countries_wise_export/import`,
+`meidb/country_wise_all_commodities_export/import`, each with a real captured CSRF token/session cookie and
+real form field values, response tables inspected directly (not assumed from field/report names).
