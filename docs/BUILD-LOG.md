@@ -734,3 +734,52 @@ and the missing regulatory note concentration warning — verified with `check_n
 **Next**: `routes/trade_report.py` (`POST /threads/{id}/trade-report`, D14 params: `years` 1-8 default 5,
 `top_n` 3-25 default 10) wires `facts.py` + `narrative.py` into a real HTTP endpoint — the last piece for a
 genuine end-to-end request/response for the canonical scenario.
+
+## `POST /threads/{id}/trade-report` — the route, built and live-verified end to end
+
+**Files**: `app/schemas/query.py` (`TradeReportQuery`, D14's `years`/`top_n` bounds as named module
+constants, not inline literals), `app/schemas/response.py` (`TradeReportResponse`, composing `Facts`
+directly rather than duplicating its shape), `app/main.py`'s new `post_trade_report` route (bare response,
+matching `post_search`'s precedent — this never touches the graph/checkpointer either), 4 new integration
+tests (real HTTP stack, `LLM_PROVIDER=mock`, real warehouse Postgres).
+
+**Budget/error handling mirrors `post_search` exactly**: `check_hs_code_allowlisted` runs before any DB
+touch (an unrecognized code never reaches the warehouse); `BudgetExceededError` (raised inside
+`generate_narrative` itself, per the prior unit's fix) maps to `429 BUDGET_EXCEEDED`; any other exception is
+caught by a defensive catch-all and returns a clean, schema-validated `500 INTERNAL_ERROR` — never a raw
+stack trace.
+
+**Two real bugs found by this route's own test suite before it could be trusted**:
+1. The test file's own "obviously invalid" HS6 code, `999999`, turned out to be a **real, reserved
+   taxonomy code** (verified live: `is_known_hs6_code("999999")` returns `True`) — not a code bug, a wrong
+   test assumption, caught immediately by the test failing with an unexpected 200. Replaced with `000000`
+   (confirmed absent).
+2. `app.warehouse.db.get_engine`'s `@lru_cache` — correct for production's one long-lived event loop, but
+   pytest-asyncio's function-scoped event loops meant a second test in the same file reused a first test's
+   now-closed loop's cached engine, producing a real `RuntimeError: Event loop is closed`. This is the exact
+   same shape of problem `get_budget_tracker()`'s test already has an established fix for
+   (`test_search_endpoint.py`'s `monkeypatch.setattr(main_module, "get_budget_tracker", ...)`); the parallel
+   fix here is an autouse fixture that clears `get_engine`'s cache before/after every test in the file,
+   confirmed stable across three repeated full-file runs.
+
+**Verification performed**: a real HTTP request through the full ASGI stack (`LLM_PROVIDER=mock`) for HS6
+120791/import/top_n=10, default `years=5` — real 200 response, real `product_label` from the taxonomy,
+real per-year statuses, `landed_cost.is_complete=false`, `regulatory_note_missing_warning=true`, all
+matching the direct `assemble_facts`/`generate_narrative` verification from the prior two units, now proven
+through the actual HTTP interface. **A real Gemini call through this exact route also hit the same live
+503 UNAVAILABLE outage observed in the previous unit** (confirmed still ongoing) — the route's defensive
+catch-all correctly turned it into a clean `500 INTERNAL_ERROR` response rather than crashing, a real,
+useful demonstration of that error path under a genuine external failure, not a simulated one. **Also
+noted, not a bug**: the default request window (`years=5` counted back from `current_year - 1` = 2025)
+is `[2021, 2025]`, which does not fully overlap the real ingested data range `[2020, 2024]` — a caller
+wanting the full ingested history for this canonical scenario needs `years=6` or later, or an explicit
+window; flagged for whoever next demos this against real data. `uv run pytest -q`: 499 passed (was 494;
++5, includes the earlier budget-gating commit's tests). `mypy app` (58 source files): clean. `ruff`/`black`:
+clean.
+
+**This completes a real, demonstrable end-to-end request/response for the canonical "poppy seeds" (HS6
+120791) scenario** — from real DGCIS/Comtrade ingestion through normalization, D9/D10/D11 gates, D14
+rankings/HHI/unit-value precompute, the frozen facts contract, a grounded narrative, and now a real HTTP
+endpoint returning all of it. Still open, not blocking this milestone: real duty-rate/regulatory-note
+citations (pending the user), Agmarknet/BACI ingestion (items 6-7), the D15 monthly section, and the full
+~250-country DGCIS run.

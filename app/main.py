@@ -58,6 +58,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
@@ -78,15 +79,23 @@ from app.models import get_model_for_role
 from app.nodes.validate_query import resolve_year_range
 from app.observability import build_trace_metadata, configure_langsmith_tracing
 from app.rate_limit import RateLimiter
+from app.report.facts import assemble_facts
+from app.report.narrative import generate_narrative
 from app.schemas.errors import ErrorResponse
-from app.schemas.query import ProductSearchQuery, TradeQuery
-from app.schemas.response import ProductSearchResponse, RankedCandidateOut, TradeAnalysisResponse
+from app.schemas.query import ProductSearchQuery, TradeQuery, TradeReportQuery
+from app.schemas.response import (
+    ProductSearchResponse,
+    RankedCandidateOut,
+    TradeAnalysisResponse,
+    TradeReportResponse,
+)
 from app.search.candidates import HybridSearchProvider
 from app.search.embeddings import get_embeddings_client
 from app.search.rerank import UngroundedRerankError
 from app.search.service import search_products
 from app.settings import Settings, get_settings
 from app.state import AnalysisState
+from app.warehouse.db import get_engine as get_warehouse_engine
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
@@ -903,6 +912,100 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 outcome=result.outcome,
                 selected_hs_code=result.selected_hs_code,
                 candidates=candidates_out,
+            ),
+            status_code=200,
+        )
+
+    @app.post("/threads/{thread_id}/trade-report")
+    async def post_trade_report(
+        thread_id: str, query: TradeReportQuery, request: Request
+    ) -> Response:
+        """India trade-analysis pipeline (`app.report.facts`/
+        `app.report.narrative`) — a separate, additive capability from
+        `POST /threads/{id}/messages`'s UN-Comtrade-only flow: reads the
+        warehouse tables this pipeline's own ingestion jobs populate, never
+        the Comtrade tool client `post_message` uses. Bare response (not
+        `{type, data}`-enveloped), matching `post_search` — this never
+        touches the graph/checkpointer either."""
+        settings: Settings = request.app.state.settings
+        trace_id = _current_trace_id()
+        structlog.contextvars.bind_contextvars(tenant_id=query.tenant_id, user_id=query.user_id)
+
+        if not check_hs_code_allowlisted(query.hs_code):
+            return _bare_response(
+                ErrorResponse(
+                    error_code="INVALID_HS_CODE",
+                    message=f"{query.hs_code!r} is not a recognized HS6 code.",
+                    retryable=False,
+                    trace_id=trace_id,
+                ),
+                status_code=400,
+            )
+
+        # DGCIS/Comtrade never have complete annual data for the current
+        # calendar year (the same "current_year - 1" convention already
+        # established by `app.nodes.validate_query`'s "latest available"
+        # heuristic and `TradeQuery`'s own year-bound docstring).
+        today = datetime.now(UTC).date()
+        end_year = today.year - 1
+        start_year = end_year - query.years + 1
+        window_start = date(start_year, 1, 1)
+        window_end = date(end_year, 12, 31)
+
+        try:
+            engine = get_warehouse_engine()
+            facts = await assemble_facts(
+                engine,
+                hs6=query.hs_code,
+                flow=query.flow,
+                window_start=window_start,
+                window_end=window_end,
+                top_n=query.top_n,
+                as_of=today,
+            )
+            model_client = get_model_for_role("analysis", provider=settings.llm_provider)
+            result = await generate_narrative(
+                facts,
+                model_client=model_client,
+                budget_tracker=get_budget_tracker(),
+                thread_id=thread_id,
+                tenant_id=query.tenant_id,
+            )
+        except BudgetExceededError:
+            # Checked inside `generate_narrative` itself, immediately before
+            # each real model call (matches `post_search`'s identical
+            # sequencing for `search_products`'s own multi-call path) — not
+            # pre-checked here, same reasoning as this module's own
+            # docstring point 4.
+            return _bare_response(
+                ErrorResponse(
+                    error_code="BUDGET_EXCEEDED",
+                    message="The model-call budget for this thread or day has been reached.",
+                    retryable=True,
+                    trace_id=trace_id,
+                ),
+                status_code=_status_code_for_error("BUDGET_EXCEEDED"),
+            )
+        except Exception:
+            # Defensive catch-all, matching `post_search`'s identical one —
+            # every response is schema-validated, never a raw stack trace.
+            logger.exception("thread.trade_report.unexpected_failure", thread_id=thread_id)
+            return _bare_response(
+                ErrorResponse(
+                    error_code="INTERNAL_ERROR",
+                    message="The trade report could not be completed due to an internal error.",
+                    retryable=False,
+                    trace_id=trace_id,
+                ),
+                status_code=_status_code_for_error("INTERNAL_ERROR"),
+            )
+
+        return _bare_response(
+            TradeReportResponse(
+                thread_id=thread_id,
+                facts=facts,
+                narrative=result.narrative,
+                narrative_source=result.source,
             ),
             status_code=200,
         )

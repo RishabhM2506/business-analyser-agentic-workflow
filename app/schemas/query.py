@@ -98,3 +98,39 @@ class ProductSearchQuery(BaseModel):
     query_text: str = Field(min_length=1, max_length=200)
     tenant_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
     user_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
+
+
+# D14 (docs/PLAN.md §12): "years: int (1-8, default 5), top_n: int (3-25,
+# default 10) flow from the API request body ... No literal 5/10 below the
+# route handler's own default values" - these are that route handler.
+MIN_TRADE_REPORT_YEARS = 1
+MAX_TRADE_REPORT_YEARS = 8
+DEFAULT_TRADE_REPORT_YEARS = 5
+MIN_TRADE_REPORT_TOP_N = 3
+MAX_TRADE_REPORT_TOP_N = 25
+DEFAULT_TRADE_REPORT_TOP_N = 10
+
+
+class TradeReportQuery(BaseModel):
+    """Request body for `POST /threads/{thread_id}/trade-report`
+    (`app.report.facts`/`app.report.narrative`) — the India trade-analysis
+    pipeline, a separate, additive capability from `TradeQuery`'s UN
+    Comtrade-only `/messages` flow (not a replacement for it).
+
+    Single `flow` per request, matching every precompute module this
+    pipeline's built on (`mismatch.py`/`rankings.py`/`unit_value.py`/
+    `coverage_gate.py` are all single-flow) — a caller wanting both
+    directions calls this endpoint twice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hs_code: str = Field(pattern=r"^\d{6}$")
+    flow: Literal["import", "export"] = "import"
+    years: int = Field(
+        default=DEFAULT_TRADE_REPORT_YEARS, ge=MIN_TRADE_REPORT_YEARS, le=MAX_TRADE_REPORT_YEARS
+    )
+    top_n: int = Field(
+        default=DEFAULT_TRADE_REPORT_TOP_N, ge=MIN_TRADE_REPORT_TOP_N, le=MAX_TRADE_REPORT_TOP_N
+    )
+    tenant_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
+    user_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
