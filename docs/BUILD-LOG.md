@@ -419,3 +419,47 @@ now shows the reporter-role and partner-role figures as separate, independently-
 2020 import (India's own claim, `comtrade-mirror-reporter-v1`) ₹344.71cr vs. 2020 export (Turkey's own
 claim, `comtrade-mirror-partner-v1`) ₹68.84cr — exactly the two real, distinct numbers check B needs to
 compare. `uv run pytest -q`: 418 passed (was 416; +2). `mypy`/`ruff`/`black`: clean.
+
+## Build sequence item 8, part 2: `app/report/mismatch.py` — D9 checks A/B, built and live-verified
+
+**Files**: `app/report/mismatch.py` (`compute_check_a`, `compute_check_b`, `upsert_mismatch_checks`, pure
+`_evaluate`/`_severity`/`_signed_gap_pct` helpers, `MismatchResult`/`SkippedCheck` dataclasses), 16 new unit
+tests (severity bands boundary-tested at 14.9/15.1/39.9/40.1%, the check B 5-12%-renders-quiet regression,
+direction-flip detection, the three never-guess-a-missing-side skip paths), 8 new integration tests (real
+Postgres, real check A/B computation, upsert idempotency). Also renamed `normalize.py`'s three
+`_DATASET_VERSION` constants to public (`DGCIS_DATASET_VERSION`, `COMTRADE_DATASET_VERSION_REPORTER_ROLE`,
+`COMTRADE_DATASET_VERSION_PARTNER_ROLE`) so `mismatch.py` imports them rather than duplicating the string
+literals.
+
+**A third real bug, found by this module's own integration test before it ever touched real data**:
+`compute_check_b` initially fetched the partner's Comtrade data using DGCIS's own flow label (`flow=flow`).
+Check B's entire premise is a *mirror* comparison — DGCIS `import` (India receiving a shipment) pairs with
+the partner's own `export` claim about the same shipment (partner sending it), never the partner's own
+`import` claim. Querying under the matching label silently found zero rows for every real partner (they
+exist under the opposite flow) — the very first test run correctly caught this before any real number could
+have been mis-reported. Fixed with an explicit `partner_mirror_flow = "export" if flow == "import" else
+"import"` used only for the Comtrade-side fetch; `MismatchResult.flow` continues to store DGCIS's own label
+throughout, matching `analytics_mismatch_checks.flow`'s existing semantics.
+
+**Un-computable checks are skipped, not guessed** (`SkippedCheck`, with a stated `reason`): either side
+`NOT_REPORTED` (never treated as 0, D2), or a `dgcis` denominator of exactly 0 (a percentage gap against a
+zero base is undefined, not infinite and not silently 0% agreement). Confirmed live: 2021 and 2024 skipped
+(NOT_REPORTED on one side), 2023 skipped (DGCIS's Turkey import was ZERO that year).
+
+**Verification performed**: real end-to-end run against the real database for HS6 120791/import/Turkey,
+2020-2024. Check B (the check that's genuinely meaningful with only one country ingested so far) produced
+real, sane results: 2020 gap 40.21% (`warning`), 2022 gap 24.26% (`flag`) — real discrepancies between
+India's and Turkey's own customs records, exactly the kind of finding this check exists to surface. **Check
+A's result (2020 gap 1126.65%, 2022 gap 50.24%) is real but currently misleading** — it sums DGCIS's total
+only across whatever partner countries have actually been ingested (Turkey alone, right now), so it
+understates the true DGCIS national total by construction; it will only become meaningful once the "real
+full ~250-country DGCIS run" (already flagged as an open item, §STATE.md) is done. This is a data-coverage
+caveat, not a logic bug — flagged explicitly here and in `docs/STATE.md` rather than silently accepted.
+Both check results confirmed persisted via `psql`. `uv run pytest -q`: 440 passed (was 418; +22).
+`mypy app`/`ruff`/`black`: clean (note: `mypy` on test files reports a known, pre-existing
+`AsyncGenerator`-return-type false positive on every `_cleanup` fixture across this test suite — CI only
+runs `mypy app`, matching this project's established scope).
+
+**Next**: `coverage_gate.py` (D11) and `unit_consistency.py` (D10) — both still open within item 8, both
+needed before `report/service.py` can assemble a real end-to-end report response. Check C (vs. BACI) remains
+unimplemented pending BACI ingestion (item 6, not started).

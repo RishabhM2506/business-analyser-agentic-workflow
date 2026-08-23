@@ -52,7 +52,7 @@ from app.warehouse.schema import (
 )
 
 _UNMAPPED = "UNMAPPED"
-_DGCIS_DATASET_VERSION = "dgcis-annual-v1"
+DGCIS_DATASET_VERSION = "dgcis-annual-v1"
 # Two distinct dataset_versions, not one - a real bug found before
 # mismatch.py could be built: a Query 1 row (India self-reporting, e.g.
 # reporter=699/partner=792/flow=export = "India's own claimed export to
@@ -65,8 +65,8 @@ _DGCIS_DATASET_VERSION = "dgcis-annual-v1"
 # rows (partner_country_code='0', §10); check_B needs only the
 # partner-shape rows (the foreign country's own mirror figure) - keeping
 # them in separate dataset_version buckets keeps both queryable.
-_COMTRADE_DATASET_VERSION_REPORTER_ROLE = "comtrade-mirror-reporter-v1"
-_COMTRADE_DATASET_VERSION_PARTNER_ROLE = "comtrade-mirror-partner-v1"
+COMTRADE_DATASET_VERSION_REPORTER_ROLE = "comtrade-mirror-reporter-v1"
+COMTRADE_DATASET_VERSION_PARTNER_ROLE = "comtrade-mirror-partner-v1"
 
 
 def _dgcis_fiscal_year_to_period_month(fiscal_year_label: str) -> tuple[int, date]:
@@ -138,7 +138,7 @@ async def normalize_dgcis_annual_rows(
                 "basis": "CIF" if raw["flow"] == "import" else "FOB",
                 "currency": "INR",
                 "universe": "india-customs",
-                "dataset_version": _DGCIS_DATASET_VERSION,
+                "dataset_version": DGCIS_DATASET_VERSION,
                 "is_provisional": False,
                 "status": status,
                 "status_detail": None,
@@ -219,9 +219,9 @@ async def normalize_comtrade_rows(
         is_reporter_role_row = raw["reporter_code"] == INDIA_CODE
         partner_country_code = raw["partner_code"] if is_reporter_role_row else raw["reporter_code"]
         dataset_version = (
-            _COMTRADE_DATASET_VERSION_REPORTER_ROLE
+            COMTRADE_DATASET_VERSION_REPORTER_ROLE
             if is_reporter_role_row
-            else _COMTRADE_DATASET_VERSION_PARTNER_ROLE
+            else COMTRADE_DATASET_VERSION_PARTNER_ROLE
         )
         normalized_rows.append(
             {
