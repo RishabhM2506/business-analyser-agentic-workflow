@@ -630,3 +630,58 @@ built, open within item 4). `report/facts.py` can now be attempted with an expli
 assemble `annual_series`, `hhi_by_year`, `unit_value_trend`, `mismatch_checks`, `landed_cost`, and
 `coverage` from real data (all now buildable), while `month_wise_current_year` stays absent/flagged rather
 than fabricated until the monthly path exists.
+
+## `app/report/facts.py` — §14 frozen LLM contract assembly, built and live-verified for the full canonical scenario
+
+**Files**: `app/report/facts.py` (`assemble_facts` + the `Facts`/`AnnualSeriesYear`/`UnitValueTrendYear`/
+`HhiYear`/`MismatchCheckFact`/`CoverageFact`/`Window` Pydantic models), 7 unit tests (`_worst_status`
+ordering, `_display_name` against the real `data/comtrade-partner-areas.csv`), 3 integration tests (real
+Postgres, full assembly against seeded analytics/ref tables including the coverage-missing and
+regulatory-note-present branches).
+
+**Read-only architecture, stated explicitly in the module docstring**: `assemble_facts` never touches
+`normalized_trade_flows` and never recomputes a metric — it only reads the already-precomputed
+`analytics_partner_rankings`/`analytics_unit_value_series`/`analytics_mismatch_checks`/
+`analytics_coverage_summary` plus `ref_duty_components` (via the existing `ManualDutySource`),
+`ref_regulatory_notes`, and `ref_hs6_hs8_crosswalk` — matching `schema.py`'s own comment ("Analytics layer:
+precomputed on ingest, API reads only this") and D13's ingestion/query plane separation.
+
+**Real, explicitly flagged deviations from §14's literal example JSON** (each because fabricating the
+example's exact shape would require inventing data that doesn't exist yet):
+- `month_wise_current_year` is always `[]` — no writer for `analytics_monthly_current_year` exists (D15,
+  blocked on DGCIS's monthly path). An empty list is the honest output of "no rows exist," not a
+  workaround.
+- `landed_cost_as_of_period` (a deliberate rename from the example's `as_of_month`) is a bare year string,
+  since this pipeline has no monthly-grain CIF figure (`analytics_landed_cost` has no writer either);
+  `landed_cost` is `None` entirely when no year in the window has a real, gate-passed unit-value figure.
+- `coverage` is `None` when no `analytics_coverage_summary` row exists for the caller's *exact* window —
+  proven directly by a dedicated test.
+- Per-year `status` uses this module's own reasoned worst-status-wins ordering across `cell_status`'s 10
+  values (`_STATUS_SEVERITY`) — §5 defines each status's producing condition but not a total order across
+  them; flagged the same way §14 itself flags its own unverified 60% concentration threshold.
+- `regulatory_note_missing_warning`'s "top-1 partner share > 60%" trigger is computed as the literal top-1
+  share of the most recent year with real ranking data, not re-derived from the HHI value (a different,
+  related but distinct measure).
+
+**Verification performed**: the full real, end-to-end canonical-scenario JSON was generated for HS6
+120791/import/2020-2024/top_n=10 — every field traces to real, already-verified data from this session's
+prior units. Notable real results: `product_label` "Oil seeds; poppy seeds, whether or not broken" (from
+the checked-in taxonomy CSV, not invented); `annual_series` correctly distinguishes `QTY_MISSING` (2020,
+2022 — real trade, no quantity) from `ZERO` (2021, 2023, 2024 — real zero trade, the restriction years) with
+no dash anywhere (D1); `unit_value_trend`/`hhi_by_year` correctly `null` for every year without real data,
+never a fabricated 0; `landed_cost.is_complete=false` with all four components `NOT_VERIFIED` and their
+exact required notice text (no real duty citation recorded yet, per the user's own rule); `mismatch_checks`
+carries all 4 real check A/B results with real country names; `regulatory_note_missing_warning=true` — a
+real, correct D12 firing (poppy seeds are 100%-Turkey-concentrated in this data and no `ref_regulatory_notes`
+row has been curated yet; deliberately **not** populated with the master prompt's own example note text in
+this unit, since that would mean asserting a specific regulatory fact as verified without this session
+having independently confirmed it against a live official source — the same evidence-first discipline
+already applied to duty rates). `uv run pytest -q`: 481 passed (was 471; +10). `mypy app`/`ruff`/`black`:
+clean — notably, zero `# type: ignore` needed anywhere in this module (an early draft used three; replaced
+with explicit `assert`s matching this codebase's established narrowing pattern, since this repo has never
+used `type: ignore` before).
+
+**Next**: `report/narrative.py` (LLM call + D4's number-grounding post-validator, matching the existing
+`/messages` flow's `check_numbers_grounded` pattern) is the next step toward a real end-to-end report
+response. `routes/trade_report.py` (D14 params) can follow once narrative exists. `analytics_monthly_current_year`
+(D15) and `analytics_landed_cost`'s monthly writer remain open, not blocking a first working narrative.
