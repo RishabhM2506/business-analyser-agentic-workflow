@@ -12,7 +12,10 @@ import pytest
 from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.report.monthly_current_year import compute_monthly_current_year, upsert_monthly_current_year
+from app.report.monthly_current_year import (
+    compute_monthly_current_year,
+    upsert_monthly_current_year,
+)
 from app.warehouse.schema import analytics_monthly_current_year, raw_dgcis_monthly
 
 pytestmark = pytest.mark.integration

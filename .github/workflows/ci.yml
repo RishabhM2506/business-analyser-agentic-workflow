@@ -18,6 +18,7 @@ env:
   # of this).
   COMTRADE_API_KEY: ci-placeholder-comtrade-key
   GEMINI_API_KEY: ci-placeholder-gemini-key
+  AGMARKNET_API_KEY: ci-placeholder-agmarknet-key
   LLM_PROVIDER: mock
 
 jobs:

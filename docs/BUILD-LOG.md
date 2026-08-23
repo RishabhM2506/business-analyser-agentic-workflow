@@ -1075,3 +1075,86 @@ Everything left is either blocked on the user (real HS 120791 duty-rate/regulato
 Agmarknet's `data.gov.in` API key) or optional/lower-value (the `HS17` BACI file for 2020-2021 coverage; a
 full real 12-month DGCIS monthly run for 2026, the actual current year, now that the analytics writer
 exists to consume it).
+
+## User-directed unblocking round (2026-08-24): ICEGATE evidence, Agmarknet credential, BACI HS17, 2026 DGCIS run, vernacular-search fix
+
+The user supplied a real `data.gov.in` API key and pointed at the live ICEGATE Trade Guide, resolving both
+of the two credential/access blockers left open above, plus approved the two previously-optional items and
+the pending vernacular-search plan. Worked through all five in order.
+
+### 1. HS 12079100 duty/regulatory evidence — real ICEGATE attempt, honestly recorded as NOT_VERIFIED
+
+Re-attempted a live fetch against `https://www.icegate.gov.in/Webappl/Trade-Guide-on-Imports` (the prior,
+already-committed finding was a TLS-handshake failure from this environment; that specific failure mode no
+longer reproduced). Found and used the real search form (`POST /Webappl/Tariff-head-details`, field `cth`),
+established a real session cookie via a prior `GET`, and confirmed the endpoint is genuinely reachable and
+POST-only (`GET` on the same path correctly returned `405`). The actual search `POST` itself returned a
+real, reproducible `HTTP 500` with an empty body across 4 separate real attempts (varying headers, a
+delay-then-retry, a bare-minimum payload) — a genuine server-side failure, not a client-side mistake or a
+WAF block page. The user separately reported viewing the live page directly and seeing Commodity "Poppy
+seeds", Unit "KGS", a duty figure of 20%, and Import Policy "Free" — but explicitly flagged, and I agree,
+that a single undifferentiated "20%" cannot be safely attributed to any one of this system's four tracked
+duty components (BCD/AIDC/SWS/IGST) without knowing which column it came from.
+
+Per the evidence-first rule, recorded all 4 components for HS8 `12079100` as `NOT_VERIFIED` via
+`scripts/record_duty_rate.py`, with a detailed `notes` field documenting the full real attempt log and the
+component-attribution ambiguity — no fabricated component-level value. Wrote a parallel free-text
+`ref_regulatory_notes` row for HS6 `120791` via a new curator script, `scripts/record_regulatory_note.py`
+(new, mirrors `record_duty_rate.py`'s upsert-on-conflict pattern; this table previously had no writer at
+all), documenting the same findings plus a live cross-check of the CBIC Tax Information Portal (real TCP
+connection reset, consistent with the already-documented finding that it's unreachable from here).
+**VERIFIED**: none of the 4 duty components, none of import policy/notifications/compliance/chapter notes.
+**NOT_VERIFIED**: all 4 duty components (real citation trail recorded). **NOT_FOUND**: notifications,
+compulsory compliance requirements, chapter notes (no live source reachable, none reported by the user).
+
+### 2. Agmarknet ingestion (`app/pipeline/agmarknet.py`, new)
+
+Real mechanics verified live against `https://api.data.gov.in/resource/35985678-0d79-46b4-9ed6-6f13308a1d24`
+using the user's real key (stored only in the local, gitignored `.env`; `app.settings.Settings.
+agmarknet_api_key` added as a new required field, `.env.example`/`tests/conftest.py`/`.github/workflows/
+ci.yml` all updated with placeholders, matching the existing `COMTRADE_API_KEY`/`GEMINI_API_KEY` pattern
+exactly — the real key is never written to any tracked file). Real, load-bearing findings:
+
+- **A real, live-confirmed silent block on `httpx`'s default `User-Agent`**: every request via plain
+  `httpx.get`/`AsyncClient.get` (default `User-Agent: python-httpx/x.y.z`) hung until timeout with *zero*
+  response, while the identical request via `curl` (default `User-Agent: curl/x.y.z`) returned instantly.
+  Isolated live: any other real `User-Agent` fixes it. `fetch_page` now always sends an explicit, honest
+  `User-Agent: business-analyser-agentic-workflow/1.0` — never this library's default, never a spoofed
+  browser/curl string.
+- **A real, live-confirmed rate limit** with an unusual shape: `HTTP 200` with
+  `{"error": "Rate limit exceeded"}` — same status code as success, detected by inspecting the parsed body
+  for an `"error"` key, not by status code. Retried on a short fixed schedule (10/30/60s ± jitter).
+  Recovered within about a minute on its own.
+  Response shape and field names (`Arrival_Date` as `dd/mm/yyyy`, every price field a JSON *string*) all
+  confirmed live; 81,355,409 total real rows as of this verification. Prices parsed via `Decimal`, never
+  `float` (D8); a blank/non-numeric price string parses to `None`, never coerced to 0 (D2).
+- **A real, live-confirmed data gap for this pipeline's own canonical scenario**: exhaustively checked 13
+  plausible `Commodity` name variants for poppy seeds (`"Poppy seeds"`, `"Postha"`, `"Posta"`, `"Khuskhus"`,
+  `"Postha Dana"`, `"Posta Dana"`, ...) plus an unfiltered sample of the 4 real districts under India's
+  licensed poppy-cultivation program (Neemuch, Mandsaur, Chittorgarh, Pratapgarh) — zero records anywhere,
+  confirmed twice (once before, once after the User-Agent fix, to rule out the block as the cause). Poppy
+  (opium poppy / *Papaver somniferum*, including seed/husk) is a Central Bureau of Narcotics
+  licensed-procurement crop in India, structurally outside the open APMC-mandi trading this dataset covers —
+  a real, structural absence. Per D2, this must surface as genuinely unknown (`NOT_FOUND`), never a
+  fabricated zero, exactly matching `docs/PLAN.md`'s pre-existing `domestic_price_inr_paise_per_kg` comment.
+- Price unit (Rs./Quintal, matching `raw_agmarknet_prices.modal_price_inr_paise_per_qtl`'s existing column
+  name) is *not* independently reconfirmed from this API's own metadata or the data.gov.in catalog page this
+  session (checked; not present in either) — recorded as an inherited, not newly verified, assumption.
+
+**Files**: `app/pipeline/agmarknet.py` (new — `fetch_page`, `fetch_all_records`, `upsert_agmarknet_records`),
+`scripts/run_agmarknet_ingestion.py` (new, curator CLI mirroring `run_dgcis_country_batch.py`'s shape, real
+fetch failures to `dead_letter_ingestion`). 17 new tests (13 unit via `httpx.MockTransport` — real response
+parsing, the real rate-limit retry shape, short-page pagination; 4 integration against real Postgres —
+write, idempotency, missing-price-stays-NULL, empty-input no-op).
+
+**Verification performed**: real end-to-end run against the live API with the real key — fetched and
+upserted 10 real "Green Peas"/Maharashtra rows (2017 vintage), confirmed via the script's own printed output
+and a real Postgres write; the 13-variant poppy-seed probe (above) run twice live. `uv run pytest -q`: 571
+passed (was 554; +17). `mypy app` (61 files)/`ruff`/`black`: clean.
+
+**A stray pre-existing lint issue was also fixed in this pass** (unrelated to Agmarknet): the D15 unit's
+`tests/integration/test_monthly_current_year.py` had a line-length violation in one import statement that a
+targeted `ruff check`/`black` run on that single file, immediately before that commit, had not caught — a
+repo-wide `ruff check .`/`black --check .` (run for the first time this session as part of the final
+acceptance checklist below) surfaced and fixed it. Folded into this commit rather than amending the prior
+one, per this project's "never amend, always a new commit" convention.

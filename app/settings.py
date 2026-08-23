@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # committed, separate keys per environment) ------------------------------
     comtrade_api_key: str
     gemini_api_key: str
+    # data.gov.in resource key for the Agmarknet daily mandi-price feed
+    # (app/pipeline/agmarknet.py). Required even when the Agmarknet job
+    # isn't running, matching this file's existing "fails loudly at
+    # startup" contract for every other credential.
+    agmarknet_api_key: str
     langsmith_api_key: str | None = None
     langsmith_project: str | None = None
     langsmith_tracing_enabled: bool = False
