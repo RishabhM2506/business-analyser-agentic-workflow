@@ -588,3 +588,45 @@ building block in `app/fx/decomposition.py` but nothing writes the per-year seri
 `analytics_monthly_current_year` (D15). `facts.py` will need to either wait for both or assemble a
 partial/degraded JSON that's honest about which sections are unavailable — a design decision to make
 explicitly when starting that module, not silently default.
+
+## `app/report/unit_value.py` — D8 three-way decomposition + unit-value precompute, built and live-verified
+
+**Files**: `app/report/unit_value.py` (`compute_unit_value_series`, `upsert_unit_value_series`, writing
+`analytics_unit_value_series`), 5 integration tests (real unit-value computation, gate-fails-on-no-data,
+real decomposition math for adjacent years, the gap-year-never-skipped-over regression, upsert idempotency).
+
+**Deliberate departure from `rankings.py`'s DGCIS-backbone convention, stated explicitly**: `raw_dgcis_annual`
+structurally has no quantity column at all, so neither a unit-value figure nor a qty/price/FX decomposition
+can ever be computed from DGCIS data — Comtrade (reporter-role, `partner_country_code='0'` World-aggregate
+rows) is the only source in this pipeline that carries both value and quantity on the same row, so this one
+metric is Comtrade-sourced by structural necessity, not preference; `mismatch.py`'s D9 checks remain the
+authority on which source to trust for value totals.
+
+**A real scope bug caught before it shipped**: the first draft gated `coverage_gate_passed` by calling
+`warehouse.coverage_gate.evaluate_coverage`, but that function counts every tracked-partner row for
+`(hs6, flow, source)` in-window — it would have silently counted all ~70+ per-year Comtrade rows across
+every partner and both query shapes, not just the single World-aggregate cell this module actually reads.
+Caught by re-reading the function's own docstring before wiring it in, not by a failing test. Fixed by
+computing the gate directly from this row's own presence (a single-cell gate correctly reduces to "is a
+real, non-null value/quantity/FX triple present for this year") rather than reusing a function built for a
+different, wider scope.
+
+**Calendar-adjacency rule**: `delta_*_pct` is only computed between year `N` and year `N-1` — never "vs. the
+most recent prior year with data." HS6 120791's real Comtrade data has a genuine gap (no reporter-role
+World row for imports in 2021 or 2024), and the regression test proves 2023's delta isn't silently computed
+against 2021 (which would misreport a two-year change as one year).
+
+**Verification performed**: real end-to-end run for HS6 120791/import 2020-2024. 2020 and 2022 (real data)
+compute real unit values (₹165.9/kg and ₹258.0/kg); 2021 and 2024 (real gaps — no World-aggregate row)
+correctly show `coverage_gate_passed=False`, `unit_value=None`, never fabricated. 2023's real, tiny import
+value (₹0.00122cr against 2022's ₹6379.97cr, a genuine near-total collapse consistent with the
+already-documented on-again/off-again Turkey poppy-seed restriction pattern) produces a real
+`delta_value_pct≈-99.99998%` via `app.fx.decomposition.decompose()` — the first real use of that module's
+qty/price/FX split against real production data this session. All 5 real years upserted into
+`analytics_unit_value_series`. `uv run pytest -q`: 471 passed (was 466; +5). `mypy app`/`ruff`/`black`: clean.
+
+**Next**: `analytics_monthly_current_year` (D15) remains blocked on DGCIS's monthly ingestion path (not yet
+built, open within item 4). `report/facts.py` can now be attempted with an explicit, honest scope decision:
+assemble `annual_series`, `hhi_by_year`, `unit_value_trend`, `mismatch_checks`, `landed_cost`, and
+`coverage` from real data (all now buildable), while `month_wise_current_year` stays absent/flagged rather
+than fabricated until the monthly path exists.
