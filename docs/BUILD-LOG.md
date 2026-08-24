@@ -1344,3 +1344,26 @@ confirmed via `psql`. 599 tests passing (was 577; +22, across the shared client 
 **Remaining Tier-1 sources not yet built**: crop-wise area/production/yield, horticulture production/area,
 horticulture varieties (Agmarknet variety-wise daily prices, the 7th listed item, was already built earlier
 this session). Continuing one source at a time, same pattern.
+
+### Tier-1 expansion stopped after MSP - the remaining candidates are all real but stale
+
+Investigated the next candidate, "Area Under Principal Crops - All India and State Wise" (`data.gov.in`
+resource `925f3957-9dd6-4bfc-a73d-070a50b98854`, Ministry of Statistics and Programme Implementation). Real
+and live-confirmed, but genuinely weak: data covers only **2000-01 through 2010-11** (11 rows total), last
+updated **2018**, and despite the dataset's own title ("...State Wise") the actual queryable API has **no
+state field at all** — all-India totals only, wide-format across ~33 crop columns.
+
+Flagged this to the user before building a pipeline around it. They chose to skip the crop area/production/
+yield family. Checked the horticulture production/area candidates next (`data.gov.in` catalog "All India and
+State Wise Area and Production of various Horticulture Crops" and its children) — their own page
+descriptions quote the identical real date range, "All India data from 2001-02 to 2010-11 and State-wise
+data from 2009-10 to 2010-11" — the same stale ~2010-11 government-data batch, evidently released once
+around 2017-2018 and never updated since. Flagged this too; the user chose to **stop the Tier-1 expansion
+here** rather than build pipelines around outdated data.
+
+**Tier-1 final state**: 2 of the original 9-item list built and live-verified (Agmarknet variety-wise daily
+prices, already existing; MSP + Cost of Production, new this round). The remaining 5 candidates (crop-wise
+area/production/yield, horticulture production/area, horticulture varieties) were investigated far enough
+to determine most of the readily-discoverable ones on `data.gov.in` are a single stale ~2010-11 batch, not
+independently worth building around — a real, evidence-based finding, not an assumption. No code changes
+from this investigation (discovery-only). 599 tests still passing, unchanged since the MSP commit.
