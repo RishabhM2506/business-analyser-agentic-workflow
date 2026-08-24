@@ -311,6 +311,32 @@ raw_msp_records = Table(
     UniqueConstraint("commodity", "year_label", name="uq_raw_msp_records"),
 )
 
+# [Tier-2 international-source expansion, 2026-08-25] FAOSTAT "Crops and
+# livestock products" bulk data (bulks-faostat.fao.org/production). Real,
+# current (data through 2024, file dated 2025-12-31), 200+ countries,
+# item/element/year granularity. `value` is NULL whenever FAOSTAT's own
+# flag is `M` ("Missing value; data cannot exist") - never coerced to 0
+# (D2) - `flag` is preserved verbatim for every row, matching this
+# pipeline's "raw layer preserves the source's own status marker,
+# unintepreted" convention (mirrors DGCIS's monthly revision marker).
+raw_faostat_records = Table(
+    "raw_faostat_records",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("fetched_at", DateTime(timezone=True), nullable=False),
+    Column("area_code", Text, nullable=False),
+    Column("area", Text, nullable=False),
+    Column("item_code", Text, nullable=False),
+    Column("item", Text, nullable=False),
+    Column("element", Text, nullable=False),
+    Column("unit", Text, nullable=False),
+    Column("year", Integer, nullable=False),
+    Column("value", Numeric(18, 3), nullable=True),
+    Column("flag", Text, nullable=True),
+    Column("raw_payload", JSONB, nullable=False),
+    UniqueConstraint("area_code", "item_code", "element", "year", name="uq_raw_faostat_records"),
+)
+
 # ── Dead letter (docs/PLAN.md D3) ────────────────────────────────────────
 
 dead_letter_ingestion = Table(
@@ -546,6 +572,7 @@ __all__ = [
     "raw_comtrade_records",
     "raw_dgcis_annual",
     "raw_dgcis_monthly",
+    "raw_faostat_records",
     "raw_msp_records",
     "ref_country_crosswalk",
     "ref_duty_component_conflicts",

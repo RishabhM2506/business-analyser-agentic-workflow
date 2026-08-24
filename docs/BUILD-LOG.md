@@ -1367,3 +1367,86 @@ area/production/yield, horticulture production/area, horticulture varieties) wer
 to determine most of the readily-discoverable ones on `data.gov.in` are a single stale ~2010-11 batch, not
 independently worth building around — a real, evidence-based finding, not an assumption. No code changes
 from this investigation (discovery-only). 599 tests still passing, unchanged since the MSP commit.
+
+## Real curation bug fixed: BCD's effective_from was future-dated (2026-08-25)
+
+Before starting the Tier-2 round, live-verified `compute_landed_cost` against the real HS 120791 duty
+evidence and found the calculation logic itself was already fully correct (only `VERIFIED` components are
+used; excluded components are listed explicitly; `is_complete=False`/`landed_cost_inr_paise_per_kg=None`
+whenever any component isn't `VERIFIED`; `narrative.py` already renders "unverified: AIDC, IGST, SWS"
+rather than a fabricated total) - but found a real bug in my own earlier curation: three same-day
+`record_duty_rate.py` calls (the initial `NOT_VERIFIED` entry, an evidence-trail update, then the real
+`VERIFIED` entry after the user's browser confirmation) had each been forced to a *later calendar date*
+than the last (2026-08-24, -25, -26) to satisfy the script's "effective_from must be strictly later than the
+current row" constraint - pushing the real `VERIFIED` row's effective date two days into the future. A
+report generated for "today" (2026-08-24) would have still resolved to the stale `NOT_VERIFIED` state.
+Corrected directly via SQL: removed the two same-day intermediate rows (their narrative is already fully
+preserved in git history and this log) and set the current `VERIFIED` row's `effective_from` back to
+2026-08-24. Re-verified live: `compute_landed_cost` now correctly picks up `BCD=VERIFIED=20%`. No code
+changes - a data-correction only.
+
+## Tier-2 investigation round (2026-08-25) + FAOSTAT build
+
+Investigated all 5 remaining Tier-2 sources per the user's own report template (source, API availability,
+auth, rate limits, fields, coverage, freshness, real example response, data quality, recommendation) before
+building anything, per their explicit "investigate and report first" instruction:
+
+- **Horticulture Varieties** (leftover from the prior round, real `data.gov.in` rate limit had not recovered):
+  retried and got through. Real resource found (`46f587a9-7476-443e-915f-fc756a6b4e2c`, "List of certified
+  varieties of horticultural crops", ICAR) - but despite its title, the actual API returns yearly *counts* of
+  newly-certified varieties per crop category (2002-2009 only), not actual variety names - not usable for the
+  intended crop->variety query-normalization purpose. **SKIP.**
+- **DGFT**: no public API. The real ITC-HS policy-lookup tool lives behind the same authenticated portal
+  shell as IEC-holder login - live-confirmed the page loads (HTTP 200) but its real search functionality
+  needs a business login, unlike ICEGATE's open Trade Guide. Public Notifications page is real and reachable,
+  PDF/HTML only. **REFERENCE-ONLY.**
+- **CBIC**: real, live-reconfirmed `taxinformation.cbic.gov.in` connection reset (matches the pre-session and
+  earlier-this-session findings already in `duty_source.py`) - plus CBIC's own explicit "unauthorized access,
+  commercial sale, or purchase of Customs-related electronic data is strictly prohibited" language, a real
+  reason not to build a scraper even if reachability were fixed. **SKIP** (automation); reference-only for
+  manual citation, matching the existing `duty_source.py` decision.
+- **FSSAI**: no official public API for product-standards data: only paid third-party *license-verification*
+  APIs exist (a different use case - verifying a business's license, not "what standard applies to HS code
+  X"). **REFERENCE-ONLY.**
+- **FAOSTAT**: real, current (file dated 2025-12-31, years through 2024), free, no auth, no rate limit -
+  REST API is down (real `HTTP 521` from `fenixservices.fao.org`, Cloudflare "origin down", reproduced
+  twice) but the Bulk Download service works. Confirmed real "Poppy seed" item code (296) exists, and the
+  exact real behavior the user asked to guard against: India+Poppy seed+Production is `flag=M` ("Missing
+  value; data cannot exist") for every year 2015-2024 with a genuinely empty value cell, while Türkiye has
+  real official (`flag=A`) values (7,922 t in 2023). **BUILD** - real, close architectural match to the
+  existing BACI pattern.
+- **World Bank** Pink Sheet: real and current (an August 2026 edition exists) but covers only ~50-60 major
+  global commodities - confirmed live via the real workbook's shared-strings list, no "poppy" match anywhere,
+  and most of this pipeline's actual HS6-level product catalog wouldn't be covered either. **SKIP**, per the
+  user's own direction.
+
+### `app/pipeline/faostat.py` (new)
+
+Bulk-ZIP ingestion mirroring `app.pipeline.baci`'s pattern (stream a real ZIP member, never load the full
+92MB-uncompressed CSV into memory), but item-filtered rather than country-filtered - FAOSTAT's value here is
+*cross-country* context, so every country/region row for a tracked item is kept, not just India's. New
+`raw_faostat_records` table (migration `9bfa1484a1d0`, real upgrade/downgrade/upgrade round-trip verified),
+`scripts/load_faostat_production.py` (new curator CLI - downloads the real bulk ZIP itself, or accepts an
+already-downloaded one via `--zip-path`).
+
+**Two real bugs found and fixed on the very first live end-to-end run** (both now permanent regression
+tests, per this project's standing convention):
+
+1. **A real asyncpg parameter-limit violation**: the first draft's single bulk upsert statement hit a real
+   `InterfaceError: the number of query arguments cannot exceed 32767` - one real item ("Poppy seed", every
+   country, every year) produced 5,760 rows x 11 columns = 63,360 params in one statement. None of this
+   pipeline's other sources had ever produced a result set large enough to hit this real ceiling. Fixed by
+   batching `upsert_faostat_records` internally at 1,000 rows/batch (11,000 params, well under the 2,978-row
+   hard limit) - a caller never needs to remember to batch.
+2. **A real encoding bug**: the parser's first draft decoded the CSV as `latin-1`; the real file is UTF-8.
+   "Türkiye" (raw bytes `\xc3\xbc` for "ü") came out as the mojibake "TÃ¼rkiye" in the database until this
+   was caught and fixed - visible immediately in a real `psql` check of the loaded Türkiye rows.
+
+**Real end-to-end verification** (after both fixes): loaded all 5,760 real rows for "Poppy seed" across 32
+real countries/regions/aggregates. India + Production, every year 2015-2024: `value=NULL, flag='M'` -
+**never a fabricated zero**, exactly the guarantee the user asked for. Türkiye + Production: real values
+(17,013 t / 496.2 t / 8,441 t across recent years, `flag='A'`), confirming the source is genuinely usable
+for cross-country context even where India's own data doesn't exist.
+
+14 new tests (9 unit, 5 integration against real Postgres, including a dedicated regression test for each of
+the two real bugs above). 613 tests passing (was 599; +14). `mypy app` (64 files)/`ruff`/`black`: clean.
