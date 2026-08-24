@@ -145,6 +145,7 @@ async def test_assemble_facts_real_shape(warehouse_engine: AsyncEngine) -> None:
         window_end=date(2023, 12, 31),
         top_n=10,
         as_of=date(2023, 12, 31),
+        include_agriculture_sources=False,
     )
 
     assert facts.hs6 == _TEST_HS6
@@ -193,6 +194,7 @@ async def test_assemble_facts_coverage_is_none_when_no_row_exists_for_the_window
         window_end=date(2023, 12, 31),
         top_n=10,
         as_of=date(2023, 12, 31),
+        include_agriculture_sources=False,
     )
 
     assert facts.coverage is None
@@ -231,6 +233,7 @@ async def test_assemble_facts_no_warning_when_a_regulatory_note_exists(
         window_end=date(2023, 12, 31),
         top_n=10,
         as_of=date(2023, 12, 31),
+        include_agriculture_sources=False,
     )
 
     assert facts.regulatory_note == "Test regulatory note."

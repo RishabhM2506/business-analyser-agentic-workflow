@@ -1450,3 +1450,68 @@ for cross-country context even where India's own data doesn't exist.
 
 14 new tests (9 unit, 5 integration against real Postgres, including a dedicated regression test for each of
 the two real bugs above). 613 tests passing (was 599; +14). `mypy app` (64 files)/`ruff`/`black`: clean.
+
+## Dynamic source-relevance classifier + wiring the 3 new sources into the actual report (2026-08-25)
+
+User-directed design discussion ("today poppy seed, tomorrow cement... the tool you're building we have to
+use them or not will be decided by llm") — proposed rule-based (HS chapter) vs. LLM-per-query vs. a hybrid
+before writing any code, per the user's own explicit request to discuss first. User chose **hybrid**
+(chapter rule primary, LLM fallback only for a narrow boundary set) and asked to wire the 3 new sources
+(Agmarknet, MSP, FAOSTAT) into the actual report in the same effort — until this point they were standalone
+raw-ingestion pipelines with no report-layer consumer at all.
+
+### `app/report/source_relevance.py` (new) — the hybrid classifier
+
+`is_agriculture_relevant(hs6, ...)`: HS chapters 01-24 (Sections I-IV — live animals, vegetable products,
+animal/vegetable fats, prepared foodstuffs/beverages/tobacco) are unambiguously agriculture — `True`, no
+model call. A narrow **boundary set** (chapters 50-53: silk/wool/cotton/vegetable-fibre) triggers one real
+`MODEL_UTILITY` call — chosen because this pipeline's own real MSP data already includes `"Cotton (Medium
+Staple)"` (HS chapter 52), a genuine agricultural raw material *outside* 01-24 that a fixed rule can't
+safely resolve either way. Every other chapter (the overwhelming majority — industrial goods, machinery,
+electronics, chemicals) is `False`, no model call, matching this pipeline's "a well-formed/clearly
+out-of-scope case costs nothing" principle already established for search. Budget-checked only immediately
+before the one real call this can make. New prompt `prompts/agriculture_relevance.md`. `app/models.py`
+gained `bool`-field support in `MockLLM`'s generic structured-output builder (the first plain-`bool`
+schema field this codebase has used).
+
+**Live-verified against the real Gemini model for the exact three real cases this was built for**: HS
+`120791` (poppy seeds, chapter 12) → `True`, rule-only, no model call. HS `252329` (portland cement, chapter
+25) → `False`, rule-only, no model call — **the literal "tomorrow cement" case now works correctly, live,
+end to end**. HS `520100` (raw cotton, boundary chapter 52) → `True`, via a real model call that actually
+fired and correctly judged raw cotton as a genuine agricultural raw material.
+
+### `app/report/facts.py` — three new sections, `NOT_APPLICABLE` vs. `NOT_FOUND`
+
+New `MandiPriceFact`/`MspFact`/`InternationalProductionFact`, each carrying a `status` of `OK`/`NOT_FOUND`/
+`NOT_APPLICABLE` — a real, deliberate distinction: `NOT_FOUND` means the source is relevant but this
+pipeline's own raw table has no matching row (a real structural gap, like Agmarknet's confirmed lack of
+poppy-seed coverage, or simply nothing ingested yet); `NOT_APPLICABLE` means the question doesn't apply at
+all (Agmarknet's mandi prices are not a coherent concept for cement). `assemble_facts` gained a new
+required `include_agriculture_sources: bool` parameter — a **plain pre-computed boolean, not a model call
+made inside this function** — `assemble_facts` stays fully deterministic (its own module docstring's
+original promise), matching D13's ingestion-vs-query-plane separation; the caller (`app/main.py`'s
+`post_trade_report` route) calls `is_agriculture_relevant` once and passes the result in.
+
+**A real, live-confirmed matching problem, honestly handled rather than papered over**: none of the three
+sources has a curated HS6-to-commodity-name crosswalk, and real names don't line up exactly (FAOSTAT's
+singular `"Poppy seed"` vs. this pipeline's own taxonomy description `"Oil seeds; poppy seeds, whether or
+not broken"`). `_commodity_name_matches`/`_normalize_commodity_text` do a light, explicitly-flagged
+heuristic (lowercase, strip punctuation, strip a trailing "s", then a normalized-substring check either
+direction) — real, live-verified to correctly match FAOSTAT's real item to the real taxonomy description,
+but documented as a heuristic, not a guaranteed-correct crosswalk (same honesty convention as this
+pipeline's other reasoned-not-verified thresholds).
+
+**Real end-to-end verification, live**: `assemble_facts` for HS `120791` (poppy seeds) with
+`include_agriculture_sources=True`, reading the real data already in this pipeline's own tables —
+`mandi_price.status='NOT_FOUND'` (real, confirmed Agmarknet gap), `msp.status='NOT_FOUND'` (poppy seeds are
+genuinely not one of the 22 real MSP-mandated crops), `international_production.status='OK'` with
+`india_status='NOT_FOUND'` (FAOSTAT's real `M` flag, never a fabricated zero) and a real, positive world
+total. Separately, HS `252329` (cement) with `include_agriculture_sources=False` (from the real classifier
+call above) → all three sections `NOT_APPLICABLE`, confirmed live end to end through the actual
+`assemble_facts` call, not just the classifier in isolation.
+
+18 new tests (7 unit for the classifier, 6 unit for the matching heuristic, 8 integration for the three
+fetch functions + `assemble_facts` wiring, including the real poppy-seed end-to-end check against already-
+loaded data) + fixed 3 existing `assemble_facts` call sites and one `Facts(...)` test fixture for the new
+required fields. 634 tests passing (was 613; +21, net of the fixed existing tests). `mypy app` (65
+files)/`ruff`/`black`: clean.

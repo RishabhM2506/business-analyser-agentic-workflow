@@ -19,6 +19,9 @@ from app.report.facts import (
     AnnualSeriesYear,
     Facts,
     HhiYear,
+    InternationalProductionFact,
+    MandiPriceFact,
+    MspFact,
     PartnerFact,
     UnitValueTrendYear,
     Window,
@@ -96,6 +99,29 @@ def _facts(*, regulatory_note_missing_warning: bool = False) -> Facts:
         regulatory_note_missing_warning=regulatory_note_missing_warning,
         coverage=None,
         hs8_split_note="12079100 is the only ITC-HS8 line beneath 120791 as of this vintage.",
+        mandi_price=MandiPriceFact(
+            status="NOT_APPLICABLE",
+            matched_commodity=None,
+            modal_price_inr_paise_per_qtl=None,
+            price_date=None,
+            market=None,
+            state=None,
+        ),
+        msp=MspFact(
+            status="NOT_APPLICABLE",
+            matched_commodity=None,
+            year_label=None,
+            msp_inr_paise_per_qtl=None,
+            cost_inr_paise_per_qtl=None,
+        ),
+        international_production=InternationalProductionFact(
+            status="NOT_APPLICABLE",
+            matched_item=None,
+            year=None,
+            india_status=None,
+            india_production_tonnes=None,
+            world_production_tonnes=None,
+        ),
     )
 
 

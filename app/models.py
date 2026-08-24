@@ -165,6 +165,13 @@ _HS6_PATTERN = re.compile(r"\b\d{6}\b")
 # relevance_score` and any future plain-`float` structured-output field.
 _MOCK_FLOAT_VALUE = 0.5
 
+# `app.report.source_relevance.AgricultureRelevanceCheck.is_agricultural`
+# is the first plain-`bool` structured-output field — under
+# `LLM_PROVIDER=mock` this call never fires for real (mock mode has no
+# real judgment to make), so a fixed, schema-valid constant is enough,
+# same reasoning as `_MOCK_FLOAT_VALUE`.
+_MOCK_BOOL_VALUE = True
+
 
 def _list_item_model(annotation: Any) -> type[BaseModel] | None:
     """If `annotation` is exactly `list[SomeModel]`, return `SomeModel`;
@@ -204,10 +211,12 @@ def _mock_nested_instance(item_model: type[BaseModel], *, hs_code: str, user_con
             values[name] = _mock_text_for(user_content, field_name=name)
         elif field.annotation is float:
             values[name] = _MOCK_FLOAT_VALUE
+        elif field.annotation is bool:
+            values[name] = _MOCK_BOOL_VALUE
         else:
             raise NotImplementedError(
                 f"MockLLM has no generic mock strategy for {item_model.__name__}.{name}: "
-                f"{field.annotation!r} (only plain `str`/`float` fields are supported)"
+                f"{field.annotation!r} (only plain `str`/`float`/`bool` fields are supported)"
             )
     return item_model.model_validate(values)
 
@@ -255,6 +264,8 @@ def _build_mock_instance[U: BaseModel](schema: type[U], *, user_content: str) ->
             field_values[name] = _mock_text_for(user_content, field_name=name)
         elif field.annotation is float:
             field_values[name] = _MOCK_FLOAT_VALUE
+        elif field.annotation is bool:
+            field_values[name] = _MOCK_BOOL_VALUE
         elif item_model is not None and "hs_code" in item_model.model_fields:
             field_values[name] = _mock_hs_code_list(
                 item_model, field=field, user_content=user_content
@@ -262,7 +273,7 @@ def _build_mock_instance[U: BaseModel](schema: type[U], *, user_content: str) ->
         else:
             raise NotImplementedError(
                 f"MockLLM has no generic mock strategy for {schema.__name__}.{name}: "
-                f"{field.annotation!r} (only plain `str`/`float` fields and "
+                f"{field.annotation!r} (only plain `str`/`float`/`bool` fields and "
                 f"`list[NestedModel]` fields where `NestedModel` has an `hs_code` "
                 f"field are supported)"
             )

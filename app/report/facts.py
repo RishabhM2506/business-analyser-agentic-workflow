@@ -58,6 +58,7 @@ evidence-first mandate forbids:
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -65,7 +66,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.knowledge.provider import get_taxonomy_entry
@@ -78,6 +79,9 @@ from app.warehouse.schema import (
     analytics_mismatch_checks,
     analytics_partner_rankings,
     analytics_unit_value_series,
+    raw_agmarknet_prices,
+    raw_faostat_records,
+    raw_msp_records,
     ref_hs6_hs8_crosswalk,
     ref_regulatory_notes,
 )
@@ -211,6 +215,81 @@ class Window(BaseModel):
     end_year: int
 
 
+# Status vocabulary for the three domain-specific agriculture sections
+# below — deliberately a plain `str`, not a shared DB enum (`cell_status`
+# is D1's own, narrower per-trade-flow-cell vocabulary; this is a
+# report-assembly-layer concept). `NOT_APPLICABLE` is real, live-directed
+# (2026-08-25, "today poppy seed, tomorrow cement"): a commodity these
+# sources categorically don't apply to (decided by
+# `app.report.source_relevance.is_agriculture_relevant`, called by this
+# module's own caller — see `assemble_facts`'s `include_agriculture_sources`
+# parameter) gets `NOT_APPLICABLE`, never `NOT_FOUND` — the two are not
+# the same claim: `NOT_FOUND` means the source is relevant but this
+# pipeline's own raw table has no matching row yet (e.g. no Agmarknet row
+# has been ingested for this commodity, or a real, confirmed structural
+# gap like poppy seeds' lack of Agmarknet coverage); `NOT_APPLICABLE`
+# means the question itself doesn't apply.
+AGRICULTURE_SECTION_STATUS_VALUES = ("OK", "NOT_FOUND", "NOT_APPLICABLE")
+
+
+class MandiPriceFact(BaseModel):
+    """Agmarknet's most recent real modal price for whatever commodity
+    name in `raw_agmarknet_prices` textually matches this HS6's taxonomy
+    description (`_commodity_name_matches` below) — a real, live-checked
+    limitation: this pipeline has no curated HS6<->Agmarknet-commodity
+    crosswalk, so matching is a heuristic normalized-substring check, not
+    an exact, guaranteed-correct mapping. Reads only this pipeline's own
+    already-ingested `raw_agmarknet_prices` rows (never a live Agmarknet
+    call at report-assembly time), so `status='NOT_FOUND'` can mean either
+    "Agmarknet genuinely has no data for this commodity" or "this
+    pipeline hasn't ingested it yet" — both are, honestly, "we don't have
+    a number to show," which is exactly what `NOT_FOUND` means here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    matched_commodity: str | None
+    modal_price_inr_paise_per_qtl: int | None
+    price_date: date | None
+    market: str | None
+    state: str | None
+
+
+class MspFact(BaseModel):
+    """The most recent real MSP + cost-of-production figures for whatever
+    commodity name in `raw_msp_records` matches this HS6's taxonomy
+    description — same matching caveat as `MandiPriceFact`. Only the 22
+    real MSP-mandated crops this pipeline has ingested can ever match."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    matched_commodity: str | None
+    year_label: str | None
+    msp_inr_paise_per_qtl: int | None
+    cost_inr_paise_per_qtl: int | None
+
+
+class InternationalProductionFact(BaseModel):
+    """Real FAOSTAT production context for whatever `Item` in
+    `raw_faostat_records` matches this HS6's taxonomy description.
+    `status` describes whether a matching *item* was found at all;
+    `india_status`/`india_production_tonnes` are then reported separately
+    since a real item match (e.g. "Poppy seed") can still have India's
+    own row genuinely missing (FAOSTAT's real `M` flag) while the item
+    itself, and `world_production_tonnes`, are real and known — the two
+    are independent facts, never conflated."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    matched_item: str | None
+    year: int | None
+    india_status: str | None
+    india_production_tonnes: Decimal | None
+    world_production_tonnes: Decimal | None
+
+
 class Facts(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -230,6 +309,9 @@ class Facts(BaseModel):
     regulatory_note_missing_warning: bool
     coverage: CoverageFact | None
     hs8_split_note: str
+    mandi_price: MandiPriceFact
+    msp: MspFact
+    international_production: InternationalProductionFact
 
 
 @dataclass(frozen=True)
@@ -445,6 +527,190 @@ async def _fetch_hs8_split_note(engine: AsyncEngine, *, hs6: str) -> tuple[str, 
     return note, active_hs8
 
 
+def _normalize_commodity_text(text: str) -> str:
+    """Lowercase, word-tokenize, and lightly stem (strip a trailing "s")
+    — enough to match real observed shape differences across sources
+    without a curated crosswalk: FAOSTAT's singular `"Poppy seed"`
+    against this pipeline's own taxonomy description `"Oil seeds; poppy
+    seeds, whether or not broken"` normalize to `"...poppy seed..."` on
+    both sides. A real, flagged heuristic — not a guaranteed-correct
+    mapping (see `MandiPriceFact`'s docstring)."""
+    words = re.findall(r"[a-z]+", text.lower())
+    stemmed = [w[:-1] if w.endswith("s") and len(w) > 3 else w for w in words]
+    return " ".join(stemmed)
+
+
+def _commodity_name_matches(source_name: str, taxonomy_description: str) -> bool:
+    normalized_source = _normalize_commodity_text(source_name)
+    normalized_taxonomy = _normalize_commodity_text(taxonomy_description)
+    if not normalized_source or not normalized_taxonomy:
+        return False
+    return normalized_source in normalized_taxonomy or normalized_taxonomy in normalized_source
+
+
+async def _fetch_mandi_price(engine: AsyncEngine, *, taxonomy_description: str) -> MandiPriceFact:
+    async with engine.connect() as conn:
+        commodities = (
+            (await conn.execute(select(raw_agmarknet_prices.c.commodity).distinct()))
+            .scalars()
+            .all()
+        )
+        matched = next(
+            (c for c in commodities if _commodity_name_matches(c, taxonomy_description)), None
+        )
+        if matched is None:
+            return MandiPriceFact(
+                status="NOT_FOUND",
+                matched_commodity=None,
+                modal_price_inr_paise_per_qtl=None,
+                price_date=None,
+                market=None,
+                state=None,
+            )
+        row = (
+            (
+                await conn.execute(
+                    select(raw_agmarknet_prices)
+                    .where(raw_agmarknet_prices.c.commodity == matched)
+                    .order_by(desc(raw_agmarknet_prices.c.price_date))
+                    .limit(1)
+                )
+            )
+            .mappings()
+            .one()
+        )
+    return MandiPriceFact(
+        status="OK",
+        matched_commodity=matched,
+        modal_price_inr_paise_per_qtl=row["modal_price_inr_paise_per_qtl"],
+        price_date=row["price_date"],
+        market=row["market"],
+        state=row["state"],
+    )
+
+
+async def _fetch_msp(engine: AsyncEngine, *, taxonomy_description: str) -> MspFact:
+    async with engine.connect() as conn:
+        commodities = (
+            (await conn.execute(select(raw_msp_records.c.commodity).distinct())).scalars().all()
+        )
+        matched = next(
+            (c for c in commodities if _commodity_name_matches(c, taxonomy_description)), None
+        )
+        if matched is None:
+            return MspFact(
+                status="NOT_FOUND",
+                matched_commodity=None,
+                year_label=None,
+                msp_inr_paise_per_qtl=None,
+                cost_inr_paise_per_qtl=None,
+            )
+        row = (
+            (
+                await conn.execute(
+                    select(raw_msp_records)
+                    .where(raw_msp_records.c.commodity == matched)
+                    .order_by(desc(raw_msp_records.c.year_label))
+                    .limit(1)
+                )
+            )
+            .mappings()
+            .one()
+        )
+    return MspFact(
+        status="OK",
+        matched_commodity=matched,
+        year_label=row["year_label"],
+        msp_inr_paise_per_qtl=row["msp_inr_paise_per_qtl"],
+        cost_inr_paise_per_qtl=row["cost_inr_paise_per_qtl"],
+    )
+
+
+async def _fetch_international_production(
+    engine: AsyncEngine, *, taxonomy_description: str
+) -> InternationalProductionFact:
+    async with engine.connect() as conn:
+        items = (
+            (
+                await conn.execute(
+                    select(raw_faostat_records.c.item)
+                    .where(raw_faostat_records.c.element == "Production")
+                    .distinct()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        matched = next((i for i in items if _commodity_name_matches(i, taxonomy_description)), None)
+        if matched is None:
+            return InternationalProductionFact(
+                status="NOT_FOUND",
+                matched_item=None,
+                year=None,
+                india_status=None,
+                india_production_tonnes=None,
+                world_production_tonnes=None,
+            )
+        latest_year = (
+            await conn.execute(
+                select(raw_faostat_records.c.year)
+                .where(
+                    raw_faostat_records.c.item == matched,
+                    raw_faostat_records.c.element == "Production",
+                    raw_faostat_records.c.area == "World",
+                )
+                .order_by(desc(raw_faostat_records.c.year))
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if latest_year is None:
+            return InternationalProductionFact(
+                status="OK",
+                matched_item=matched,
+                year=None,
+                india_status=None,
+                india_production_tonnes=None,
+                world_production_tonnes=None,
+            )
+        world_row = (
+            (
+                await conn.execute(
+                    select(raw_faostat_records.c.value).where(
+                        raw_faostat_records.c.item == matched,
+                        raw_faostat_records.c.element == "Production",
+                        raw_faostat_records.c.area == "World",
+                        raw_faostat_records.c.year == latest_year,
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        india_row = (
+            (
+                await conn.execute(
+                    select(raw_faostat_records.c.value, raw_faostat_records.c.flag).where(
+                        raw_faostat_records.c.item == matched,
+                        raw_faostat_records.c.element == "Production",
+                        raw_faostat_records.c.area == "India",
+                        raw_faostat_records.c.year == latest_year,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    india_value = india_row["value"] if india_row is not None else None
+    return InternationalProductionFact(
+        status="OK",
+        matched_item=matched,
+        year=latest_year,
+        india_status="OK" if india_value is not None else "NOT_FOUND",
+        india_production_tonnes=india_value,
+        world_production_tonnes=world_row["value"],
+    )
+
+
 async def _fetch_regulatory_note(engine: AsyncEngine, *, hs6: str) -> str | None:
     async with engine.connect() as conn:
         return (
@@ -492,7 +758,18 @@ async def assemble_facts(
     window_end: date,
     top_n: int,
     as_of: date,
+    include_agriculture_sources: bool,
 ) -> Facts:
+    """`include_agriculture_sources` is a plain, pre-computed boolean, not
+    a model call made here — this function stays fully deterministic
+    (its own module docstring's promise), matching `docs/PLAN.md`'s
+    ingestion-vs-query-plane separation (D13). The caller decides
+    relevance once (`app.report.source_relevance.is_agriculture_relevant`,
+    real live-directed 2026-08-25: "today poppy seed, tomorrow cement" —
+    Agmarknet/MSP/FAOSTAT must not be queried, or reported `NOT_FOUND`,
+    for a commodity they categorically don't apply to) and passes the
+    result in; `False` makes `mandi_price`/`msp`/`international_production`
+    all `NOT_APPLICABLE` without touching their raw tables at all."""
     years = list(range(window_start.year, window_end.year + 1))
 
     rankings_by_year = await _fetch_rankings_by_year(engine, hs6=hs6, flow=flow, years=years)
@@ -544,6 +821,37 @@ async def assemble_facts(
     taxonomy_entry = get_taxonomy_entry(hs6)
     product_label = taxonomy_entry.description if taxonomy_entry is not None else hs6
 
+    if include_agriculture_sources:
+        mandi_price = await _fetch_mandi_price(engine, taxonomy_description=product_label)
+        msp = await _fetch_msp(engine, taxonomy_description=product_label)
+        international_production = await _fetch_international_production(
+            engine, taxonomy_description=product_label
+        )
+    else:
+        mandi_price = MandiPriceFact(
+            status="NOT_APPLICABLE",
+            matched_commodity=None,
+            modal_price_inr_paise_per_qtl=None,
+            price_date=None,
+            market=None,
+            state=None,
+        )
+        msp = MspFact(
+            status="NOT_APPLICABLE",
+            matched_commodity=None,
+            year_label=None,
+            msp_inr_paise_per_qtl=None,
+            cost_inr_paise_per_qtl=None,
+        )
+        international_production = InternationalProductionFact(
+            status="NOT_APPLICABLE",
+            matched_item=None,
+            year=None,
+            india_status=None,
+            india_production_tonnes=None,
+            world_production_tonnes=None,
+        )
+
     return Facts(
         hs6=hs6,
         product_label=product_label,
@@ -563,4 +871,7 @@ async def assemble_facts(
             engine, hs6=hs6, flow=flow, window_start=window_start, window_end=window_end
         ),
         hs8_split_note=hs8_split_note,
+        mandi_price=mandi_price,
+        msp=msp,
+        international_production=international_production,
     )

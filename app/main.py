@@ -75,12 +75,14 @@ from app.budget import BudgetExceededError, get_budget_tracker
 from app.cache.response_cache import filter_hash, get_response_cache
 from app.graph import COMBINED_PROMPT_VERSION, build_checkpointer, build_graph
 from app.guardrails import check_hs_code_allowlisted
+from app.knowledge.provider import get_taxonomy_entry
 from app.models import get_model_for_role
 from app.nodes.validate_query import resolve_year_range
 from app.observability import build_trace_metadata, configure_langsmith_tracing
 from app.rate_limit import RateLimiter
 from app.report.facts import assemble_facts
 from app.report.narrative import generate_narrative
+from app.report.source_relevance import is_agriculture_relevant
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import ProductSearchQuery, TradeQuery, TradeReportQuery
 from app.schemas.response import (
@@ -954,6 +956,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         try:
             engine = get_warehouse_engine()
+            taxonomy_entry = get_taxonomy_entry(query.hs_code)
+            commodity_description = (
+                taxonomy_entry.description if taxonomy_entry is not None else query.hs_code
+            )
+            include_agriculture_sources = await is_agriculture_relevant(
+                query.hs_code,
+                commodity_description=commodity_description,
+                model_client=get_model_for_role("utility", provider=settings.llm_provider),
+                budget_tracker=get_budget_tracker(),
+                thread_id=thread_id,
+                tenant_id=query.tenant_id,
+            )
             facts = await assemble_facts(
                 engine,
                 hs6=query.hs_code,
@@ -962,6 +976,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 window_end=window_end,
                 top_n=query.top_n,
                 as_of=today,
+                include_agriculture_sources=include_agriculture_sources,
             )
             model_client = get_model_for_role("analysis", provider=settings.llm_provider)
             result = await generate_narrative(
