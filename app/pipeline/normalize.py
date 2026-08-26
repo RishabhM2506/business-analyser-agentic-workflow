@@ -58,8 +58,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -72,6 +73,8 @@ from app.warehouse.schema import (
     raw_dgcis_annual,
     ref_country_crosswalk,
 )
+
+logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 
 UNMAPPED_PREFIX = "UNMAPPED:"
 DGCIS_DATASET_VERSION = "dgcis-annual-v1"
@@ -98,6 +101,17 @@ COMTRADE_DATASET_VERSION_PARTNER_ROLE = "comtrade-mirror-partner-v1"
 # historical vintage forever (its own real unique key includes vintage),
 # so nothing is lost, only the normalized layer's view moves forward.
 BACI_DATASET_VERSION = "baci-v1"
+
+
+def _to_paise(value: Decimal) -> int:
+    """USD/INR-value `Decimal` -> integer paise, rounded half-up — not
+    Python's `int()` (truncates toward zero, a systematic downward bias on
+    every converted row). Matches `app.report.landed_cost`'s own rounding
+    mode (architect-review finding, 2026-08-26: this module's own comment
+    culture already states "rounding happens once, at render time, never
+    mid-calculation" as a deliberate rule — this was a real gap against that
+    rule, not a difference in per-row magnitude that would matter)."""
+    return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def _derive_status(*, value: int | None, quantity: Decimal | None) -> str:
@@ -170,7 +184,26 @@ async def normalize_dgcis_annual_rows(
 
     normalized_rows = []
     for raw in raw_rows:
-        _year, period_month = _dgcis_fiscal_year_to_period_month(raw["fiscal_year_label"])
+        # Per-row fault isolation (architect-review finding, 2026-08-26):
+        # `_dgcis_fiscal_year_to_period_month` deliberately raises on a
+        # genuinely malformed fiscal_year_label rather than guessing a year
+        # (its own docstring) — but before this fix, one bad label anywhere
+        # among (potentially) ~250 countries' worth of real scraped rows
+        # for this hs6 aborted normalization for *every* row, not just the
+        # offending one, inconsistent with `app.pipeline.comtrade_mirror.
+        # fetch_all_countries_annual`'s own documented "one bad country
+        # never aborts the batch" discipline one layer upstream. Skip-and-
+        # log the one bad row; every other row still normalizes.
+        try:
+            _year, period_month = _dgcis_fiscal_year_to_period_month(raw["fiscal_year_label"])
+        except ValueError:
+            logger.warning(
+                "normalize_dgcis_annual_rows.malformed_fiscal_year_label",
+                hs8=raw["hs8"],
+                partner_country=raw["partner_country"],
+                fiscal_year_label=raw["fiscal_year_label"],
+            )
+            continue
         value = raw["value_inr_paise"]
         # raw_dgcis_annual has no quantity column at all - this report
         # never returns one (verified live, §1) - so quantity is always
@@ -200,6 +233,12 @@ async def normalize_dgcis_annual_rows(
                 "quantity_kg": None,
             }
         )
+
+    if not normalized_rows:
+        # Every row for this hs6 had a malformed fiscal_year_label (all
+        # skipped above) — an empty `.values([])` upsert is invalid, and
+        # there is nothing real to write anyway.
+        return 0
 
     async with engine.begin() as conn:
         stmt = insert(normalized_trade_flows).values(normalized_rows)
@@ -254,8 +293,8 @@ async def normalize_comtrade_rows(
             continue
         rate, rate_date = fx_rates[year]
         value_usd = raw["primary_value_usd"]
-        value_original_paise = int(value_usd * 100) if value_usd is not None else None
-        value_inr_paise = int(value_usd * rate * 100) if value_usd is not None else None
+        value_original_paise = _to_paise(value_usd) if value_usd is not None else None
+        value_inr_paise = _to_paise(value_usd * rate) if value_usd is not None else None
         status = _derive_status(value=value_inr_paise, quantity=raw["net_weight_kg"])
         flow = "import" if raw["flow_code"] == "M" else "export"
         # Query 1 (role="reporter") rows have reporter_code=699 (India) and
@@ -376,8 +415,8 @@ async def normalize_baci_rows(
 
         rate, rate_date = fx_rates[year]
         value_usd = raw["value_fob_usd"]
-        value_original_paise = int(value_usd * 100) if value_usd is not None else None
-        value_inr_paise = int(value_usd * rate * 100) if value_usd is not None else None
+        value_original_paise = _to_paise(value_usd) if value_usd is not None else None
+        value_inr_paise = _to_paise(value_usd * rate) if value_usd is not None else None
         status = _derive_status(value=value_inr_paise, quantity=raw["quantity_kg"])
         normalized_rows.append(
             {

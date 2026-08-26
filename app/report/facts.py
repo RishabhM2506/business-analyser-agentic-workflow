@@ -540,12 +540,37 @@ def _normalize_commodity_text(text: str) -> str:
     return " ".join(stemmed)
 
 
+def _contains_word_sequence(haystack: list[str], needle: list[str]) -> bool:
+    """True iff `needle` appears as a contiguous, whole-word run inside
+    `haystack` — not a raw string-substring check. Word-boundary matching
+    (architect-review finding, 2026-08-26): the old code joined both sides
+    into plain strings and used Python's `in`, which matches *inside* a
+    word too — "grape" is a genuine substring of "grapefruit" even though
+    they're different, unrelated commodities. Tokenizing first (matching
+    `_normalize_commodity_text`'s own word-list construction) and requiring
+    each `needle` word to line up with a whole `haystack` word closes that
+    false-positive class without narrowing the real, live-verified matches
+    this heuristic depends on (`_commodity_name_matches`'s own tests) — a
+    short *phrase* like "poppy seed" still matches "oil seed poppy seed
+    whether or not broken" exactly as before, since the fix is about word
+    boundaries, not phrase length."""
+    if not needle or len(needle) > len(haystack):
+        return False
+    return any(
+        haystack[i : i + len(needle)] == needle for i in range(len(haystack) - len(needle) + 1)
+    )
+
+
 def _commodity_name_matches(source_name: str, taxonomy_description: str) -> bool:
     normalized_source = _normalize_commodity_text(source_name)
     normalized_taxonomy = _normalize_commodity_text(taxonomy_description)
     if not normalized_source or not normalized_taxonomy:
         return False
-    return normalized_source in normalized_taxonomy or normalized_taxonomy in normalized_source
+    source_words = normalized_source.split()
+    taxonomy_words = normalized_taxonomy.split()
+    return _contains_word_sequence(taxonomy_words, source_words) or _contains_word_sequence(
+        source_words, taxonomy_words
+    )
 
 
 async def _fetch_mandi_price(engine: AsyncEngine, *, taxonomy_description: str) -> MandiPriceFact:

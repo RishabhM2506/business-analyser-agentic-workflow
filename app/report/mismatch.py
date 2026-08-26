@@ -293,7 +293,16 @@ async def compute_check_a(
 
     results: list[MismatchResult] = []
     skipped: list[SkippedCheck] = []
-    previous_signed_gap: Decimal | None = None
+    # `{year: signed_gap}`, looked up at `year - 1` specifically (matching
+    # `app.report.unit_value`'s identical "calendar-adjacent years only"
+    # rule) — not a single running "previous computed year" variable.
+    # Architect-review finding, 2026-08-26: a skipped interim year (a real,
+    # common outcome — either side NOT_REPORTED, or a zero DGCIS
+    # denominator) used to leave that variable pointing at whatever year
+    # was last *successfully* evaluated, silently comparing e.g. 2022
+    # against 2020 (not 2021) if 2021 was skipped — contradicting this
+    # module's own stated "sign flips year-on-year" semantics.
+    signed_gaps_by_year: dict[int, Decimal] = {}
     for year in sorted(years):
         dgcis_value = dgcis_totals.get(year)
         other_value = comtrade_india_totals.get(year)
@@ -305,14 +314,16 @@ async def compute_check_a(
             partner_country_code=ALL_PARTNERS,
             dgcis_value=dgcis_value,
             other_value=other_value,
-            previous_signed_gap_pct=previous_signed_gap,
+            previous_signed_gap_pct=signed_gaps_by_year.get(year - 1),
         )
         if isinstance(outcome, MismatchResult):
             results.append(outcome)
             assert dgcis_value is not None and other_value is not None  # else _evaluate skips
             # gap_pct on the result is already abs() - re-derive the signed
             # value for next year's flip comparison rather than losing it.
-            previous_signed_gap = _signed_gap_pct(dgcis_value=dgcis_value, other_value=other_value)
+            signed_gaps_by_year[year] = _signed_gap_pct(
+                dgcis_value=dgcis_value, other_value=other_value
+            )
         else:
             skipped.append(outcome)
     return results, skipped
@@ -351,7 +362,10 @@ async def compute_check_b(
             dataset_version=COMTRADE_DATASET_VERSION_PARTNER_ROLE,
             partner_country_code=partner_country_code,
         )
-        previous_signed_gap: Decimal | None = None
+        # Reset per partner — see compute_check_a's identical dict for why
+        # this is keyed by year and looked up at `year - 1` rather than a
+        # single running "previous computed year" variable.
+        signed_gaps_by_year: dict[int, Decimal] = {}
         for year in sorted(years):
             dgcis_value = dgcis_years.get(year)
             other_value = partner_comtrade_years.get(year)
@@ -363,12 +377,12 @@ async def compute_check_b(
                 partner_country_code=partner_country_code,
                 dgcis_value=dgcis_value,
                 other_value=other_value,
-                previous_signed_gap_pct=previous_signed_gap,
+                previous_signed_gap_pct=signed_gaps_by_year.get(year - 1),
             )
             if isinstance(outcome, MismatchResult):
                 results.append(outcome)
                 assert dgcis_value is not None and other_value is not None
-                previous_signed_gap = _signed_gap_pct(
+                signed_gaps_by_year[year] = _signed_gap_pct(
                     dgcis_value=dgcis_value, other_value=other_value
                 )
             else:
@@ -392,7 +406,9 @@ async def compute_check_c(
 
     results: list[MismatchResult] = []
     skipped: list[SkippedCheck] = []
-    previous_signed_gap: Decimal | None = None
+    # See compute_check_a's identical dict for why this is keyed by year
+    # and looked up at `year - 1` rather than a running variable.
+    signed_gaps_by_year: dict[int, Decimal] = {}
     for year in sorted(years):
         dgcis_value = dgcis_totals.get(year)
         other_value = baci_totals.get(year)
@@ -404,12 +420,14 @@ async def compute_check_c(
             partner_country_code=ALL_PARTNERS,
             dgcis_value=dgcis_value,
             other_value=other_value,
-            previous_signed_gap_pct=previous_signed_gap,
+            previous_signed_gap_pct=signed_gaps_by_year.get(year - 1),
         )
         if isinstance(outcome, MismatchResult):
             results.append(outcome)
             assert dgcis_value is not None and other_value is not None
-            previous_signed_gap = _signed_gap_pct(dgcis_value=dgcis_value, other_value=other_value)
+            signed_gaps_by_year[year] = _signed_gap_pct(
+                dgcis_value=dgcis_value, other_value=other_value
+            )
         else:
             skipped.append(outcome)
     return results, skipped

@@ -137,6 +137,86 @@ async def test_normalize_dgcis_annual_rows_resolves_crosswalk_and_status(
     assert by_year[2025]["partner_country_code"] == "UNMAPPED:UNKNOWNLAND"
 
 
+async def test_normalize_dgcis_annual_rows_skips_a_malformed_row_without_aborting_the_batch(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """Architect-review regression (2026-08-26): one row with a genuinely
+    malformed fiscal_year_label used to raise and abort normalization for
+    *every* row in the batch, not just the offending one — inconsistent
+    with app.pipeline.comtrade_mirror's own "one bad country never aborts
+    the batch" discipline one layer upstream. This seeds two good rows and
+    one bad one in the same call and asserts the two good rows still
+    normalize (the bad one silently isn't written, never raises)."""
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(ref_country_crosswalk).values(dgcis_country_name="TESTLAND", country_code="792")
+        )
+        await conn.execute(
+            insert(raw_dgcis_annual).values(
+                [
+                    {
+                        "scraped_at": datetime.now(UTC),
+                        "fiscal_year_label": "2023 - 2024",
+                        "hs8": _TEST_HS8,
+                        "flow": "import",
+                        "partner_country": "TESTLAND",
+                        "description": "TEST COMMODITY",
+                        "unit": "KGS",
+                        "value_inr_paise": 100_000_000,
+                        "raw_payload": {},
+                    },
+                    {
+                        "scraped_at": datetime.now(UTC),
+                        # Genuinely malformed - not parseable as a year at
+                        # all, the real shape a scraper bug or a source
+                        # format change could produce.
+                        "fiscal_year_label": "not-a-fiscal-year",
+                        "hs8": _TEST_HS8,
+                        "flow": "import",
+                        "partner_country": "TESTLAND",
+                        "description": "TEST COMMODITY",
+                        "unit": "KGS",
+                        "value_inr_paise": 200_000_000,
+                        "raw_payload": {},
+                    },
+                    {
+                        "scraped_at": datetime.now(UTC),
+                        "fiscal_year_label": "2024 - 2025",
+                        "hs8": _TEST_HS8,
+                        "flow": "import",
+                        "partner_country": "TESTLAND",
+                        "description": "TEST COMMODITY",
+                        "unit": "KGS",
+                        "value_inr_paise": 300_000_000,
+                        "raw_payload": {},
+                    },
+                ]
+            )
+        )
+
+    crosswalk = await _load_test_crosswalk(warehouse_engine)
+    # Must not raise - the malformed row is skipped, not fatal.
+    written = await normalize_dgcis_annual_rows(
+        warehouse_engine, hs6=_TEST_HS6, crosswalk=crosswalk
+    )
+
+    assert written == 2  # the two good rows, not the malformed one
+    async with warehouse_engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    select(normalized_trade_flows).where(normalized_trade_flows.c.hs6 == _TEST_HS6)
+                )
+            )
+            .mappings()
+            .all()
+        )
+    by_year = {r["period_month"].year: r for r in rows}
+    assert set(by_year) == {2023, 2024}  # not the malformed row's (nonexistent) year
+    assert by_year[2023]["value_inr_paise"] == 100_000_000
+    assert by_year[2024]["value_inr_paise"] == 300_000_000
+
+
 async def test_normalize_dgcis_annual_rows_does_not_collide_on_two_distinct_unmapped_countries(
     warehouse_engine: AsyncEngine,
 ) -> None:

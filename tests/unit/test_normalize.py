@@ -17,9 +17,34 @@ from app.pipeline.normalize import (
     CountryCrosswalk,
     _derive_status,
     _dgcis_fiscal_year_to_period_month,
+    _to_paise,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_to_paise_rounds_half_up_instead_of_truncating() -> None:
+    """Architect-review regression (2026-08-26): the old code used Python's
+    `int()`, which truncates toward zero — a systematic downward bias on
+    every converted row. $1.2349 (Decimal, matching the real
+    Numeric(18, 2)-sourced values this is always fed in practice) -> 123.49
+    paise; truncation would give 123, half-up rounding gives 123 too (below
+    the midpoint) - use a genuinely midpoint-or-above case instead to prove
+    rounding, not truncation, is happening."""
+    # 100.005 * 100 = 10000.5 - exactly the rounding-mode boundary: half-up
+    # rounds to 10001, truncation would give 10000.
+    assert _to_paise(Decimal("100.005")) == 10001
+
+
+def test_to_paise_matches_plain_int_for_an_exact_value() -> None:
+    assert _to_paise(Decimal("20.00")) == 2000
+
+
+def test_to_paise_rounds_a_real_fx_converted_value() -> None:
+    # A real shape this is actually fed: value_usd * rate, both Decimals.
+    value_usd = Decimal("1000.00")
+    rate = Decimal("83.12345")
+    assert _to_paise(value_usd * rate) == 8312345  # 1000 * 83.12345 * 100, exact here
 
 
 def test_derive_status_not_reported_when_value_is_none() -> None:

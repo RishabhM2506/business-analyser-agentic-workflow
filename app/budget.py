@@ -26,7 +26,24 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+
+# How long a thread_id can sit untouched before its counter is safe to
+# evict entirely (architect-review finding, 2026-08-26: `_thread_calls`
+# never shrank — every distinct thread_id ever seen added a permanent
+# entry for the life of the process, and `thread_id` is a free-form,
+# client-controlled string on an unauthenticated endpoint per this class's
+# own C1 finding, so this grows as a side effect of ordinary use, not even
+# needing to defeat the day ceiling on purpose). Generously above any
+# realistic single browsing session (docs/PLAN.md's per-session framing for
+# max_calls_per_thread) — an evicted thread_id's counter simply restarts at
+# zero if ever reused, identical to how a never-seen thread_id already
+# behaves (`check_and_increment`'s own `.get(thread_id, 0)`), so eviction
+# changes no observable behavior for a thread that's genuinely done.
+_THREAD_IDLE_TTL = timedelta(hours=2)
+# Sweep periodically, not on every call — see `app.rate_limit`'s identical
+# reasoning for the same trade-off.
+_SWEEP_INTERVAL_CALLS = 500
 
 
 class BudgetExceededError(Exception):
@@ -71,9 +88,11 @@ class BudgetTracker:
         self._max_calls_per_day = max_calls_per_day
         self._now_fn = now_fn
         self._thread_calls: dict[str, int] = {}
+        self._thread_last_seen: dict[str, datetime] = {}
         self._day_calls: dict[tuple[str, date], int] = {}
         self._global_day_calls: dict[date, int] = {}
         self._lock = asyncio.Lock()
+        self._calls_since_sweep = 0
 
     async def check_and_increment(self, *, thread_id: str, tenant_id: str) -> None:
         """Raise `BudgetExceededError` if incrementing would breach any
@@ -83,11 +102,25 @@ class BudgetTracker:
         partial spend recorded for a call that was refused.
         """
         async with self._lock:
-            today = self._now_fn().date()
+            now = self._now_fn()
+            today = now.date()
             day_key = (tenant_id, today)
             thread_count = self._thread_calls.get(thread_id, 0)
             day_count = self._day_calls.get(day_key, 0)
             global_day_count = self._global_day_calls.get(today, 0)
+
+            # Updated unconditionally, before the ceiling checks below — a
+            # thread that's actively being rejected for exceeding its own
+            # ceiling is still "active" for eviction purposes; touching this
+            # only on a successful increment would let a client bypass its
+            # own per-thread ceiling by waiting out `_THREAD_IDLE_TTL` while
+            # still hammering the same thread_id.
+            self._thread_last_seen[thread_id] = now
+
+            self._calls_since_sweep += 1
+            if self._calls_since_sweep >= _SWEEP_INTERVAL_CALLS:
+                self._calls_since_sweep = 0
+                self._sweep_idle_entries(now)
 
             if thread_count + 1 > self._max_calls_per_thread:
                 raise BudgetExceededError(
@@ -110,6 +143,22 @@ class BudgetTracker:
             self._thread_calls[thread_id] = thread_count + 1
             self._day_calls[day_key] = day_count + 1
             self._global_day_calls[today] = global_day_count + 1
+
+    def _sweep_idle_entries(self, now: datetime) -> None:
+        """Drop every thread_id untouched for `_THREAD_IDLE_TTL` or longer,
+        and every `_day_calls` entry whose day has already passed (a dead
+        counter the instant the day rolls over — no TTL needed, just a
+        direct comparison). `_global_day_calls` needs no sweep: it has at
+        most one entry per calendar day ever seen, already bounded.
+        Called with `self._lock` already held."""
+        cutoff = now - _THREAD_IDLE_TTL
+        idle_threads = [tid for tid, seen in self._thread_last_seen.items() if seen < cutoff]
+        for tid in idle_threads:
+            self._thread_calls.pop(tid, None)
+            self._thread_last_seen.pop(tid, None)
+
+        today = now.date()
+        self._day_calls = {key: count for key, count in self._day_calls.items() if key[1] == today}
 
 
 _budget_tracker_singleton: BudgetTracker | None = None

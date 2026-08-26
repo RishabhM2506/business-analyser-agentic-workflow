@@ -44,3 +44,26 @@ def test_does_not_match_an_unrelated_commodity() -> None:
 def test_does_not_match_when_either_side_is_empty() -> None:
     assert not _commodity_name_matches("", "Poppy seeds")
     assert not _commodity_name_matches("Poppy seeds", "")
+
+
+def test_does_not_match_a_word_that_is_only_a_raw_substring_of_a_different_word() -> None:
+    """Architect-review regression (2026-08-26): the old implementation
+    joined both sides into plain strings and used Python's `in`, which
+    matches *inside* a word too - "grape" is a genuine substring of
+    "grapefruit" even though they are different, unrelated commodities.
+    Real shape: a source commodity name that happens to be a strict prefix
+    of an unrelated taxonomy description's own single word must not match."""
+    assert not _commodity_name_matches("Grape", "Grapefruit; fresh or dried")
+    assert not _commodity_name_matches("Grapefruit; fresh or dried", "Grape")
+
+
+def test_does_not_match_a_generic_word_embedded_in_an_unrelated_longer_word() -> None:
+    # "oil" (a real, common source-side word) must not match "boil"/"foil"/
+    # etc. by raw substring - only a genuine whole-word occurrence counts.
+    assert not _commodity_name_matches("Oil", "Foil; aluminium, in rolls")
+
+
+def test_still_matches_a_short_source_phrase_against_a_longer_taxonomy_description() -> None:
+    # The word-boundary fix must not narrow phrase-length matching - only
+    # close the raw-substring-inside-a-word false-positive class.
+    assert _commodity_name_matches("Cotton", "Cotton; raw, not carded or combed")

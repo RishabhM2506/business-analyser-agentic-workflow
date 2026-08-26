@@ -144,6 +144,79 @@ async def test_compute_check_a_skips_a_year_with_no_comtrade_world_row(
     assert "NOT_REPORTED" in skipped[0].reason
 
 
+async def test_compute_check_a_direction_flip_compares_against_the_calendar_adjacent_year_only(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """Architect-review regression (2026-08-26): direction-flip detection
+    used to carry forward whatever year was last *successfully* evaluated,
+    not calendar-adjacent `year - 1` specifically. Here 2021 is skipped
+    (no Comtrade row at all); 2020 has a positive signed gap and 2022 has a
+    negative one. The buggy version would compare 2022 against 2020 (2
+    years apart, skipping over the gap left by 2021) and see a sign flip ->
+    incorrectly flag 2022 as "untrustworthy". The fix looks up 2021
+    specifically, finds nothing there (it was skipped, never computable),
+    and correctly treats 2022 as having no adjacent-year comparison at all
+    -> its severity comes from gap magnitude alone."""
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(normalized_trade_flows).values(
+                [
+                    _row(
+                        source="dgcis",
+                        dataset_version=DGCIS_DATASET_VERSION,
+                        year=2020,
+                        partner_country_code=_TEST_PARTNER,
+                        value_inr_paise=100_000_000_000,
+                    ),
+                    _row(
+                        source="comtrade",
+                        dataset_version=COMTRADE_DATASET_VERSION_REPORTER_ROLE,
+                        year=2020,
+                        partner_country_code=WORLD_AGGREGATE_PARTNER_CODE,
+                        value_inr_paise=105_000_000_000,  # +5% signed gap
+                    ),
+                    # 2021: DGCIS has a row, but no Comtrade world-aggregate
+                    # row at all - compute_check_a skips this year entirely
+                    # (matching test_compute_check_a_skips_a_year_with_no_
+                    # comtrade_world_row's own real repro of this shape).
+                    _row(
+                        source="dgcis",
+                        dataset_version=DGCIS_DATASET_VERSION,
+                        year=2021,
+                        partner_country_code=_TEST_PARTNER,
+                        value_inr_paise=100_000_000_000,
+                    ),
+                    _row(
+                        source="dgcis",
+                        dataset_version=DGCIS_DATASET_VERSION,
+                        year=2022,
+                        partner_country_code=_TEST_PARTNER,
+                        value_inr_paise=100_000_000_000,
+                    ),
+                    _row(
+                        source="comtrade",
+                        dataset_version=COMTRADE_DATASET_VERSION_REPORTER_ROLE,
+                        year=2022,
+                        partner_country_code=WORLD_AGGREGATE_PARTNER_CODE,
+                        value_inr_paise=95_000_000_000,  # -5% signed gap - opposite sign to 2020
+                    ),
+                ]
+            )
+        )
+
+    results, skipped = await compute_check_a(
+        warehouse_engine, hs6=_TEST_HS6, flow="import", years=[2020, 2021, 2022]
+    )
+
+    assert len(skipped) == 1
+    assert skipped[0].year == 2021
+
+    by_year = {r.year: r for r in results}
+    assert by_year[2020].direction_flip_yoy is False  # no year before it in this window
+    assert by_year[2022].direction_flip_yoy is False  # 2021 (its real predecessor) was skipped
+    assert by_year[2022].severity == "quiet"  # gap magnitude alone (5%), not "untrustworthy"
+
+
 async def test_compute_check_b_compares_dgcis_partner_to_that_partners_own_comtrade_export(
     warehouse_engine: AsyncEngine,
 ) -> None:

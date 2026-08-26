@@ -69,7 +69,7 @@ from fastapi.responses import JSONResponse
 from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.budget import BudgetExceededError, get_budget_tracker
 from app.cache.response_cache import filter_hash, get_response_cache
@@ -428,16 +428,25 @@ async def rate_limit_middleware(
     return await call_next(request)
 
 
-async def check_database(database_url: str) -> None:
-    """Open a real connection against `database_url` and run a trivial
-    query. Raises on any failure — callers decide what that means for their
-    response status."""
-    engine = create_async_engine(database_url, pool_pre_ping=True)
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-    finally:
-        await engine.dispose()
+async def check_database(engine: AsyncEngine) -> None:
+    """Run a trivial query against `engine`. Raises on any failure —
+    callers decide what that means for their response status.
+
+    Takes an already-constructed `engine`, rather than a `database_url` to
+    build one from itself (architect-review finding, 2026-08-26): the old
+    version called `create_async_engine(...)`/`.dispose()` on every single
+    `/healthz` request, needlessly churning a connection pool on every
+    liveness probe — `pool_pre_ping=True` already gives a *reused* pooled
+    connection the exact same "detect and reconnect a dead connection on
+    checkout" guarantee this was trying to buy with a full create/teardown
+    cycle. `lifespan` now constructs one process-lifetime engine
+    (`app.state.healthz_engine`), matching `app.state.thread_locks`/
+    `app.state.rate_limiter`'s existing per-app-instance (not process-wide
+    `lru_cache`) pattern — a process-wide singleton would leak across the
+    independently-configured `create_app()` calls each test in this suite
+    makes, exactly the reason those two are already per-app-instance."""
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
 
 
 @asynccontextmanager
@@ -463,7 +472,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # entered once here rather than per-request.
     async with build_checkpointer(settings.database_url) as checkpointer:
         app.state.compiled_graph = build_graph().compile(checkpointer=checkpointer)
-        yield
+        try:
+            yield
+        finally:
+            # `app.state.healthz_engine` is constructed synchronously in
+            # `create_app` (not here) — see that assignment's own comment
+            # for why — but disposed here, the one place guaranteed to run
+            # on real shutdown. A test harness that never runs `lifespan` at
+            # all (bare `httpx.ASGITransport`, `tests/integration/
+            # test_health.py`'s own documented constraint) simply never
+            # reaches this cleanup either, consistent with how this app
+            # already treats every other per-app-instance resource in that
+            # harness (`thread_locks`/`rate_limiter` are never explicitly
+            # torn down there today).
+            await app.state.healthz_engine.dispose()
     logger.info("app.shutdown")
 
 
@@ -480,6 +502,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = resolved_settings
+    # `/healthz`'s own engine (`check_database`, above) — constructed once
+    # per app instance and reused via its pool, not create/dispose-per-
+    # request (architect-review finding, 2026-08-26: the old code did
+    # exactly that churn on every single liveness-probe request, buying
+    # nothing `pool_pre_ping=True` doesn't already give a reused connection
+    # for free). Built here (synchronously), not inside `lifespan`: unlike
+    # `compiled_graph` (which needs `build_checkpointer`'s own `async with`
+    # setup), `create_async_engine` needs no async context to construct —
+    # opening this here instead keeps it available even under a test
+    # harness that never runs `lifespan` at all (`httpx.ASGITransport`,
+    # `tests/integration/test_health.py`'s own documented constraint;
+    # `resolved_settings.database_url` read directly here is exactly why
+    # the pre-fix version of `check_database` didn't have this problem).
+    app.state.healthz_engine = create_async_engine(
+        resolved_settings.database_url, pool_pre_ping=True
+    )
     # Per-app-instance, matching `app.state.settings`/`app.state.compiled_graph`
     # rather than a process-wide singleton (unlike `get_budget_tracker()`
     # etc.) — each test creates its own `create_app()`, and thread locks
@@ -539,11 +577,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/healthz")
-    async def healthz(response: Response) -> dict[str, object]:
+    async def healthz(response: Response, request: Request) -> dict[str, object]:
         checks: dict[str, str] = {}
         healthy = True
         try:
-            await check_database(resolved_settings.database_url)
+            await check_database(request.app.state.healthz_engine)
             checks["database"] = "ok"
         except Exception as exc:
             checks["database"] = "unreachable"

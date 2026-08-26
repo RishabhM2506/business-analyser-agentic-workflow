@@ -5,11 +5,17 @@ state, no I/O — `unit`, not `integration`.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.budget import BudgetExceededError, BudgetTracker, get_budget_tracker
+from app.budget import (
+    _SWEEP_INTERVAL_CALLS,
+    _THREAD_IDLE_TTL,
+    BudgetExceededError,
+    BudgetTracker,
+    get_budget_tracker,
+)
 
 
 @pytest.mark.unit
@@ -130,6 +136,80 @@ async def test_failed_check_does_not_partially_increment_either_counter() -> Non
         # Still the day ceiling that trips, not "thread ceiling now at 1/1
         # already used" -- proves no partial increment happened above.
         await tracker2.check_and_increment(thread_id="t-2", tenant_id="default")
+
+
+# --- idle-entry eviction (architect-review finding, 2026-08-26) ---------------
+#
+# `_thread_calls` used to grow forever — every distinct thread_id ever seen
+# (a free-form, client-supplied string on an unauthenticated endpoint, per
+# this class's own C1 finding) added a permanent entry for the life of the
+# process. These tests drive the sweep directly via `now_fn`, never real
+# wall-clock time.
+
+
+@pytest.mark.unit
+async def test_sweep_evicts_a_thread_idle_past_the_ttl() -> None:
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    tracker = BudgetTracker(max_calls_per_thread=5, max_calls_per_day=10_000, now_fn=lambda: start)
+    await tracker.check_and_increment(thread_id="t-1", tenant_id="default")
+    assert "t-1" in tracker._thread_calls
+
+    later = start + _THREAD_IDLE_TTL + timedelta(seconds=1)
+    tracker._now_fn = lambda: later
+    for i in range(_SWEEP_INTERVAL_CALLS):
+        await tracker.check_and_increment(thread_id=f"other-thread-{i}", tenant_id="default")
+
+    assert "t-1" not in tracker._thread_calls
+    assert "t-1" not in tracker._thread_last_seen
+
+
+@pytest.mark.unit
+async def test_sweep_does_not_evict_a_recently_touched_thread() -> None:
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    tracker = BudgetTracker(max_calls_per_thread=5, max_calls_per_day=10_000, now_fn=lambda: start)
+    await tracker.check_and_increment(thread_id="t-1", tenant_id="default")
+
+    soon = start + timedelta(minutes=1)  # well under the idle TTL
+    tracker._now_fn = lambda: soon
+    for i in range(_SWEEP_INTERVAL_CALLS):
+        await tracker.check_and_increment(thread_id=f"other-thread-{i}", tenant_id="default")
+
+    assert "t-1" in tracker._thread_calls  # still tracked - was not idle long enough
+
+
+@pytest.mark.unit
+async def test_a_rejected_call_still_counts_as_activity_for_eviction_purposes() -> None:
+    """A thread actively hammering its own ceiling (every call rejected)
+    must not have its counter evicted mid-stream - that would let a client
+    reset its own per-thread ceiling early by waiting out the idle TTL
+    while still nominally "using" the same thread_id."""
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    tracker = BudgetTracker(max_calls_per_thread=1, max_calls_per_day=10_000, now_fn=lambda: start)
+    await tracker.check_and_increment(thread_id="t-1", tenant_id="default")  # exhausts the 1 slot
+
+    later = start + _THREAD_IDLE_TTL + timedelta(seconds=1)
+    tracker._now_fn = lambda: later
+    with pytest.raises(BudgetExceededError):
+        await tracker.check_and_increment(thread_id="t-1", tenant_id="default")  # still rejected
+
+    assert tracker._thread_calls["t-1"] == 1  # counter intact, never silently reset
+
+
+@pytest.mark.unit
+async def test_sweep_evicts_stale_day_call_entries_once_the_day_has_passed() -> None:
+    yesterday = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    tracker = BudgetTracker(
+        max_calls_per_thread=100, max_calls_per_day=10_000, now_fn=lambda: yesterday
+    )
+    await tracker.check_and_increment(thread_id="t-1", tenant_id="tenant-a")
+    assert ("tenant-a", yesterday.date()) in tracker._day_calls
+
+    today = yesterday + timedelta(days=1)
+    tracker._now_fn = lambda: today
+    for i in range(_SWEEP_INTERVAL_CALLS):
+        await tracker.check_and_increment(thread_id=f"other-thread-{i}", tenant_id="tenant-b")
+
+    assert ("tenant-a", yesterday.date()) not in tracker._day_calls
 
 
 @pytest.mark.unit
