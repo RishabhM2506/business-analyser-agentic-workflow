@@ -49,9 +49,18 @@ def resolve_year_range(query: TradeQuery, *, now: datetime | None = None) -> tup
     """Resolve `TradeQuery.year_start`/`year_end` to concrete years per the
     schema's own documented defaults, so every downstream node (both
     `fetch_imports` and `fetch_exports`) agrees on the identical range
-    without each re-deriving "latest available" independently."""
+    without each re-deriving "latest available" independently.
+
+    `query.years` (2026-08-26 addition) is a relative alternative to
+    year_start/year_end — 'the last N years ending at latest available' —
+    resolved against the same `_latest_available_year` heuristic as the
+    no-args default, so a frontend "years of history" control never has to
+    duplicate that heuristic itself to stay in sync. The schema's own
+    validator (`TradeQuery._validate_year_range_ordering_and_span`) already
+    guarantees `years` and `year_start`/`year_end` are never both set."""
     year_end = query.year_end if query.year_end is not None else _latest_available_year(now=now)
-    year_start = query.year_start if query.year_start is not None else year_end - (YEAR_WINDOW - 1)
+    window = query.years if query.years is not None else YEAR_WINDOW
+    year_start = query.year_start if query.year_start is not None else year_end - (window - 1)
     return year_start, year_end
 
 

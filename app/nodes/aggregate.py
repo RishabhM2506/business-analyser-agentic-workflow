@@ -247,9 +247,15 @@ def aggregate(state: AnalysisState) -> dict[str, Any]:
     years = list(range(query.year_start, query.year_end + 1))
     return {
         "imports_table": build_trade_table(
-            raw_imports, years=years, fetch_issues=state.get("import_fetch_issues")
+            raw_imports,
+            years=years,
+            top_n=query.top_n,
+            fetch_issues=state.get("import_fetch_issues"),
         ),
         "exports_table": build_trade_table(
-            raw_exports, years=years, fetch_issues=state.get("export_fetch_issues")
+            raw_exports,
+            years=years,
+            top_n=query.top_n,
+            fetch_issues=state.get("export_fetch_issues"),
         ),
     }
