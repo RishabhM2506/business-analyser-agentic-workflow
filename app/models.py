@@ -17,14 +17,20 @@ documentation alone (`docs.langchain.com`'s current integration page for
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal, Protocol, TypeVar, get_args, get_origin
 
+import structlog
 from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 
 from app.guardrails import extract_numbers
 from app.nodes.aggregate import TOP_N_PARTNERS
+
+logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 
 NodeRole = Literal["utility", "analysis"]
 
@@ -57,15 +63,22 @@ class ModelClient(Protocol):
 class GeminiModelClient:
     """Real `langchain-google-genai`-backed adapter."""
 
-    def __init__(self, *, model: str, api_key: str) -> None:
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str,
+        max_retries: int = _GEMINI_MAX_RETRIES,
+        timeout: float = _GEMINI_TIMEOUT_SECONDS,
+    ) -> None:
         from langchain_google_genai import ChatGoogleGenerativeAI
 
         self._chat = ChatGoogleGenerativeAI(
             model=model,
             api_key=api_key,
             temperature=0.2,  # low but nonzero: consistent prose, not maximally deterministic
-            max_retries=_GEMINI_MAX_RETRIES,
-            timeout=_GEMINI_TIMEOUT_SECONDS,
+            max_retries=max_retries,
+            timeout=timeout,
         )
 
     async def generate_structured(
@@ -83,6 +96,198 @@ class GeminiModelClient:
             # not an expected runtime path.
             raise TypeError(f"expected {schema.__name__}, got {type(result).__name__}")
         return result
+
+
+# Small, fixed pause between failed attempts (a real request-path caller —
+# `app.pipeline.comtrade_mirror`'s own module docstring draws this same
+# distinction: "tight exponential backoff suited to a request path" vs. a
+# background job's fixed retry schedule — this is deliberately the former,
+# just simpler, since 3 bounded attempts don't need a full exponential
+# curve). Real purpose: on a genuinely model-wide, correlated failure (the
+# live-observed `503 "high demand"`, which can hit every key with the
+# *same* error near-simultaneously — see this class's own honest scope
+# note), firing all attempts back-to-back with zero pause burns quota
+# across the whole pool in milliseconds for no added chance of success.
+# Small enough not to meaningfully change the pool's own worst-case latency
+# budget (3 x 20s timeout already dominates 2 x 0.25s of pause).
+_RETRY_BACKOFF_SECONDS = 0.25
+
+# How many distinct keys one `generate_structured` call will try before
+# giving up (2026-08-26 addition, real user-supplied 7-key pool). Deliberately
+# not "try every key in the pool": each attempt still carries its own
+# `timeout` (below), so trying all N keys would multiply worst-case latency
+# by N. Bounded to 3 so the pool's own worst case stays roughly in line with
+# the *previous* single-key worst case (3 attempts x 20s timeout ~= 60s,
+# matching the old max_retries=2 => 3-attempts-on-one-key math) — the budget
+# is now spent trying 3 *different* keys instead of retrying the same
+# possibly-broken one 3 times, which is strictly more resilient for the same
+# wait, not a slower version of the old behavior.
+_DEFAULT_MAX_KEY_ATTEMPTS = 3
+
+# Each pooled per-key `GeminiModelClient` gets zero *internal* retries — the
+# pool itself is the retry mechanism (a failed attempt rotates to the next
+# key immediately) rather than each key separately burning its own
+# max_retries budget against what might be the same transient outage before
+# the pool ever gets a chance to rotate. Timeout is left at the standalone
+# default: a slow-but-eventually-successful call on one key shouldn't be cut
+# short more aggressively than a single-key deployment would be.
+_POOLED_KEY_MAX_RETRIES = 0
+
+
+class LoadBalancedGeminiModelClient:
+    """Round-robins `generate_structured` calls across multiple real Gemini
+    API keys and fails over to the next key when one call fails — built for
+    the real 2026-08-26 finding that a single key can hit a transient,
+    per-key failure (rate limiting/quota, a slow/hung connection) that a
+    *different* key is unaffected by. Drop-in `ModelClient`: every existing
+    call site (`get_model_for_role`'s only caller contract) is unaware
+    whether it holds one key or a pool of them.
+
+    Honest scope note: this helps most against *per-key* failure modes
+    (429 quota/rate-limit, one key's connection hanging) — it does not
+    guarantee relief from a genuinely model-wide capacity issue (Gemini's
+    own `503 "the model is currently experiencing high demand"`, observed
+    live this session on `gemini-flash-latest`), since that can plausibly
+    affect every key against the same overloaded model simultaneously. It's
+    real, additive resilience, not a claimed fix for every failure shape.
+
+    Never logs a raw key value anywhere, including on total exhaustion —
+    only each attempt's zero-based pool index and the real exception's own
+    type/message.
+
+    On total exhaustion, re-raises the *real* exception from the last
+    attempted key — never a wrapping type. This was a real, live bug this
+    class shipped with initially (backend-architect-review finding,
+    2026-08-26): `app/main.py`'s `post_message` classifies a failed graph
+    run's error code by `isinstance(exc, ValidationError |
+    OutputParserException)`; a wrapping `LoadBalancerExhaustedError` (even
+    with `raise ... from last_exc` chaining `__cause__`) does not satisfy
+    that check, so a genuine schema-validation failure on the last-attempted
+    key would have been misclassified as a retryable `INTERNAL_ERROR`
+    instead of the correct, non-retryable `SCHEMA_VALIDATION_FAILED` —
+    silently telling a client to retry a request that fails deterministically
+    every time. Re-raising the real exception keeps this class a truly
+    transparent `ModelClient` substitute, matching this docstring's own
+    "every existing call site is unaware whether it holds one key or a pool"
+    claim — the `gemini_load_balancer.all_attempts_exhausted` log line
+    (below) is the pool-exhaustion signal for observability instead of a
+    dedicated exception type.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        clients: list[ModelClient],
+        max_key_attempts: int = _DEFAULT_MAX_KEY_ATTEMPTS,
+        start_index_counter: itertools.count[int] | None = None,
+        sleep_fn: Callable[[float], Awaitable[object]] = asyncio.sleep,
+    ) -> None:
+        """`clients` is a pre-built `ModelClient` per pool member — deliberately
+        generic (not `api_keys: list[str]`) so the round-robin/failover logic
+        here has nothing Gemini-specific about it and is trivially testable
+        with plain fake `ModelClient`s, with no real network client or
+        credential ever required to exercise it. `model` is carried only for
+        log lines (`generate_structured` below) — it plays no role in
+        client construction here. Use `for_gemini_keys` (below) to build the
+        real thing from a list of API keys.
+
+        `start_index_counter`: defaults to a fresh `itertools.count()` owned
+        by this instance alone. `get_model_for_role` passes in a counter
+        *shared across every instance it builds for the same role* instead
+        (architect-review finding, 2026-08-26: `get_model_for_role`
+        constructs a brand new client on every single request — matching
+        the pre-existing per-request `GeminiModelClient` construction
+        pattern this file already had — so an instance-owned counter would
+        silently reset to key 0 every request, meaning every request's
+        *first* attempt would always hit the same key and the "successive
+        requests spread across the pool" property below would never
+        actually hold in production. Passing the counter in, rather than
+        this class owning module-level role-keyed state itself, keeps the
+        class itself just as easy to unit test as before — every existing
+        test constructing a pool directly still gets an isolated counter by
+        default, with no shared state to reset between tests."""
+        if not clients:
+            raise ValueError("LoadBalancedGeminiModelClient requires at least one client")
+        self._model = model
+        self._clients = clients
+        self._max_attempts = min(max_key_attempts, len(self._clients))
+        # Shared across every call this instance ever makes (not per-call) —
+        # and, via `start_index_counter`, across every instance
+        # `get_model_for_role` builds for the same role — so successive
+        # top-level requests start from different keys too, not just
+        # retries within one request, and load actually spreads across the
+        # pool rather than every request hammering key 0 first.
+        self._next_index = (
+            start_index_counter if start_index_counter is not None else itertools.count()
+        )
+        self._sleep = sleep_fn
+
+    @classmethod
+    def for_gemini_keys(
+        cls,
+        *,
+        model: str,
+        api_keys: list[str],
+        max_key_attempts: int = _DEFAULT_MAX_KEY_ATTEMPTS,
+        start_index_counter: itertools.count[int] | None = None,
+    ) -> LoadBalancedGeminiModelClient:
+        """Real-world entry point (`get_model_for_role`): one real,
+        zero-internal-retry `GeminiModelClient` per key — see
+        `_POOLED_KEY_MAX_RETRIES`'s own comment for why."""
+        clients: list[ModelClient] = [
+            GeminiModelClient(model=model, api_key=key, max_retries=_POOLED_KEY_MAX_RETRIES)
+            for key in api_keys
+        ]
+        return cls(
+            model=model,
+            clients=clients,
+            max_key_attempts=max_key_attempts,
+            start_index_counter=start_index_counter,
+        )
+
+    async def generate_structured(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> T:
+        pool_size = len(self._clients)
+        start = next(self._next_index) % pool_size
+        last_exc: Exception | None = None
+        for attempt in range(self._max_attempts):
+            if attempt > 0:
+                # Only between attempts, never before the first — see
+                # `_RETRY_BACKOFF_SECONDS`'s own comment for why this exists
+                # at all (avoid slamming every key back-to-back on a
+                # correlated, model-wide failure).
+                await self._sleep(_RETRY_BACKOFF_SECONDS)
+            index = (start + attempt) % pool_size
+            try:
+                return await self._clients[index].generate_structured(
+                    system_prompt=system_prompt, user_content=user_content, schema=schema
+                )
+            except Exception as exc:  # deliberately broad - see class docstring
+                last_exc = exc
+                logger.warning(
+                    "gemini_load_balancer.key_attempt_failed",
+                    model=self._model,
+                    key_index=index,
+                    pool_size=pool_size,
+                    attempt=attempt + 1,
+                    max_attempts=self._max_attempts,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+        logger.error(
+            "gemini_load_balancer.all_attempts_exhausted",
+            model=self._model,
+            pool_size=pool_size,
+            attempts_made=self._max_attempts,
+        )
+        # Re-raise the real last exception, never a wrapping type — see this
+        # class's own docstring for the real, live misclassification bug
+        # this fixes. `last_exc` is guaranteed set: the loop body always
+        # either returns or sets it before falling through.
+        assert last_exc is not None
+        raise last_exc
 
 
 _WORD_WITH_DIGIT_PATTERN = re.compile(r"\d")
@@ -291,8 +496,30 @@ class MockLLM:
         return _build_mock_instance(schema, user_content=user_content)
 
 
+# One round-robin start-index counter per role, persisted at module scope
+# (not owned by any single `LoadBalancedGeminiModelClient` instance) —
+# `get_model_for_role` is called fresh on every request (every real call
+# site: app/main.py's route handlers, app/nodes/describe_item.py,
+# app/nodes/summarize.py all call it once per request/graph-run, matching
+# this file's pre-existing per-request `GeminiModelClient` construction
+# pattern), so without this, each request's own instance-owned counter
+# would reset to 0 and every request's first attempt would always hit key
+# 0 — see `LoadBalancedGeminiModelClient.__init__`'s own docstring for the
+# full finding.
+_role_key_start_indices: dict[NodeRole, itertools.count[int]] = {}
+
+
 def get_model_for_role(role: NodeRole, *, provider: Literal["gemini", "mock"]) -> ModelClient:
-    """Return the configured model client for a given node role."""
+    """Return the configured model client for a given node role.
+
+    Real-provider branch returns a `LoadBalancedGeminiModelClient` when more
+    than one key is configured (`Settings.gemini_key_pool`), otherwise a
+    plain single-key `GeminiModelClient` — byte-for-byte the same object
+    every existing deployment already got, since `gemini_api_keys_extra`
+    defaults to empty. Every call site already treats the return value as
+    an opaque `ModelClient`, so this branch is invisible to callers either
+    way (docs/PLAN.md §3's "swapping providers is one file").
+    """
     if provider == "mock":
         return MockLLM()
 
@@ -300,4 +527,10 @@ def get_model_for_role(role: NodeRole, *, provider: Literal["gemini", "mock"]) -
 
     settings = get_settings()
     model_name = settings.model_utility if role == "utility" else settings.model_analysis
+    key_pool = settings.gemini_key_pool
+    if len(key_pool) > 1:
+        counter = _role_key_start_indices.setdefault(role, itertools.count())
+        return LoadBalancedGeminiModelClient.for_gemini_keys(
+            model=model_name, api_keys=key_pool, start_index_counter=counter
+        )
     return GeminiModelClient(model=model_name, api_key=settings.gemini_api_key)

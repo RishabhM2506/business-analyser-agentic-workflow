@@ -15,6 +15,12 @@ import os
 
 os.environ.setdefault("COMTRADE_API_KEY", "test-placeholder-comtrade-key")
 os.environ.setdefault("GEMINI_API_KEY", "test-placeholder-gemini-key")
+# Real env vars take precedence over `.env` (pydantic-settings' own
+# precedence order) - without this, a developer's real local `.env` setting
+# GEMINI_API_KEYS_EXTRA (the load balancer's extra-keys field,
+# app/settings.py) would leak into every bare `Settings()` construction in
+# this suite, exactly like every other field pre-empted below.
+os.environ.setdefault("GEMINI_API_KEYS_EXTRA", "[]")
 os.environ.setdefault("AGMARKNET_API_KEY", "test-placeholder-agmarknet-key")
 os.environ.setdefault("LLM_PROVIDER", "mock")
 os.environ.setdefault("MODEL_UTILITY", "mock-utility")
