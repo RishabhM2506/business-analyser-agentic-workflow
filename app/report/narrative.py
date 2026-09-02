@@ -8,6 +8,17 @@ pass `check_narrative_grounded` before being returned; unlike
 narrative built directly from `Facts`, guaranteed grounded by construction,
 so a caller always gets *some* narrative back, never a bare error.
 
+**The template fallback also covers a total model-call failure, not just
+an ungrounded result** (2026-09-03 fix, live-observed: `gemini-flash-latest`
+returning `503 "high demand"` across every key in the load-balanced pool
+propagated as a bare 500 from `POST /threads/{id}/trade-report`, contradicting
+this module's own "never a bare error" claim above). `generate_narrative`
+below now treats *any* exception from `model_client.generate_structured` the
+same as an ungrounded result: log it and move to the next attempt (or the
+template, if both attempts are exhausted). `BudgetExceededError` is still
+never caught — it's raised by `budget_tracker.check_and_increment`, called
+outside this try block, so it always propagates.
+
 **Grounding set generalizes `app.guardrails.check_numbers_grounded`'s
 pattern** rather than reusing it directly — that function is hardwired to
 `TradeTable`'s shape. Every numeric leaf of `Facts` (including structural
@@ -46,12 +57,15 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.budget import BudgetTracker
 from app.guardrails import extract_numbers
 from app.models import ModelClient
 from app.report.facts import Facts
+
+logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 
 PROMPT_VERSION = "trade_narrative-v1"
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "trade_narrative.md"
@@ -346,9 +360,20 @@ async def generate_narrative(
     sources: tuple[Literal["model", "model_retry"], ...] = ("model", "model_retry")
     for source in sources:
         await budget_tracker.check_and_increment(thread_id=thread_id, tenant_id=tenant_id)
-        result = await model_client.generate_structured(
-            system_prompt=system_prompt, user_content=user_content, schema=NarrativeOutput
-        )
+        try:
+            result = await model_client.generate_structured(
+                system_prompt=system_prompt, user_content=user_content, schema=NarrativeOutput
+            )
+        except Exception as exc:
+            # A total model-call failure (e.g. every key in a load-balanced
+            # pool exhausted) is treated the same as an ungrounded result -
+            # try the next attempt, or fall through to the template below.
+            logger.warning(
+                "narrative.model_call_failed",
+                source=source,
+                error_type=type(exc).__name__,
+            )
+            continue
         if check_narrative_grounded(result.narrative, facts):
             return NarrativeResult(narrative=result.narrative, source=source)
 
