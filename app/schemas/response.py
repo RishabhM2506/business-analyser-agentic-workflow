@@ -128,19 +128,21 @@ class RankedCandidateOut(BaseModel):
 
 class ProductSearchResponse(BaseModel):
     """The full result of a free-text product search. `outcome` drives the
-    frontend's branch: `auto_selected` carries a non-null
-    `selected_hs_code` the UI should navigate straight to;
-    `disambiguate` asks the user to pick from `candidates`;
-    `no_candidates_found` is a normal 200 (a nonsense query returning
-    nothing is a legitimate outcome, not an error — the same principle as
-    `years_no_data` rendering "no data recorded," not a failure)."""
+    frontend's branch: `disambiguate` asks the user to pick from
+    `candidates` (at most `app.search.service.MAX_DISAMBIGUATE_CANDIDATES`,
+    always accompanied client-side by an "or describe it again" option —
+    every search that finds anything real ends here, never auto-navigates,
+    2026-09-02 product decision: see `app.search.service`'s own module
+    docstring for why); `no_candidates_found` is a normal 200 (a nonsense
+    query returning nothing is a legitimate outcome, not an error — the
+    same principle as `years_no_data` rendering "no data recorded," not a
+    failure)."""
 
     model_config = ConfigDict(extra="forbid")
 
     thread_id: str
     query_text: str
-    outcome: Literal["auto_selected", "disambiguate", "no_candidates_found"]
-    selected_hs_code: str | None
+    outcome: Literal["disambiguate", "no_candidates_found"]
     candidates: list[RankedCandidateOut]
 
 

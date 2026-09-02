@@ -116,8 +116,8 @@ class _TranslatingModelClient:
             # Mirrors `test_rerank.py`'s `_EchoingModelClient`: scores by
             # position, descending - whichever candidate the provider
             # listed first (the only one, in every case this double is used
-            # for) clears `HIGH_CONFIDENCE_THRESHOLD`, regardless of which
-            # code it happens to be.
+            # for) clears `LOW_CONFIDENCE_FLOOR`, regardless of which code
+            # it happens to be.
             ranked = [
                 {"hs_code": code, "relevance_score": max(0.1, 0.95 - 0.3 * i)}
                 for i, code in enumerate(codes)
@@ -141,6 +141,27 @@ class _EchoNormalizeModelClient:
         raise AssertionError(f"unexpected schema in test double: {schema}")
 
 
+class _FixedPerCodeScoreModelClient:
+    """Fake `ModelClient` scoring each candidate by a caller-supplied
+    per-code map, for tests that need genuinely mixed above/below-floor
+    scores in one rerank result (unlike `_TranslatingModelClient`'s
+    single-fixed-score-per-call shape)."""
+
+    def __init__(self, *, scores_by_code: dict[str, float]) -> None:
+        self._scores_by_code = scores_by_code
+
+    async def generate_structured(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> T:
+        if schema is NormalizedQuery:
+            return schema.model_validate({"normalized_query": user_content.strip()})
+        codes = list(dict.fromkeys(_HS6_PATTERN.findall(user_content)))
+        ranked = [
+            {"hs_code": code, "relevance_score": self._scores_by_code[code]} for code in codes
+        ]
+        return schema.model_validate({"ranked_candidates": ranked})
+
+
 def _tracker(*, max_calls_per_thread: int = 10) -> BudgetTracker:
     return BudgetTracker(max_calls_per_thread=max_calls_per_thread, max_calls_per_day=100)
 
@@ -158,8 +179,8 @@ async def test_search_products_normalizes_a_bm25_empty_query_and_finds_correct_c
         budget_tracker=_tracker(),
     )
 
-    assert result.outcome == "auto_selected"
-    assert result.selected_hs_code == "120791"
+    assert result.outcome == "disambiguate"
+    assert result.ranked_candidates[0].hs_code == "120791"
     # Retried with the translated term after the raw term's real BM25
     # lookup found zero lexical overlap (verified against the real,
     # checked-in taxonomy - "posta dana" has none).
@@ -186,7 +207,7 @@ async def test_search_products_skips_normalization_when_bm25_already_finds_somet
         budget_tracker=_tracker(),
     )
 
-    assert result.outcome in {"auto_selected", "disambiguate"}
+    assert result.outcome == "disambiguate"
     # find_candidates called exactly once, with the raw query - no retry.
     assert provider.calls == ["coffee"]
 
@@ -228,3 +249,48 @@ async def test_search_products_budget_exhausted_before_normalize_raises_early() 
             model_client=_TranslatingModelClient(),
             budget_tracker=_tracker(max_calls_per_thread=0),
         )
+
+
+@pytest.mark.integration
+async def test_search_products_excludes_below_floor_candidates_from_the_disambiguate_list() -> None:
+    """MAX_DISAMBIGUATE_CANDIDATES caps the list at 5, but a candidate the
+    reranker itself scored below LOW_CONFIDENCE_FLOOR must never be one of
+    the 5 shown either, even if there's room - a below-floor candidate has
+    no more business being offered as a choice than the whole result would
+    if *every* candidate scored that low (the existing no_candidates_found
+    path, tested elsewhere). Six real Comtrade-shaped candidates, three
+    genuinely qualifying and three not."""
+    provider = _AlwaysFindsProvider(
+        [
+            SearchCandidate(hs_code="090111", description="Coffee A", fusion_score=0.9),
+            SearchCandidate(hs_code="090112", description="Coffee B", fusion_score=0.8),
+            SearchCandidate(hs_code="090121", description="Coffee C", fusion_score=0.7),
+            SearchCandidate(hs_code="090190", description="Unrelated A", fusion_score=0.6),
+            SearchCandidate(hs_code="210111", description="Unrelated B", fusion_score=0.5),
+            SearchCandidate(hs_code="210112", description="Unrelated C", fusion_score=0.4),
+        ]
+    )
+    model_client = _FixedPerCodeScoreModelClient(
+        scores_by_code={
+            "090111": 0.9,
+            "090112": 0.8,
+            "090121": 0.7,
+            "090190": 0.2,  # below LOW_CONFIDENCE_FLOOR (0.35)
+            "210111": 0.1,
+            "210112": 0.05,
+        }
+    )
+
+    result = await search_products(
+        "coffee",
+        thread_id="thread-1",
+        tenant_id="default",
+        search_provider=provider,
+        model_client=model_client,
+        budget_tracker=_tracker(),
+    )
+
+    assert result.outcome == "disambiguate"
+    returned_codes = {c.hs_code for c in result.ranked_candidates}
+    assert returned_codes == {"090111", "090112", "090121"}  # only the 3 qualifying codes
+    assert len(result.ranked_candidates) == 3  # under the cap of 5 - no padding to fill it

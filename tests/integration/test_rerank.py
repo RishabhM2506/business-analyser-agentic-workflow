@@ -17,12 +17,7 @@ import structlog
 from pydantic import BaseModel, ValidationError
 
 from app.search.candidates import SearchCandidate
-from app.search.rerank import (
-    HIGH_CONFIDENCE_THRESHOLD,
-    RerankOutput,
-    UngroundedRerankError,
-    rerank_candidates,
-)
+from app.search.rerank import RerankOutput, UngroundedRerankError, rerank_candidates
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -152,11 +147,3 @@ async def test_rerank_output_schema_rejects_malformed_hs_code() -> None:
         RerankOutput.model_validate(
             {"ranked_candidates": [{"hs_code": "not-a-code", "relevance_score": 0.5}]}
         )
-
-
-@pytest.mark.integration
-def test_high_confidence_threshold_is_a_real_probability() -> None:
-    # Cheap regression guard against an accidental typo turning the
-    # auto-select threshold into something nonsensical (e.g. 75 instead of
-    # 0.75) - the boundary that decides auto_selected vs disambiguate.
-    assert 0.0 < HIGH_CONFIDENCE_THRESHOLD <= 1.0

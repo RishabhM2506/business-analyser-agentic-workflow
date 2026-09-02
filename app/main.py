@@ -950,7 +950,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 thread_id=thread_id,
                 query_text=query.query_text,
                 outcome=result.outcome,
-                selected_hs_code=result.selected_hs_code,
                 candidates=candidates_out,
             ),
             status_code=200,
