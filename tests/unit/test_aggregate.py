@@ -11,8 +11,14 @@ from __future__ import annotations
 import pytest
 
 from app.nodes.aggregate import (
+    HIGH_VOLATILITY_COV_THRESHOLD,
+    REST_OF_WORLD_PARTNER_CODE,
+    _compute_hhi,
+    _rest_of_world_row,
+    _world_total_reconciles,
     aggregate,
     build_trade_table,
+    compute_trade_balance,
     find_excluded_partner_codes,
     flag_years_finalized,
     flag_years_no_data,
@@ -20,6 +26,7 @@ from app.nodes.aggregate import (
     strip_aggregate_partners,
 )
 from app.schemas.query import TradeQuery
+from app.schemas.response import CountryRow
 from app.state import AnalysisState, FetchIssue
 from app.tools.comtrade_client import ComtradeRecord
 
@@ -589,3 +596,225 @@ def test_aggregate_node_short_circuits_on_existing_error() -> None:
 def test_aggregate_node_defensive_noop_when_state_incomplete() -> None:
     assert aggregate({}) == {}
     assert aggregate({"query": TradeQuery(hs_code="010121")}) == {}  # no raw_imports/raw_exports
+
+
+# --- rest_of_world / world_total (Concern 1: "preserve the denominator") -----
+
+
+@pytest.mark.unit
+def test_rest_of_world_row_none_when_nothing_truncated() -> None:
+    records = [
+        _record(partner_code="842", partner_country="USA", year=2023, value=300.0),
+        _record(partner_code="826", partner_country="UK", year=2023, value=200.0),
+    ]
+    assert _rest_of_world_row(records, years=[2023], top_n=10) is None
+
+
+@pytest.mark.unit
+def test_rest_of_world_row_sums_exactly_the_truncated_countries_at_the_boundary() -> None:
+    """10 real countries -> no rest_of_world row; the 11th tips it over -
+    the exact top_n boundary this feature exists to handle."""
+    ten_countries = [
+        _record(partner_code=str(code), partner_country=f"Country{code}", year=2023, value=100.0)
+        for code in range(1, 11)
+    ]
+    assert _rest_of_world_row(ten_countries, years=[2023], top_n=10) is None
+
+    eleven_countries = [
+        *ten_countries,
+        _record(partner_code="11", partner_country="Country11", year=2023, value=50.0),
+    ]
+    row = _rest_of_world_row(eleven_countries, years=[2023], top_n=10)
+    assert row is not None
+    assert row.partner_code == REST_OF_WORLD_PARTNER_CODE
+    assert row.cumulative_5yr == pytest.approx(50.0)
+    assert row.values_by_year[2023] == pytest.approx(50.0)
+    assert row.rank == 11
+
+
+@pytest.mark.unit
+def test_build_trade_table_captures_world_total_without_double_counting_it() -> None:
+    records = [
+        _record(partner_code="0", partner_country="World", year=2023, value=1000.0),
+        _record(partner_code="842", partner_country="USA", year=2023, value=300.0),
+    ]
+    table = build_trade_table(records, years=[2023])
+    assert table.world_total_comtrade[2023] == pytest.approx(1000.0)
+    # World never leaks into rows/rest_of_world - only into excluded_partner_codes once.
+    assert "0" not in [row.partner_code for row in table.rows]
+    assert table.rest_of_world is None
+    assert table.excluded_partner_codes == ["0"]
+
+
+@pytest.mark.unit
+def test_build_trade_table_world_total_none_when_comtrade_never_reported_it() -> None:
+    records = [_record(partner_code="842", partner_country="USA", year=2023, value=300.0)]
+    table = build_trade_table(records, years=[2023])
+    assert table.world_total_comtrade[2023] is None  # distinct from a reported 0.0
+
+
+@pytest.mark.unit
+def test_world_total_reconciles_none_when_world_total_missing() -> None:
+    rows = [
+        CountryRow(
+            partner_country="USA",
+            partner_code="842",
+            values_by_year={2023: 300.0},
+            cumulative_5yr=300.0,
+            rank=1,
+        )
+    ]
+    result = _world_total_reconciles(rows, None, {2023: None}, years=[2023])
+    assert result == {2023: None}
+
+
+@pytest.mark.unit
+def test_world_total_reconciles_true_within_tolerance() -> None:
+    rows = [
+        CountryRow(
+            partner_country="USA",
+            partner_code="842",
+            values_by_year={2023: 300.0},
+            cumulative_5yr=300.0,
+            rank=1,
+        )
+    ]
+    rest_of_world = CountryRow(
+        partner_country="All Other Countries",
+        partner_code=REST_OF_WORLD_PARTNER_CODE,
+        values_by_year={2023: 700.0},
+        cumulative_5yr=700.0,
+        rank=2,
+    )
+    result = _world_total_reconciles(rows, rest_of_world, {2023: 1000.0}, years=[2023])
+    assert result == {2023: True}
+
+
+@pytest.mark.unit
+def test_world_total_reconciles_false_on_a_real_mismatch() -> None:
+    """A deliberately inconsistent fixture (top-N + rest_of_world sums to
+    far less than Comtrade's own World total) must be flagged, not silently
+    pass - this is exactly the class of internal inconsistency the check
+    exists to surface."""
+    rows = [
+        CountryRow(
+            partner_country="USA",
+            partner_code="842",
+            values_by_year={2023: 300.0},
+            cumulative_5yr=300.0,
+            rank=1,
+        )
+    ]
+    result = _world_total_reconciles(rows, None, {2023: 1000.0}, years=[2023])
+    assert result == {2023: False}
+
+
+# --- coefficient of variation (Concern 1: volatility) -------------------------
+# Pure-function CoV/CAGR fixture tests live in tests/unit/test_timeseries_math.py
+# (2026-09-02, Step 4 hardening) — this integration-level test stays here since
+# it exercises `rank_top_partners`'s own wiring, not the pure math itself.
+
+
+@pytest.mark.unit
+def test_rank_top_partners_flags_high_volatility_but_not_a_stable_partner() -> None:
+    records = [
+        _record(partner_code="842", partner_country="Spiky", year=2019, value=30_000_000.0),
+        _record(partner_code="842", partner_country="Spiky", year=2020, value=0.0),
+        _record(partner_code="842", partner_country="Spiky", year=2021, value=0.0),
+        _record(partner_code="826", partner_country="Steady", year=2019, value=9_000_000.0),
+        _record(partner_code="826", partner_country="Steady", year=2020, value=9_000_000.0),
+        _record(partner_code="826", partner_country="Steady", year=2021, value=9_000_000.0),
+    ]
+    rows = rank_top_partners(records, years=[2019, 2020, 2021])
+    by_country = {row.partner_country: row for row in rows}
+    assert by_country["Spiky"].coefficient_of_variation is not None
+    assert by_country["Spiky"].coefficient_of_variation > HIGH_VOLATILITY_COV_THRESHOLD
+    assert by_country["Spiky"].is_high_volatility is True
+    assert by_country["Steady"].coefficient_of_variation == pytest.approx(0.0)
+    assert by_country["Steady"].is_high_volatility is False
+
+
+# --- HHI concentration index (Concern 3: new metrics) -------------------------
+
+
+@pytest.mark.unit
+def test_compute_hhi_hand_computed_value() -> None:
+    # 50% + 30% + 20% shares -> 0.25 + 0.09 + 0.04 = 0.38
+    assert _compute_hhi([500.0, 300.0, 200.0]) == pytest.approx(0.38)
+
+
+@pytest.mark.unit
+def test_compute_hhi_none_for_non_positive_total() -> None:
+    assert _compute_hhi([]) is None
+    assert _compute_hhi([0.0, 0.0]) is None
+
+
+@pytest.mark.unit
+def test_build_trade_table_hhi_reflects_every_real_country_not_the_truncated_view() -> None:
+    """HHI must be computed over every real country's own cumulative value,
+    not the truncated top-N-plus-one-rest_of_world-bucket view - lumping a
+    diffuse tail into one synthetic row would overstate concentration
+    (squaring one big lumped share vs. summing many smaller squared
+    shares)."""
+    # 10 equal top-N countries + 10 more equally-sized countries in the
+    # tail: true HHI (20 equal 5% shares) is 20 * 0.05**2 = 0.05. Lumping
+    # the tail 10 into one 50%-share rest_of_world bucket would instead
+    # compute 10 * 0.05**2 + 0.5**2 = 0.275 - a very different answer.
+    records = [
+        _record(partner_code=str(code), partner_country=f"Country{code}", year=2023, value=100.0)
+        for code in range(1, 21)
+    ]
+    table = build_trade_table(records, years=[2023], top_n=10)
+    assert table.hhi is not None
+    assert table.hhi == pytest.approx(0.05)
+
+
+# --- trade balance (Concern 3: new metrics) -----------------------------------
+
+
+@pytest.mark.unit
+def test_compute_trade_balance_positive_when_exports_exceed_imports() -> None:
+    imports = build_trade_table(
+        [_record(partner_code="0", partner_country="World", year=2023, value=100.0)], years=[2023]
+    )
+    exports = build_trade_table(
+        [_record(partner_code="0", partner_country="World", year=2023, value=250.0)], years=[2023]
+    )
+    balance = compute_trade_balance(imports, exports)
+    assert balance.by_year[2023] == pytest.approx(150.0)
+    assert balance.cumulative == pytest.approx(150.0)
+
+
+@pytest.mark.unit
+def test_compute_trade_balance_none_for_a_year_missing_either_sides_world_total() -> None:
+    """One side never reported a World total for a year -> that year's
+    balance must be None, never a one-sided, misleading number."""
+    imports = build_trade_table(
+        [_record(partner_code="842", partner_country="USA", year=2023, value=100.0)],
+        years=[2023],  # no "0" record - world_total_comtrade[2023] is None
+    )
+    exports = build_trade_table(
+        [_record(partner_code="0", partner_country="World", year=2023, value=250.0)], years=[2023]
+    )
+    balance = compute_trade_balance(imports, exports)
+    assert balance.by_year[2023] is None
+    assert balance.cumulative is None
+
+
+@pytest.mark.unit
+def test_compute_trade_balance_cumulative_skips_none_years() -> None:
+    imports = build_trade_table(
+        [
+            _record(partner_code="0", partner_country="World", year=2022, value=100.0),
+            _record(partner_code="842", partner_country="USA", year=2023, value=50.0),
+        ],
+        years=[2022, 2023],
+    )
+    exports = build_trade_table(
+        [_record(partner_code="0", partner_country="World", year=2022, value=150.0)],
+        years=[2022, 2023],  # no World row for 2023
+    )
+    balance = compute_trade_balance(imports, exports)
+    assert balance.by_year[2022] == pytest.approx(50.0)
+    assert balance.by_year[2023] is None
+    assert balance.cumulative == pytest.approx(50.0)  # only the real year counted

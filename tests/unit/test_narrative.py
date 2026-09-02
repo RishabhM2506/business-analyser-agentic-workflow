@@ -8,6 +8,7 @@ pattern — no DB, no network needed for any of this).
 
 from __future__ import annotations
 
+from datetime import date
 from typing import TypeVar
 
 import pytest
@@ -59,6 +60,7 @@ def _facts(*, regulatory_note_missing_warning: bool = False) -> Facts:
                     PartnerFact(
                         rank=1,
                         country="Türkiye",
+                        partner_country_code="792",
                         value_inr_paise=424_660_000_000,
                         status="QTY_MISSING",
                     )
@@ -70,7 +72,15 @@ def _facts(*, regulatory_note_missing_warning: bool = False) -> Facts:
                 flow="import",
                 total_inr_paise=0,
                 status="ZERO",
-                partners=[PartnerFact(rank=1, country="Türkiye", value_inr_paise=0, status="ZERO")],
+                partners=[
+                    PartnerFact(
+                        rank=1,
+                        country="Türkiye",
+                        partner_country_code="792",
+                        value_inr_paise=0,
+                        status="ZERO",
+                    )
+                ],
                 all_other_partners=AllOtherPartnersFact(value_inr_paise=0, status="OK"),
             ),
         ],
@@ -92,6 +102,10 @@ def _facts(*, regulatory_note_missing_warning: bool = False) -> Facts:
             ),
         ],
         hhi_by_year=[HhiYear(year=2022, hhi=1), HhiYear(year=2023, hhi=None)],
+        overall_cagr=None,
+        overall_volatility=None,
+        cagr_by_partner={},
+        volatility_by_partner={},
         landed_cost=None,
         landed_cost_as_of_period=None,
         mismatch_checks=[],
@@ -122,6 +136,10 @@ def _facts(*, regulatory_note_missing_warning: bool = False) -> Facts:
             india_production_tonnes=None,
             world_production_tonnes=None,
         ),
+        llm_datapoints=[],
+        mandi_price_llm_datapoints=[],
+        msp_llm_datapoints=[],
+        international_production_llm_datapoints=[],
     )
 
 
@@ -146,6 +164,59 @@ def test_flatten_facts_numbers_includes_both_paise_and_crore() -> None:
     assert 424.66 in grounded  # crore conversion (424_660_000_000 paise = 424.66 crore)
     assert 2022.0 in grounded  # a plain structural year is also grounded
     assert 1.0 in grounded  # rank 1 / HHI 1 are also grounded
+
+
+def test_llm_datapoints_are_never_rendered_into_the_model_prompt() -> None:
+    """2026-09-02, Step 4 hardening: the model must never see a cited-but-
+    not-independently-verified figure, so it can never narrate one. This
+    is the actual protection mechanism - not a number-matching filter."""
+    from app.report.facts import LlmDatapointFact
+
+    facts = _facts().model_copy(
+        update={
+            "llm_datapoints": [
+                LlmDatapointFact(
+                    field_name="mandi_price",
+                    effective_period="2026-08",
+                    value={"modal_price_inr_paise_per_qtl": 999_999},
+                    source_authority="Test Authority",
+                    source_reference="Test",
+                    source_url=None,
+                    verified_date=date(2026, 9, 2),
+                )
+            ],
+            "mandi_price_llm_datapoints": [],
+        }
+    )
+    assert "999999" not in render_facts_for_prompt(facts)
+    assert "999,999" not in render_facts_for_prompt(facts)
+
+
+def test_llm_datapoints_numbers_are_technically_groundable_but_never_reach_the_prompt() -> None:
+    """Documents a known, deliberate tradeoff (see this module's own
+    docstring): `flatten_facts_numbers` is fully generic over `Facts`'
+    shape, so an `llm_datapoints` number is technically part of the
+    groundable set - this is harmless only because the number is never
+    rendered into the prompt in the first place (previous test), so a
+    model has no way to guess it by coincidence."""
+    from app.report.facts import LlmDatapointFact
+
+    facts = _facts().model_copy(
+        update={
+            "llm_datapoints": [
+                LlmDatapointFact(
+                    field_name="mandi_price",
+                    effective_period="2026-08",
+                    value={"modal_price_inr_paise_per_qtl": 777_777},
+                    source_authority="Test Authority",
+                    source_reference="Test",
+                    source_url=None,
+                    verified_date=date(2026, 9, 2),
+                )
+            ]
+        }
+    )
+    assert 777777.0 in flatten_facts_numbers(facts)
 
 
 def test_check_narrative_grounded_accepts_a_real_grounded_number() -> None:

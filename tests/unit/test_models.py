@@ -16,9 +16,13 @@ from app.guardrails import extract_numbers
 from app.models import (
     _RETRY_BACKOFF_SECONDS,
     GeminiModelClient,
+    GroundedResult,
+    GroundingCitation,
     LoadBalancedGeminiModelClient,
     MockLLM,
     ModelClient,
+    UngroundedSearchError,
+    _extract_citations,
     get_model_for_role,
 )
 
@@ -341,6 +345,17 @@ class _FakeModelClient:
             raise RuntimeError(f"simulated failure on {self.label}")
         return cast(T, _OneFieldSchema(description=f"handled by {self.label}"))
 
+    async def generate_grounded(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> GroundedResult[T]:
+        self.calls.append(user_content)
+        if self.fail:
+            raise RuntimeError(f"simulated failure on {self.label}")
+        return GroundedResult(
+            value=cast(T, _OneFieldSchema(description=f"handled by {self.label}")),
+            citations=[GroundingCitation(source_url=f"https://example.test/{self.label}")],
+        )
+
 
 async def _no_op_sleep(seconds: float) -> None:
     """Replaces the real inter-attempt backoff (`_RETRY_BACKOFF_SECONDS`) in
@@ -535,3 +550,152 @@ def test_load_balanced_client_for_gemini_keys_builds_one_client_per_key_without_
     )
     assert len(pool._clients) == 3  # whitebox: confirms one real client per key
     assert all(isinstance(client, GeminiModelClient) for client in pool._clients)
+
+
+# --- generate_grounded / GroundedResult (2026-09-02, Step 4 hardening) -------
+
+
+@pytest.mark.unit
+async def test_mock_llm_generate_grounded_returns_deterministic_citation() -> None:
+    result = await MockLLM().generate_grounded(
+        system_prompt="sys", user_content="hello", schema=_OneFieldSchema
+    )
+    assert isinstance(result, GroundedResult)
+    assert isinstance(result.value, _OneFieldSchema)
+    assert len(result.citations) == 1
+    assert result.citations[0].source_url.startswith("https://")
+
+
+@pytest.mark.unit
+async def test_load_balanced_client_generate_grounded_uses_the_first_healthy_key() -> None:
+    pool, fakes = _pool(("a", False), ("b", False), ("c", False))
+    result = await pool.generate_grounded(
+        system_prompt="sys", user_content="hello", schema=_OneFieldSchema
+    )
+    assert result.value.description == "handled by a"
+    assert result.citations == [GroundingCitation(source_url="https://example.test/a")]
+    assert fakes[0].calls == ["hello"]
+    assert fakes[1].calls == []
+
+
+@pytest.mark.unit
+async def test_load_balanced_client_generate_grounded_fails_over_to_the_next_key_on_failure() -> (
+    None
+):
+    pool, fakes = _pool(("a", True), ("b", False), ("c", False))
+    result = await pool.generate_grounded(
+        system_prompt="sys", user_content="hello", schema=_OneFieldSchema
+    )
+    assert result.value.description == "handled by b"
+    assert fakes[0].calls == ["hello"]
+    assert fakes[1].calls == ["hello"]
+    assert fakes[2].calls == []
+
+
+@pytest.mark.unit
+async def test_load_balanced_client_generate_grounded_raises_when_every_attempted_key_fails() -> (
+    None
+):
+    pool, fakes = _pool(("a", True), ("b", True), ("c", True))
+    with pytest.raises(RuntimeError, match="simulated failure on c"):
+        await pool.generate_grounded(
+            system_prompt="sys", user_content="hello", schema=_OneFieldSchema
+        )
+    assert all(fake.calls == ["hello"] for fake in fakes)
+
+
+class _AlwaysUngroundedClient:
+    """A `ModelClient` whose `generate_grounded` always raises
+    `UngroundedSearchError` — proves the pool rotates to the next key on
+    this failure exactly like any other exception (a key that couldn't
+    find a real citation is exactly as worth retrying on a different key
+    as a transient network error would be)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def generate_structured(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> T:
+        raise NotImplementedError
+
+    async def generate_grounded(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> GroundedResult[T]:
+        self.calls.append(user_content)
+        raise UngroundedSearchError("no real citation found")
+
+
+@pytest.mark.unit
+async def test_load_balanced_client_generate_grounded_rotates_past_an_ungrounded_result() -> None:
+    ungrounded = _AlwaysUngroundedClient()
+    healthy = _FakeModelClient(label="b", fail=False)
+    pool = LoadBalancedGeminiModelClient(
+        model="test-model", clients=[ungrounded, healthy], sleep_fn=_no_op_sleep
+    )
+    result = await pool.generate_grounded(
+        system_prompt="sys", user_content="hello", schema=_OneFieldSchema
+    )
+    assert result.value.description == "handled by b"
+    assert ungrounded.calls == ["hello"]
+    assert healthy.calls == ["hello"]
+
+
+# --- _extract_citations (2026-09-02, Step 4 hardening) -----------------------
+
+
+@pytest.mark.unit
+def test_extract_citations_empty_when_no_grounding_metadata_key() -> None:
+    assert _extract_citations({"finish_reason": "STOP"}) == []
+
+
+@pytest.mark.unit
+def test_extract_citations_empty_when_grounding_metadata_is_empty() -> None:
+    assert _extract_citations({"grounding_metadata": {}}) == []
+    assert _extract_citations({"grounding_metadata": None}) == []
+
+
+@pytest.mark.unit
+def test_extract_citations_parses_real_shaped_grounding_chunks() -> None:
+    metadata = {
+        "grounding_metadata": {
+            "grounding_chunks": [
+                {"web": {"uri": "https://example.test/a", "title": "Source A"}},
+                {"web": {"uri": "https://example.test/b", "title": "Source B"}},
+            ]
+        }
+    }
+    citations = _extract_citations(metadata)
+    assert citations == [
+        GroundingCitation(source_url="https://example.test/a", title="Source A"),
+        GroundingCitation(source_url="https://example.test/b", title="Source B"),
+    ]
+
+
+@pytest.mark.unit
+def test_extract_citations_parses_the_camel_case_groundingchunks_variant() -> None:
+    metadata = {
+        "grounding_metadata": {"groundingChunks": [{"web": {"uri": "https://example.test/c"}}]}
+    }
+    assert _extract_citations(metadata) == [GroundingCitation(source_url="https://example.test/c")]
+
+
+@pytest.mark.unit
+def test_extract_citations_title_is_none_when_not_present() -> None:
+    metadata = {
+        "grounding_metadata": {"grounding_chunks": [{"web": {"uri": "https://example.test/d"}}]}
+    }
+    citations = _extract_citations(metadata)
+    assert citations == [GroundingCitation(source_url="https://example.test/d", title=None)]
+
+
+@pytest.mark.unit
+def test_extract_citations_skips_a_chunk_with_no_web_field() -> None:
+    metadata = {"grounding_metadata": {"grounding_chunks": [{"retrievedContext": {}}]}}
+    assert _extract_citations(metadata) == []
+
+
+@pytest.mark.unit
+def test_extract_citations_skips_a_chunk_whose_web_has_no_uri() -> None:
+    metadata = {"grounding_metadata": {"grounding_chunks": [{"web": {"title": "No URI here"}}]}}
+    assert _extract_citations(metadata) == []

@@ -11,6 +11,12 @@ values; `tests/unit/test_aggregate.py` constructs `ComtradeRecord`s by hand
 rather than depending on live/fixture data, so every edge case (ties,
 missing years, more than 10 partners, all-aggregate input, a year with zero
 data at all) is exactly controllable.
+
+CAGR/coefficient-of-variation are computed via `app.analytics.timeseries_math`
+(2026-09-02, extracted there once `app.report.facts`, a separate pipeline,
+needed the identical pure math over its own differently-shaped data) —
+imported here under their original private names so every call site below
+is unchanged.
 """
 
 from __future__ import annotations
@@ -18,7 +24,10 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from app.schemas.response import CountryRow, TradeTable
+from app.analytics.timeseries_math import HIGH_VOLATILITY_COV_THRESHOLD
+from app.analytics.timeseries_math import cagr as _cagr
+from app.analytics.timeseries_math import coefficient_of_variation as _coefficient_of_variation
+from app.schemas.response import CountryRow, TradeBalance, TradeTable
 from app.state import AnalysisState, FetchIssue, has_error
 from app.tools.comtrade_client import (
     INDIA_REPORTER_CODE,
@@ -27,6 +36,20 @@ from app.tools.comtrade_client import (
 )
 
 TOP_N_PARTNERS = 10
+
+# Comtrade's own "World" aggregate partner code — see `is_aggregate_partner_code`.
+WORLD_PARTNER_CODE = "0"
+
+# Sentinel `partner_code` for the "every other real country" bucket
+# (`TradeTable.rest_of_world`) — chosen to never collide with a real
+# Comtrade numeric partner code.
+REST_OF_WORLD_PARTNER_CODE = "_REST_OF_WORLD_"
+
+# Tolerance for `TradeTable.world_total_reconciles`: the top-N + rest_of_world
+# sum is allowed to differ from Comtrade's own reported World total by this
+# fraction before being flagged as a real mismatch, not floating-point noise
+# or ordinary rounding across many partner-level records.
+_WORLD_TOTAL_RECONCILE_TOLERANCE = 0.01
 
 
 def _is_excluded_partner_code(partner_code: str) -> bool:
@@ -80,19 +103,20 @@ def _cumulative_value(values_by_year: dict[int, float | None]) -> float:
     return sum(value for value in values_by_year.values() if value is not None)
 
 
-def rank_top_partners(
-    records: list[ComtradeRecord], *, years: list[int], top_n: int = TOP_N_PARTNERS
-) -> list[CountryRow]:
-    """Pivot `records` (already stripped of aggregate codes) into one row
-    per partner country, ranked by 5-year cumulative value descending — an
+def _rank_candidates(
+    records: list[ComtradeRecord], *, years: list[int]
+) -> list[tuple[str, str, dict[int, float | None], float]]:
+    """Pivot `records` (already stripped of aggregate codes) into one
+    (partner_code, partner_country, values_by_year, cumulative) tuple per
+    partner country, sorted by 5-year cumulative value descending — an
     explicit Gate 0 decision (docs/PHASE0-FINDINGS.md §5): the most recent
     single year is frequently provisional/estimated, so cumulative value is
     the stable ranking basis, not latest-year value. Ties broken by partner
     country name (ascending) for fully deterministic output.
 
-    Returns at most `top_n` rows — fewer if fewer than `top_n` partner
-    countries have any data at all (no padding, no fabricated rows).
-    """
+    Returns *every* real candidate, not just the top-N — `rank_top_partners`
+    truncates for the ranked table; `_rest_of_world_row` and `_compute_hhi`
+    need the full list too (2026-09-02, Step 3 hardening)."""
     by_partner: dict[str, list[ComtradeRecord]] = defaultdict(list)
     for record in records:
         by_partner[record.partner_code].append(record)
@@ -108,19 +132,149 @@ def rank_top_partners(
         candidates.append((partner_code, partner_country, values_by_year, cumulative))
 
     candidates.sort(key=lambda item: (-item[3], item[1]))
+    return candidates
 
+
+def _build_country_row(
+    *,
+    partner_code: str,
+    partner_country: str,
+    values_by_year: dict[int, float | None],
+    cumulative: float,
+    rank: int,
+) -> CountryRow:
+    """Shared row-builder for both a ranked top-N partner and the synthetic
+    `rest_of_world` bucket — every `CountryRow` gets the same derived
+    statistics computed the same way, rather than an arbitrary asymmetry a
+    future reader would have to explain (2026-09-02, Step 3 hardening)."""
+    cov = _coefficient_of_variation(values_by_year)
+    return CountryRow(
+        partner_country=partner_country,
+        partner_code=partner_code,
+        values_by_year=values_by_year,
+        cumulative_5yr=cumulative,
+        rank=rank,
+        coefficient_of_variation=cov,
+        is_high_volatility=cov is not None and cov > HIGH_VOLATILITY_COV_THRESHOLD,
+        cagr=_cagr(values_by_year),
+    )
+
+
+def rank_top_partners(
+    records: list[ComtradeRecord], *, years: list[int], top_n: int = TOP_N_PARTNERS
+) -> list[CountryRow]:
+    """Pivot `records` (already stripped of aggregate codes) into the top-N
+    ranked partner-country rows (`_rank_candidates` does the actual
+    pivot/sort). Returns at most `top_n` rows — fewer if fewer than `top_n`
+    partner countries have any data at all (no padding, no fabricated
+    rows)."""
+    candidates = _rank_candidates(records, years=years)
     return [
-        CountryRow(
-            partner_country=partner_country,
+        _build_country_row(
             partner_code=partner_code,
+            partner_country=partner_country,
             values_by_year=values_by_year,
-            cumulative_5yr=cumulative,
+            cumulative=cumulative,
             rank=rank,
         )
         for rank, (partner_code, partner_country, values_by_year, cumulative) in enumerate(
             candidates[:top_n], start=1
         )
     ]
+
+
+def _rest_of_world_row(
+    records: list[ComtradeRecord], *, years: list[int], top_n: int = TOP_N_PARTNERS
+) -> CountryRow | None:
+    """Sum every real country ranked below the top-N cutoff into one
+    synthetic row (2026-09-02, Step 3 hardening, Concern 1: "preserve the
+    denominator" — a downstream percentage calculation using only the top-N
+    sum as its denominator would artificially inflate every shown partner's
+    apparent share). `None` when nothing was truncated (`len(candidates) <=
+    top_n`) — never a fabricated all-zero row for a table that already shows
+    every real partner."""
+    candidates = _rank_candidates(records, years=years)
+    truncated = candidates[top_n:]
+    if not truncated:
+        return None
+    values_by_year: dict[int, float | None] = {
+        year: sum(
+            (values.get(year) or 0.0)
+            for _, _, values, _ in truncated
+            if values.get(year) is not None
+        )
+        for year in years
+    }
+    cumulative = sum(cumulative for _, _, _, cumulative in truncated)
+    return _build_country_row(
+        partner_code=REST_OF_WORLD_PARTNER_CODE,
+        partner_country="All Other Countries",
+        values_by_year=values_by_year,
+        cumulative=cumulative,
+        rank=top_n + 1,
+    )
+
+
+def _comtrade_world_total(
+    records: list[ComtradeRecord], *, years: list[int]
+) -> dict[int, float | None]:
+    """Comtrade's own `partnerCode="0"` ("World") row's value per year,
+    captured from the *unstripped* records (before `strip_aggregate_partners`
+    excludes it from ranking) — previously discarded entirely. `None` for a
+    year Comtrade didn't report a World total for at all, distinct from a
+    genuinely reported `0.0` (2026-09-02, Step 3 hardening, Concern 1)."""
+    by_year: dict[int, float | None] = dict.fromkeys(years)
+    for record in records:
+        if record.partner_code == WORLD_PARTNER_CODE and record.year in by_year:
+            by_year[record.year] = record.value
+    return by_year
+
+
+def _world_total_reconciles(
+    rows: list[CountryRow],
+    rest_of_world: CountryRow | None,
+    world_total_comtrade: dict[int, float | None],
+    *,
+    years: list[int],
+) -> dict[int, bool | None]:
+    """Whether the top-N rows plus the rest-of-world bucket sum to
+    (approximately) Comtrade's own reported World total for each year.
+    `None` when either side is missing for that year — never guessed from a
+    partial comparison (2026-09-02, Step 3 hardening, Concern 1)."""
+    result: dict[int, bool | None] = {}
+    for year in years:
+        world_total = world_total_comtrade.get(year)
+        if world_total is None:
+            result[year] = None
+            continue
+        computed = sum((row.values_by_year.get(year) or 0.0) for row in rows)
+        if rest_of_world is not None:
+            computed += rest_of_world.values_by_year.get(year) or 0.0
+        if world_total == 0:
+            result[year] = abs(computed) < 1e-6
+        else:
+            result[year] = abs(computed - world_total) / abs(world_total) <= (
+                _WORLD_TOTAL_RECONCILE_TOLERANCE
+            )
+    return result
+
+
+def _compute_hhi(candidate_cumulatives: list[float]) -> float | None:
+    """Herfindahl-Hirschman concentration index over every real country's
+    own cumulative value (not the truncated top-N-plus-rest_of_world view —
+    squaring one lumped "rest of world" total would overstate concentration
+    relative to summing each of those countries' own, individually smaller,
+    squared shares). `None` when the total is not strictly positive — never
+    a fabricated concentration figure from an undefined denominator
+    (2026-09-02, Step 3 hardening, Concern 3; formula ported from
+    `app.report.rankings.compute_hhi`, reimplemented here rather than
+    imported since that function's `PartnerRanking` input type and
+    rupee-paise-typed field are Pipeline-B-shaped and don't fit Step 3's
+    USD-float `CountryRow`/candidate-tuple shape)."""
+    total = sum(candidate_cumulatives)
+    if total <= 0:
+        return None
+    return sum((value / total) ** 2 for value in candidate_cumulatives)
 
 
 def flag_years_finalized(records: list[ComtradeRecord], *, years: list[int]) -> list[int]:
@@ -216,10 +370,13 @@ def build_trade_table(
     excluded_partner_codes = find_excluded_partner_codes(records)
     country_records = strip_aggregate_partners(records)
     rows = rank_top_partners(country_records, years=years, top_n=top_n)
+    rest_of_world = _rest_of_world_row(country_records, years=years, top_n=top_n)
+    world_total_comtrade = _comtrade_world_total(records, years=years)
     years_finalized = flag_years_finalized(country_records, years=years)
     years_no_data = flag_years_no_data(
         country_records, years=years, fetch_failed_years=fetch_failed_years
     )
+    all_candidates = _rank_candidates(country_records, years=years)
     return TradeTable(
         unit="USD",
         years=years,
@@ -229,11 +386,40 @@ def build_trade_table(
         fetch_issue_years=[issue.year for issue in sorted_issues],
         excluded_partner_codes=excluded_partner_codes,
         rows=rows,
+        rest_of_world=rest_of_world,
+        world_total_comtrade=world_total_comtrade,
+        world_total_reconciles=_world_total_reconciles(
+            rows, rest_of_world, world_total_comtrade, years=years
+        ),
+        hhi=_compute_hhi([cumulative for _, _, _, cumulative in all_candidates]),
     )
 
 
+def compute_trade_balance(imports_table: TradeTable, exports_table: TradeTable) -> TradeBalance:
+    """Net trade (exports minus imports) per year, using each side's
+    Comtrade-reported World total (`TradeTable.world_total_comtrade`) as the
+    denominator — the honest full total, not just the sum of whichever
+    top-N partners happened to be ranked (2026-09-02, Step 3 hardening,
+    Concern 3). `None` for a year where either side's World total is
+    missing — never a one-sided, misleading "balance" computed from half
+    the picture."""
+    by_year: dict[int, float | None] = {}
+    for year in imports_table.years:
+        import_total = imports_table.world_total_comtrade.get(year)
+        export_total = exports_table.world_total_comtrade.get(year)
+        if import_total is None or export_total is None:
+            by_year[year] = None
+        else:
+            by_year[year] = export_total - import_total
+    real_balances = [v for v in by_year.values() if v is not None]
+    cumulative = sum(real_balances) if real_balances else None
+    return TradeBalance(by_year=by_year, cumulative=cumulative)
+
+
 def aggregate(state: AnalysisState) -> dict[str, Any]:
-    """Turn `raw_imports`/`raw_exports` into `imports_table`/`exports_table`."""
+    """Turn `raw_imports`/`raw_exports` into `imports_table`/`exports_table`,
+    plus `trade_balance` (2026-09-02, Step 3 hardening) computed from both
+    tables' Comtrade-reported World totals."""
     if has_error(state):
         return {}
     query = state.get("query")
@@ -245,17 +431,20 @@ def aggregate(state: AnalysisState) -> dict[str, Any]:
         return {}  # defensive: validate_query always resolves these
 
     years = list(range(query.year_start, query.year_end + 1))
+    imports_table = build_trade_table(
+        raw_imports,
+        years=years,
+        top_n=query.top_n,
+        fetch_issues=state.get("import_fetch_issues"),
+    )
+    exports_table = build_trade_table(
+        raw_exports,
+        years=years,
+        top_n=query.top_n,
+        fetch_issues=state.get("export_fetch_issues"),
+    )
     return {
-        "imports_table": build_trade_table(
-            raw_imports,
-            years=years,
-            top_n=query.top_n,
-            fetch_issues=state.get("import_fetch_issues"),
-        ),
-        "exports_table": build_trade_table(
-            raw_exports,
-            years=years,
-            top_n=query.top_n,
-            fetch_issues=state.get("export_fetch_issues"),
-        ),
+        "imports_table": imports_table,
+        "exports_table": exports_table,
+        "trade_balance": compute_trade_balance(imports_table, exports_table),
     }

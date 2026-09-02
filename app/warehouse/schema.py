@@ -170,6 +170,62 @@ ref_hs_revision_notes = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
 )
 
+# [2026-09-02, Step 4 hardening, Concern 2] One row per real, citation-
+# required search result for a `Facts` field the verified analytics/ref
+# layer genuinely has nothing for (`mandi_price`/`msp`/
+# `international_production` to start — see `LLM_DATAPOINT_FIELDS`).
+# `source_authority`/`source_reference`/`verified_date` are required
+# (`source_url` isn't, matching `ref_duty_components`'s own precedent —
+# not every real citation is a URL) — modeled directly on that table's
+# citation columns.
+#
+# No approval gate: a row is live and readable the moment the curator
+# script writes it (2026-09-02 user-directed correction to an earlier,
+# more cautious draft of this feature — see the plan doc: "the citation
+# requirement itself is the safety mechanism, not a human sign-off step").
+# `status` defaults to `ACTIVE`; a curator can flip a specific row to
+# `RETRACTED` after the fact if it's later found to be wrong — a
+# correction path, not a pre-publication gate. A disagreeing later search
+# writes a fresh `ACTIVE` row rather than overwriting the old one — same
+# "never auto-resolved into a single value" discipline as
+# `ref_duty_component_conflicts` above; multiple rows may legitimately
+# exist for the same `(hs6, field_name)`, distinguished by `verified_date`
+# and `status`.
+LLM_DATAPOINT_FIELDS = ("mandi_price", "msp", "international_production")
+LLM_DATAPOINT_STATUS_VALUES = ("ACTIVE", "RETRACTED")
+llm_datapoint_status_enum = PGEnum(
+    *LLM_DATAPOINT_STATUS_VALUES, name="llm_datapoint_status", metadata=metadata
+)
+ref_llm_datapoints = Table(
+    "ref_llm_datapoints",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("hs6", Text, nullable=False),
+    Column("field_name", Text, nullable=False),
+    # Free-text, not a typed date/year column — the fields this table can
+    # back-fill are heterogeneous (`mandi_price` is a specific date,
+    # `msp`/`international_production` are a fiscal year), so a rigid
+    # column type would force a lossy conversion for at least one of them.
+    Column("effective_period", Text, nullable=False),
+    Column("value_json", JSONB, nullable=False),
+    Column("source_authority", Text, nullable=False),
+    Column("source_reference", Text, nullable=False),
+    Column("source_url", Text, nullable=True),
+    Column("verified_date", Date, nullable=False),
+    Column("status", llm_datapoint_status_enum, nullable=False, server_default=text("'ACTIVE'")),
+    Column("retracted_reason", Text, nullable=True),
+    Column("notes", Text, nullable=True),
+    CheckConstraint(
+        "field_name IN ('mandi_price','msp','international_production')",
+        name="ck_rld_field_name",
+    ),
+    CheckConstraint(
+        "(status = 'ACTIVE' AND retracted_reason IS NULL) OR "
+        "(status = 'RETRACTED' AND retracted_reason IS NOT NULL)",
+        name="ck_rld_retracted_reason_matches_status",
+    ),
+)
+
 # ── Raw layer: immutable, append-only, mirrors source shape ─────────────
 
 # [2026-08-23 revision, found via real Step 3 investigation, docs/PLAN.md

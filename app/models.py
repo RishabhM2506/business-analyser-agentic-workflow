@@ -13,6 +13,38 @@ Verified against the installed `langchain-google-genai==4.3.4` (pinned in
 all introspected from the real installed package, not assumed from
 documentation alone (`docs.langchain.com`'s current integration page for
 `google_generative_ai` was also checked and agrees).
+
+**`generate_grounded` (2026-09-02, Step 4 hardening, `llm_datapoints`)
+— real live-spike findings, not assumed:** binding the `google_search`
+grounding tool (`.bind_tools([{"google_search": {}}])`) and then calling
+`.with_structured_output(schema, method="json_schema")` in the *same*
+call does not raise — the API accepts the combined request — but a real,
+live successful call this way came back with `response_metadata`
+containing no `grounding_metadata` key at all, meaning either the model
+silently chose not to invoke the search tool, or the citation channel
+does not survive being combined with a schema constraint on this SDK
+version. Confirmed separately, with the raw `google-genai` SDK directly
+(bypassing langchain): the exact same API key succeeds on a bare
+ungrounded call and fails immediately with `429 RESOURCE_EXHAUSTED` the
+moment the `google_search` tool is added — Search grounding has its own,
+separate, far more easily exhausted quota from ordinary generation calls,
+a real operational fact for `run_llm_datapoint_search.py` regardless of
+call shape.
+
+Given this, `generate_grounded` below uses a **two-call** design: call 1
+is a plain grounded free-text call (no schema constraint, so grounding
+metadata isn't competing with anything), call 2 is an ordinary
+`generate_structured`-shaped extraction over that grounded text (no
+search tool, so the schema constraint applies cleanly, exactly like every
+other structured call in this file). **Not yet independently confirmed**:
+that `grounding_metadata` actually populates on the plain call 1 once
+real search does happen (today's quota exhaustion above prevented
+completing that specific check) — `_extract_citations` below is written
+defensively against Google's documented `groundingChunks[].web.{uri,
+title}` shape and fails closed (raises, extracts nothing) rather than
+guessing at an unconfirmed shape; this should be re-verified live once
+quota resets, per this file's own "verified against the real thing, not
+assumed" standard the rest of this docstring holds itself to.
 """
 
 from __future__ import annotations
@@ -21,6 +53,7 @@ import asyncio
 import itertools
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeVar, get_args, get_origin
 
 import structlog
@@ -35,6 +68,43 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 NodeRole = Literal["utility", "analysis"]
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class GroundingCitation:
+    """One real, checkable source a `generate_grounded` call's answer was
+    (claimed to be) drawn from — `source_url` is the one field every
+    caller actually needs (a citation with no URL isn't checkable); `title`
+    is best-effort, `None` when the grounding response didn't carry one."""
+
+    source_url: str
+    title: str | None = None
+
+
+class UngroundedSearchError(Exception):
+    """Raised by `generate_grounded` when a grounded search call comes back
+    with zero real citations to extract — never silently falls through to
+    treating the model's bare answer as if it were cited (2026-09-02, Step
+    4 hardening: the same fail-closed discipline `check_hs_codes_grounded`/
+    `check_numbers_grounded` already apply to a narrated number applies
+    here to a *sourced* one — an uncited `llm_datapoints` entry is exactly
+    the fabrication risk this whole feature exists to avoid)."""
+
+
+@dataclass(frozen=True)
+class GroundedResult[U: BaseModel]:
+    """Result of `generate_grounded` — a validated `schema` instance plus
+    the real citations the grounded search step actually returned. `citations`
+    is deliberately required, not defaulted to `[]` — every real construction
+    site explicitly has a non-empty list in hand already (`generate_grounded`
+    raises `UngroundedSearchError` instead of ever constructing one with
+    none), so a silently-available empty default would invite a future
+    caller to construct a "grounded" result with nothing actually grounding
+    it."""
+
+    value: U
+    citations: list[GroundingCitation]
+
 
 # Bounded retries only (master brief §7.9) — the langchain-google-genai
 # default (6) is too generous against a finite per-thread call budget
@@ -58,6 +128,17 @@ class ModelClient(Protocol):
     async def generate_structured(
         self, *, system_prompt: str, user_content: str, schema: type[T]
     ) -> T: ...
+
+    async def generate_grounded(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> GroundedResult[T]:
+        """Sibling to `generate_structured`, not a replacement — every
+        existing caller is unaffected. For a datapoint that must carry a
+        real, checkable source (2026-09-02, Step 4 hardening,
+        `llm_datapoints`) rather than the model's own unsourced answer.
+        Raises `UngroundedSearchError` when no real citation comes back —
+        never returns a `GroundedResult` with empty `citations`."""
+        ...
 
 
 class GeminiModelClient:
@@ -96,6 +177,68 @@ class GeminiModelClient:
             # not an expected runtime path.
             raise TypeError(f"expected {schema.__name__}, got {type(result).__name__}")
         return result
+
+    async def generate_grounded(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> GroundedResult[T]:
+        """Two-call design — see this module's own docstring for the real,
+        live spike finding that motivates it (combining the search tool
+        with a schema-constrained call silently drops grounding metadata,
+        not an explicit incompatibility)."""
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        grounded_chat = self._chat.bind_tools([{"google_search": {}}])
+        grounded_response = await grounded_chat.ainvoke(
+            [SystemMessage(content=system_prompt), HumanMessage(content=user_content)]
+        )
+        citations = _extract_citations(grounded_response.response_metadata)
+        if not citations:
+            raise UngroundedSearchError(
+                "generate_grounded: the search call returned no real citations "
+                "to extract from — refusing to treat an uncited answer as sourced"
+            )
+
+        extraction_prompt = (
+            "Extract the answer to the original question from the real, "
+            "already-researched text below into the requested schema. Do not "
+            "add any information that isn't present in the text.\n\n"
+            f"Original question:\n{user_content}\n\n"
+            f"Researched text:\n{grounded_response.content}"
+        )
+        value = await self.generate_structured(
+            system_prompt=system_prompt, user_content=extraction_prompt, schema=schema
+        )
+        return GroundedResult(value=value, citations=citations)
+
+
+def _extract_citations(response_metadata: dict[str, Any]) -> list[GroundingCitation]:
+    """Pulls real source URLs out of a grounded response's
+    `grounding_metadata` — written defensively against Google's documented
+    `groundingChunks[].web.{uri,title}` shape (`google-genai==2.18.1`'s own
+    `GroundingChunk`/`GroundingChunkWeb` types), **not yet independently
+    confirmed against a real populated response** (this module's own
+    docstring explains why — real Search-grounding quota was exhausted
+    before that specific check could complete). Returns `[]` (never raises)
+    for any shape that doesn't match what's expected — `generate_grounded`
+    treats an empty result as "nothing to safely extract," the same
+    fail-closed outcome as a citation genuinely not existing, rather than
+    this function guessing at an unconfirmed shape."""
+    grounding_metadata = response_metadata.get("grounding_metadata")
+    if not grounding_metadata:
+        return []
+    chunks = grounding_metadata.get("grounding_chunks") or grounding_metadata.get("groundingChunks")
+    if not chunks:
+        return []
+    citations: list[GroundingCitation] = []
+    for chunk in chunks:
+        web = chunk.get("web") if isinstance(chunk, dict) else None
+        if not web:
+            continue
+        uri = web.get("uri")
+        if not uri:
+            continue
+        citations.append(GroundingCitation(source_url=uri, title=web.get("title")))
+    return citations
 
 
 # Small, fixed pause between failed attempts (a real request-path caller —
@@ -289,6 +432,47 @@ class LoadBalancedGeminiModelClient:
         assert last_exc is not None
         raise last_exc
 
+    async def generate_grounded(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> GroundedResult[T]:
+        """Same round-robin/failover mechanism as `generate_structured`
+        above, delegating to each pooled client's `generate_grounded`
+        instead — including `UngroundedSearchError` in the rotate-on-failure
+        set, since a key that failed to find a real citation is exactly as
+        worth retrying on the next key as a transient network error would
+        be (2026-09-02, Step 4 hardening)."""
+        pool_size = len(self._clients)
+        start = next(self._next_index) % pool_size
+        last_exc: Exception | None = None
+        for attempt in range(self._max_attempts):
+            if attempt > 0:
+                await self._sleep(_RETRY_BACKOFF_SECONDS)
+            index = (start + attempt) % pool_size
+            try:
+                return await self._clients[index].generate_grounded(
+                    system_prompt=system_prompt, user_content=user_content, schema=schema
+                )
+            except Exception as exc:  # deliberately broad - see class docstring
+                last_exc = exc
+                logger.warning(
+                    "gemini_load_balancer.grounded_key_attempt_failed",
+                    model=self._model,
+                    key_index=index,
+                    pool_size=pool_size,
+                    attempt=attempt + 1,
+                    max_attempts=self._max_attempts,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+        logger.error(
+            "gemini_load_balancer.grounded_all_attempts_exhausted",
+            model=self._model,
+            pool_size=pool_size,
+            attempts_made=self._max_attempts,
+        )
+        assert last_exc is not None
+        raise last_exc
+
 
 _WORD_WITH_DIGIT_PATTERN = re.compile(r"\d")
 
@@ -376,6 +560,14 @@ _MOCK_FLOAT_VALUE = 0.5
 # real judgment to make), so a fixed, schema-valid constant is enough,
 # same reasoning as `_MOCK_FLOAT_VALUE`.
 _MOCK_BOOL_VALUE = True
+
+# `generate_grounded`'s mock counterpart (2026-09-02, Step 4 hardening) —
+# a deliberately obviously-fake URL/title, same "fixed, schema-valid
+# constant, never mistaken for the real thing" reasoning as
+# `_MOCK_FLOAT_VALUE`/`_MOCK_BOOL_VALUE` above.
+_MOCK_CITATION = GroundingCitation(
+    source_url="https://mock.example/citation", title="Mock citation"
+)
 
 
 def _list_item_model(annotation: Any) -> type[BaseModel] | None:
@@ -494,6 +686,14 @@ class MockLLM:
         self, *, system_prompt: str, user_content: str, schema: type[T]
     ) -> T:
         return _build_mock_instance(schema, user_content=user_content)
+
+    async def generate_grounded(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> GroundedResult[T]:
+        return GroundedResult(
+            value=_build_mock_instance(schema, user_content=user_content),
+            citations=[_MOCK_CITATION],
+        )
 
 
 # One round-robin start-index counter per role, persisted at module scope

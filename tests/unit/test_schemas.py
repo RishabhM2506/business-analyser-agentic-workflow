@@ -13,7 +13,13 @@ from pydantic import ValidationError
 
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
-from app.schemas.response import CountryRow, Provenance, TradeAnalysisResponse, TradeTable
+from app.schemas.response import (
+    CountryRow,
+    Provenance,
+    TradeAnalysisResponse,
+    TradeBalance,
+    TradeTable,
+)
 
 
 @pytest.mark.unit
@@ -180,6 +186,7 @@ def test_trade_analysis_response_round_trip() -> None:
         item_description="Placeholder description.",
         imports=_sample_trade_table(),
         exports=_sample_trade_table(),
+        trade_balance=TradeBalance(by_year={2023: 10.0}, cumulative=10.0),
         analytical_summary="Placeholder summary.",
         provenance=Provenance(
             source="UN Comtrade (comtradeapi.un.org)",
