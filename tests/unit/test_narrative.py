@@ -153,6 +153,35 @@ class _FixedModelClient:
         return schema.model_validate({"narrative": self._texts.pop(0)})
 
 
+class _RaisingModelClient:
+    """Simulates a total model-call failure, e.g. every key in a
+    load-balanced pool exhausted (`app.models.LoadBalancedGeminiModelClient`
+    re-raises the real last exception on total exhaustion)."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def generate_structured(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> T:
+        raise self._exc
+
+
+class _FailThenFixedModelClient:
+    def __init__(self, exc: Exception, then_text: str) -> None:
+        self._exc = exc
+        self._then_text = then_text
+        self._calls = 0
+
+    async def generate_structured(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> T:
+        self._calls += 1
+        if self._calls == 1:
+            raise self._exc
+        return schema.model_validate({"narrative": self._then_text})
+
+
 def _budget_tracker(*, max_calls_per_thread: int = 100) -> BudgetTracker:
     return BudgetTracker(max_calls_per_thread=max_calls_per_thread, max_calls_per_day=100)
 
@@ -327,6 +356,47 @@ async def test_generate_narrative_falls_back_to_template_after_two_ungrounded_at
 
     assert result.source == "template_fallback"
     assert check_narrative_grounded(result.narrative, facts)
+
+
+async def test_generate_narrative_falls_back_to_template_on_repeated_call_failure() -> None:
+    """2026-09-03 fix: a total model-call failure (e.g. every key in a
+    load-balanced pool exhausted, live-observed as a bare 500 from
+    POST /threads/{id}/trade-report) must degrade the same way an
+    ungrounded result does, not propagate as an unhandled exception -
+    this module's own docstring promises a caller "always gets *some*
+    narrative back, never a bare error." """
+    facts = _facts()
+    client = _RaisingModelClient(RuntimeError("503 UNAVAILABLE - high demand"))
+
+    result = await generate_narrative(
+        facts,
+        model_client=client,
+        budget_tracker=_budget_tracker(),
+        thread_id="t-1",
+        tenant_id="default",
+    )
+
+    assert result.source == "template_fallback"
+    assert check_narrative_grounded(result.narrative, facts)
+
+
+async def test_generate_narrative_retries_after_a_model_call_failure_then_accepts() -> None:
+    facts = _facts()
+    client = _FailThenFixedModelClient(
+        RuntimeError("503 UNAVAILABLE - high demand"),
+        "In 2022, imports totalled ₹424.66 crore.",
+    )
+
+    result = await generate_narrative(
+        facts,
+        model_client=client,
+        budget_tracker=_budget_tracker(),
+        thread_id="t-1",
+        tenant_id="default",
+    )
+
+    assert result.source == "model_retry"
+    assert "424.66" in result.narrative
 
 
 async def test_generate_narrative_propagates_budget_exceeded_rather_than_degrading() -> None:
