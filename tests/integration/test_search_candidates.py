@@ -136,3 +136,81 @@ async def test_find_candidates_no_bm25_hit_and_low_vector_similarity_returns_emp
     results = await provider.find_candidates("zzzqqqxxx nonsense", top_k=8)
 
     assert results == []
+
+
+@pytest.mark.integration
+async def test_find_candidates_rejects_a_high_but_flat_vector_ranking(tmp_path: Path) -> None:
+    """Regression for a real, measured false positive in the old static
+    0.35 absolute-score floor: real gibberish queries against the actual
+    embedding corpus scored 0.55-0.61 top-1 cosine similarity (comfortably
+    clearing 0.35) because of embedding-space "hubness" — a handful of
+    vectors sit unusually close to everything. Engineered here: every
+    candidate scores the *same* high similarity (0.6, well above the old
+    0.35 floor) — a flat ranking with no real standout, exactly the shape
+    that broke the old floor. The new margin-based floor must reject it."""
+    hs_codes = ["090111", "090112", "090121", "090190", "010121", "271012"]
+    # All six vectors identical -> every one scores exactly the same
+    # similarity against any query, however high - zero margin.
+    vectors = np.zeros((6, _DIMS), dtype=np.float32)
+    vectors[:, 0] = 1.0
+    stem = tmp_path / "fixture_flat"
+    np.save(stem.with_suffix(".npy"), vectors)
+    (tmp_path / "fixture_flat.hscodes.txt").write_text("\n".join(hs_codes), encoding="utf-8")
+    (tmp_path / "fixture_flat.meta.json").write_text(
+        json.dumps({"count": len(hs_codes), "dims": _DIMS}), encoding="utf-8"
+    )
+
+    class _MatchingQueryEmbeddingsClient(MockEmbeddingsClient):
+        async def embed_query(self, text: str) -> list[float]:
+            # Identical direction to every fixture row -> a real 0.6+
+            # cosine similarity, same shape as the live-measured gibberish
+            # scores this test reproduces.
+            vector = [0.0] * _DIMS
+            vector[0] = 0.6
+            vector[1] = 0.8  # keeps the vector non-degenerate (unit-ish norm)
+            return vector
+
+    provider = HybridSearchProvider(
+        embeddings_client=_MatchingQueryEmbeddingsClient(dimensions=_DIMS),
+        embeddings_path=str(stem),
+    )
+
+    results = await provider.find_candidates("zzxxqqbbvvnn flibbertigibbet", top_k=8)
+
+    assert results == []
+
+
+@pytest.mark.integration
+async def test_find_candidates_accepts_a_vector_hit_that_stands_out_from_its_neighbors(
+    tmp_path: Path,
+) -> None:
+    """The margin floor's other side: one real standout hit, well above
+    its neighbors, must still pass through to the reranker even though its
+    own absolute score is unremarkable — the point of the fix is
+    discriminating by shape, not by raising the bar."""
+    hs_codes = ["090111", "090112", "090121", "090190", "010121", "271012"]
+    vectors = np.zeros((6, _DIMS), dtype=np.float32)
+    vectors[0, 0] = 1.0  # the one real standout
+    for i in range(1, 6):
+        vectors[i, 1] = 1.0  # everything else orthogonal to the query
+    stem = tmp_path / "fixture_standout"
+    np.save(stem.with_suffix(".npy"), vectors)
+    (tmp_path / "fixture_standout.hscodes.txt").write_text("\n".join(hs_codes), encoding="utf-8")
+    (tmp_path / "fixture_standout.meta.json").write_text(
+        json.dumps({"count": len(hs_codes), "dims": _DIMS}), encoding="utf-8"
+    )
+
+    class _StandoutQueryEmbeddingsClient(MockEmbeddingsClient):
+        async def embed_query(self, text: str) -> list[float]:
+            vector = [0.0] * _DIMS
+            vector[0] = 1.0  # matches only the first fixture row
+            return vector
+
+    provider = HybridSearchProvider(
+        embeddings_client=_StandoutQueryEmbeddingsClient(dimensions=_DIMS),
+        embeddings_path=str(stem),
+    )
+
+    results = await provider.find_candidates("qqzzxxwwvvnn blorptastic", top_k=8)
+
+    assert any(c.hs_code == "090111" for c in results)
