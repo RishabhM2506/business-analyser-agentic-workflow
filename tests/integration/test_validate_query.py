@@ -75,3 +75,46 @@ def test_resolve_year_range_respects_explicit_year_end_only() -> None:
     year_start, year_end = resolve_year_range(query)
     assert year_end == 2020
     assert year_start == 2016
+
+
+@pytest.mark.unit
+def test_resolve_year_range_honors_relative_years_field() -> None:
+    query = TradeQuery(hs_code="010121", years=3)
+    fixed_now = datetime(2026, 8, 16, tzinfo=UTC)
+    year_start, year_end = resolve_year_range(query, now=fixed_now)
+    assert year_end == 2025  # unchanged "latest available" heuristic
+    assert year_start == 2023  # 3-year window instead of the 5-year default
+    assert year_end - year_start == 2
+
+
+@pytest.mark.integration
+def test_validate_query_resolves_relative_years_field() -> None:
+    state: AnalysisState = {"query": TradeQuery(hs_code="010121", years=8)}
+    result = validate_query(state)
+    normalized = result["query"]
+    assert normalized.year_end - normalized.year_start == 7  # 8-year inclusive window
+
+
+@pytest.mark.unit
+def test_trade_query_rejects_years_combined_with_explicit_year_start() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TradeQuery(hs_code="010121", years=3, year_start=2015)
+
+
+@pytest.mark.unit
+def test_trade_query_rejects_years_combined_with_explicit_year_end() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TradeQuery(hs_code="010121", years=3, year_end=2020)
+
+
+@pytest.mark.unit
+def test_trade_query_top_n_defaults_to_ten() -> None:
+    assert TradeQuery(hs_code="010121").top_n == 10
+
+
+@pytest.mark.unit
+def test_trade_query_top_n_rejects_out_of_bounds_values() -> None:
+    with pytest.raises(ValueError):
+        TradeQuery(hs_code="010121", top_n=2)  # below MIN_TOP_N (3)
+    with pytest.raises(ValueError):
+        TradeQuery(hs_code="010121", top_n=26)  # above MAX_TOP_N (25)

@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.report.facts import Facts
+
 
 class Provenance(BaseModel):
     """Data provenance attached to every analysis response."""
@@ -140,3 +142,24 @@ class ProductSearchResponse(BaseModel):
     outcome: Literal["auto_selected", "disambiguate", "no_candidates_found"]
     selected_hs_code: str | None
     candidates: list[RankedCandidateOut]
+
+
+class TradeReportResponse(BaseModel):
+    """The full result of `POST /threads/{thread_id}/trade-report`
+    (`app.report.facts`/`app.report.narrative`) — India trade-analysis
+    pipeline, D14. `facts` is the complete frozen contract document
+    (`docs/PLAN.md` §14) every numeral in `narrative` must trace back to;
+    exposed directly (not summarized/re-shaped) so a caller can render a
+    full data view independent of the narrative prose. `narrative_source`
+    tells the caller whether the prose came straight from the model, a
+    grounding-retry, or the deterministic template fallback — never hidden
+    from the API consumer (§14's own "reject -> regenerate once ->
+    template fallback" policy is a real, visible outcome, not an internal
+    implementation detail)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: str
+    facts: Facts
+    narrative: str
+    narrative_source: Literal["model", "model_retry", "template_fallback"]

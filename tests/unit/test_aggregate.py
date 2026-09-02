@@ -542,6 +542,40 @@ def test_aggregate_node_missing_fetch_issues_keys_defaults_to_empty() -> None:
 
 
 @pytest.mark.unit
+def test_aggregate_node_honors_query_top_n_instead_of_the_hardcoded_default() -> None:
+    # Regression test for the years/top_n configurability gap: aggregate()
+    # used to call build_trade_table with no top_n at all, silently falling
+    # back to its hardcoded TOP_N_PARTNERS=10 default regardless of what the
+    # caller actually asked for.
+    query = TradeQuery(hs_code="010121", year_start=2023, year_end=2023, top_n=3)
+    state: AnalysisState = {
+        "query": query,
+        "raw_imports": [
+            _record(
+                partner_code="842", partner_country="USA", year=2023, value=400.0, flow="import"
+            ),
+            _record(
+                partner_code="826", partner_country="UK", year=2023, value=300.0, flow="import"
+            ),
+            _record(
+                partner_code="276", partner_country="Germany", year=2023, value=200.0, flow="import"
+            ),
+            _record(
+                partner_code="392", partner_country="Japan", year=2023, value=100.0, flow="import"
+            ),
+        ],
+        "raw_exports": [],
+    }
+    result = aggregate(state)
+    assert len(result["imports_table"].rows) == 3  # capped at query.top_n, not TOP_N_PARTNERS
+    assert [row.partner_country for row in result["imports_table"].rows] == [
+        "USA",
+        "UK",
+        "Germany",
+    ]
+
+
+@pytest.mark.unit
 def test_aggregate_node_short_circuits_on_existing_error() -> None:
     from app.schemas.errors import ErrorResponse
 

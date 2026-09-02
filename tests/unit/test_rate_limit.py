@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.rate_limit import RateLimiter
+from app.rate_limit import _IDLE_EVICTION_SECONDS, _SWEEP_INTERVAL_CALLS, RateLimiter
 
 
 @pytest.mark.unit
@@ -86,3 +86,62 @@ async def test_refill_never_exceeds_the_per_minute_cap() -> None:
     # (the bucket refills to its cap, not beyond it), not more.
     results = [await limiter.check_and_consume("1.2.3.4") for _ in range(6)]
     assert results == [True, True, True, True, True, False]
+
+
+# --- idle-key eviction (architect-review finding, 2026-08-26) -----------------
+#
+# `_tokens`/`_last_refill` used to grow forever — every distinct key
+# (client IP) ever seen added a permanent entry for the life of the
+# process. These tests drive the sweep directly via `now_fn`/enough calls,
+# never real wall-clock time.
+
+
+@pytest.mark.unit
+async def test_sweep_evicts_a_key_idle_past_the_eviction_threshold() -> None:
+    limiter = RateLimiter(requests_per_minute=5, now_fn=lambda: 0.0)
+    await limiter.check_and_consume("1.2.3.4")
+    assert "1.2.3.4" in limiter._tokens
+
+    # Advance past the idle threshold and burn enough other calls (from a
+    # different key, so "1.2.3.4" itself is never touched again) to trigger
+    # the periodic sweep.
+    later = _IDLE_EVICTION_SECONDS + 1.0
+    limiter._now_fn = lambda: later
+    for _ in range(_SWEEP_INTERVAL_CALLS):
+        await limiter.check_and_consume("other-key-not-under-test")
+
+    assert "1.2.3.4" not in limiter._tokens
+    assert "1.2.3.4" not in limiter._last_refill
+
+
+@pytest.mark.unit
+async def test_sweep_does_not_evict_a_recently_touched_key() -> None:
+    limiter = RateLimiter(requests_per_minute=5, now_fn=lambda: 0.0)
+    await limiter.check_and_consume("1.2.3.4")
+
+    # Advance only slightly (well under the idle threshold) and trigger the
+    # sweep interval.
+    limiter._now_fn = lambda: 1.0
+    for _ in range(_SWEEP_INTERVAL_CALLS):
+        await limiter.check_and_consume("other-key")
+
+    assert "1.2.3.4" in limiter._tokens  # still tracked - was not idle long enough
+
+
+@pytest.mark.unit
+async def test_an_evicted_key_behaves_identically_to_a_never_seen_one() -> None:
+    """Eviction must be a pure memory-hygiene optimization, not an
+    observable behavior change: a key whose entry was swept starts with a
+    full bucket again, exactly like a genuinely new key — never an empty or
+    partially-refilled one, and never itself rejected."""
+    limiter = RateLimiter(requests_per_minute=1, now_fn=lambda: 0.0)
+    await limiter.check_and_consume("1.2.3.4")  # exhausts the 1-token bucket
+    assert await limiter.check_and_consume("1.2.3.4") is False
+
+    later = _IDLE_EVICTION_SECONDS + 1.0
+    limiter._now_fn = lambda: later
+    for _ in range(_SWEEP_INTERVAL_CALLS):
+        await limiter.check_and_consume("other-key")
+    assert "1.2.3.4" not in limiter._tokens  # confirmed evicted
+
+    assert await limiter.check_and_consume("1.2.3.4") is True  # fresh full bucket, not rejected

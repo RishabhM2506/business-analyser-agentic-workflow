@@ -35,6 +35,26 @@ _FREE_TEXT_FIELD_MAX_LENGTH = 128
 EARLIEST_SUPPORTED_YEAR = 1962  # generous floor - predates UN Comtrade's own annual HS data
 MAX_YEAR_SPAN = 20  # generous ceiling on a single request's requested year-range width
 
+# Shared by both `TradeQuery.top_n` and `TradeReportQuery.top_n` — one
+# "how many top trading partners" bound for the whole product, not a
+# per-endpoint one. Matches `app.nodes.aggregate.TOP_N_PARTNERS`'s existing
+# default (10); kept as a separate literal here (schemas is a leaf module —
+# `app.nodes.aggregate` already imports from `app.schemas`, not the reverse).
+MIN_TOP_N = 3
+MAX_TOP_N = 25
+DEFAULT_TOP_N = 10
+
+# D14-style "years" convenience for `TradeQuery` (2026-08-26 addition): the
+# frontend product ask was "how many years, how many top countries" as a
+# single, direct control — `year_start`/`year_end` alone force the caller to
+# know "latest available year" itself to express "give me N years." `years`
+# is relative (resolved against `app.nodes.validate_query`'s own "latest
+# available" heuristic, same as the existing no-args default already is —
+# see that module's `YEAR_WINDOW`/`resolve_year_range`), so a frontend
+# control never has to duplicate that heuristic to stay in sync.
+MIN_TRADE_QUERY_YEARS = 1
+MAX_TRADE_QUERY_YEARS = MAX_YEAR_SPAN
+
 
 def _current_year() -> int:
     return datetime.now(UTC).year
@@ -49,6 +69,17 @@ class TradeQuery(BaseModel):
     flow: Literal["import", "export", "both"] = "both"
     year_start: int | None = Field(default=None, ge=EARLIEST_SUPPORTED_YEAR)
     year_end: int | None = Field(default=None, ge=EARLIEST_SUPPORTED_YEAR)
+    years: int | None = Field(
+        default=None,
+        ge=MIN_TRADE_QUERY_YEARS,
+        le=MAX_TRADE_QUERY_YEARS,
+        description=(
+            "Convenience alternative to year_start/year_end: 'the last N years "
+            "ending at the latest available year'. Mutually exclusive with "
+            "year_start/year_end — supplying both is rejected as ambiguous."
+        ),
+    )
+    top_n: int = Field(default=DEFAULT_TOP_N, ge=MIN_TOP_N, le=MAX_TOP_N)
     partner_region: str | None = Field(default=None, max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
     value_or_volume: Literal["value", "volume"] = "value"
     tenant_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
@@ -75,6 +106,11 @@ class TradeQuery(BaseModel):
 
     @model_validator(mode="after")
     def _validate_year_range_ordering_and_span(self) -> TradeQuery:
+        if self.years is not None and (self.year_start is not None or self.year_end is not None):
+            raise ValueError(
+                "years is mutually exclusive with year_start/year_end — "
+                "supply either a relative span or an explicit range, not both"
+            )
         if self.year_start is not None and self.year_end is not None:
             if self.year_start > self.year_end:
                 raise ValueError(
@@ -96,5 +132,43 @@ class ProductSearchQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query_text: str = Field(min_length=1, max_length=200)
+    tenant_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
+    user_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
+
+
+# D14 (docs/PLAN.md §12): "years: int (1-8, default 5), top_n: int (3-25,
+# default 10) flow from the API request body ... No literal 5/10 below the
+# route handler's own default values" - these are that route handler.
+# top_n reuses MIN_TOP_N/MAX_TOP_N/DEFAULT_TOP_N (defined above, shared with
+# `TradeQuery.top_n`) — one "how many top trading partners" bound for the
+# whole product. `years` keeps its own, TradeReportQuery-specific bound
+# (1-8) — deliberately narrower than TradeQuery's `years` (1-20, matching
+# MAX_YEAR_SPAN): this endpoint's per-year fan-out already includes duty/
+# mandi/MSP/FAOSTAT lookups beyond plain Comtrade fetches, so its practical
+# per-request cost ceiling is lower.
+MIN_TRADE_REPORT_YEARS = 1
+MAX_TRADE_REPORT_YEARS = 8
+DEFAULT_TRADE_REPORT_YEARS = 5
+
+
+class TradeReportQuery(BaseModel):
+    """Request body for `POST /threads/{thread_id}/trade-report`
+    (`app.report.facts`/`app.report.narrative`) — the India trade-analysis
+    pipeline, a separate, additive capability from `TradeQuery`'s UN
+    Comtrade-only `/messages` flow (not a replacement for it).
+
+    Single `flow` per request, matching every precompute module this
+    pipeline's built on (`mismatch.py`/`rankings.py`/`unit_value.py`/
+    `coverage_gate.py` are all single-flow) — a caller wanting both
+    directions calls this endpoint twice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hs_code: str = Field(pattern=r"^\d{6}$")
+    flow: Literal["import", "export"] = "import"
+    years: int = Field(
+        default=DEFAULT_TRADE_REPORT_YEARS, ge=MIN_TRADE_REPORT_YEARS, le=MAX_TRADE_REPORT_YEARS
+    )
+    top_n: int = Field(default=DEFAULT_TOP_N, ge=MIN_TOP_N, le=MAX_TOP_N)
     tenant_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)
     user_id: str = Field(default="default", max_length=_FREE_TEXT_FIELD_MAX_LENGTH)

@@ -18,7 +18,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +39,20 @@ class Settings(BaseSettings):
     # committed, separate keys per environment) ------------------------------
     comtrade_api_key: str
     gemini_api_key: str
+    # Additional Gemini API keys for the round-robin/failover load balancer
+    # (2026-08-26 addition, `app.models.LoadBalancedGeminiModelClient`) —
+    # JSON array, same convention as `cors_allowed_origins` below. `[]`
+    # (the default) means "just gemini_api_key, no pooling," so every
+    # existing deployment that hasn't set this keeps its current
+    # single-key `GeminiModelClient` behavior unchanged.
+    # `gemini_api_key` is always the pool's first key — never duplicated
+    # in this list, see `Settings.gemini_key_pool`.
+    gemini_api_keys_extra: list[str] = Field(default_factory=list)
+    # data.gov.in resource key for the Agmarknet daily mandi-price feed
+    # (app/pipeline/agmarknet.py). Required even when the Agmarknet job
+    # isn't running, matching this file's existing "fails loudly at
+    # startup" contract for every other credential.
+    agmarknet_api_key: str
     langsmith_api_key: str | None = None
     langsmith_project: str | None = None
     langsmith_tracing_enabled: bool = False
@@ -57,6 +71,11 @@ class Settings(BaseSettings):
     # any deployed environment").
     database_url: str = "sqlite+aiosqlite:///./local.db"
     checkpoint_retention_days: int = 90  # docs/PLAN.md §6: explicit 90-day rolling retention
+    # Trade pipeline's FX cache only (app/fx/cache.py) — nothing else in this
+    # app uses Redis (the existing response/tool caches are deliberately
+    # in-process, see app/cache/tool_cache.py's own docstring). Default
+    # matches the new `redis` service in docker-compose.yml.
+    redis_url: str = "redis://localhost:6379/0"
 
     # --- Model routing (master brief §3: node-role -> model, config-driven,
     # never hard-coded; docs/PLAN.md §5.1) -----------------------------------
@@ -99,6 +118,27 @@ class Settings(BaseSettings):
     # --- Structured logging ---------------------------------------------------
     log_level: str = "INFO"
     log_json: bool = True
+
+    @field_validator("gemini_api_keys_extra")
+    @classmethod
+    def _drop_blank_extra_keys(cls, value: list[str]) -> list[str]:
+        """A stray empty string in a hand-edited JSON array (e.g.
+        `["", "AQ...."]`) must never become a "real" pool member that every
+        request round-robins into and fails against — silently drop blanks
+        rather than trusting the env var was well-formed."""
+        return [key for key in value if key.strip()]
+
+    @property
+    def gemini_key_pool(self) -> list[str]:
+        """`gemini_api_key` first, then `gemini_api_keys_extra`, with any
+        accidental duplicate (e.g. the primary key re-pasted into the extra
+        list) removed while preserving order — every other call site that
+        wants "the" key still reads `gemini_api_key` directly and is
+        unaffected by this property existing."""
+        seen: dict[str, None] = {}
+        for key in [self.gemini_api_key, *self.gemini_api_keys_extra]:
+            seen.setdefault(key, None)
+        return list(seen)
 
 
 @lru_cache(maxsize=1)

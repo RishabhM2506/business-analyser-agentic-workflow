@@ -58,6 +58,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
@@ -68,25 +69,35 @@ from fastapi.responses import JSONResponse
 from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.budget import BudgetExceededError, get_budget_tracker
 from app.cache.response_cache import filter_hash, get_response_cache
 from app.graph import COMBINED_PROMPT_VERSION, build_checkpointer, build_graph
 from app.guardrails import check_hs_code_allowlisted
+from app.knowledge.provider import get_taxonomy_entry
 from app.models import get_model_for_role
 from app.nodes.validate_query import resolve_year_range
 from app.observability import build_trace_metadata, configure_langsmith_tracing
 from app.rate_limit import RateLimiter
+from app.report.facts import assemble_facts
+from app.report.narrative import generate_narrative
+from app.report.source_relevance import is_agriculture_relevant
 from app.schemas.errors import ErrorResponse
-from app.schemas.query import ProductSearchQuery, TradeQuery
-from app.schemas.response import ProductSearchResponse, RankedCandidateOut, TradeAnalysisResponse
+from app.schemas.query import ProductSearchQuery, TradeQuery, TradeReportQuery
+from app.schemas.response import (
+    ProductSearchResponse,
+    RankedCandidateOut,
+    TradeAnalysisResponse,
+    TradeReportResponse,
+)
 from app.search.candidates import HybridSearchProvider
 from app.search.embeddings import get_embeddings_client
 from app.search.rerank import UngroundedRerankError
 from app.search.service import search_products
 from app.settings import Settings, get_settings
 from app.state import AnalysisState
+from app.warehouse.db import get_engine as get_warehouse_engine
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
@@ -417,16 +428,25 @@ async def rate_limit_middleware(
     return await call_next(request)
 
 
-async def check_database(database_url: str) -> None:
-    """Open a real connection against `database_url` and run a trivial
-    query. Raises on any failure — callers decide what that means for their
-    response status."""
-    engine = create_async_engine(database_url, pool_pre_ping=True)
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-    finally:
-        await engine.dispose()
+async def check_database(engine: AsyncEngine) -> None:
+    """Run a trivial query against `engine`. Raises on any failure —
+    callers decide what that means for their response status.
+
+    Takes an already-constructed `engine`, rather than a `database_url` to
+    build one from itself (architect-review finding, 2026-08-26): the old
+    version called `create_async_engine(...)`/`.dispose()` on every single
+    `/healthz` request, needlessly churning a connection pool on every
+    liveness probe — `pool_pre_ping=True` already gives a *reused* pooled
+    connection the exact same "detect and reconnect a dead connection on
+    checkout" guarantee this was trying to buy with a full create/teardown
+    cycle. `lifespan` now constructs one process-lifetime engine
+    (`app.state.healthz_engine`), matching `app.state.thread_locks`/
+    `app.state.rate_limiter`'s existing per-app-instance (not process-wide
+    `lru_cache`) pattern — a process-wide singleton would leak across the
+    independently-configured `create_app()` calls each test in this suite
+    makes, exactly the reason those two are already per-app-instance."""
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
 
 
 @asynccontextmanager
@@ -452,7 +472,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # entered once here rather than per-request.
     async with build_checkpointer(settings.database_url) as checkpointer:
         app.state.compiled_graph = build_graph().compile(checkpointer=checkpointer)
-        yield
+        try:
+            yield
+        finally:
+            # `app.state.healthz_engine` is constructed synchronously in
+            # `create_app` (not here) — see that assignment's own comment
+            # for why — but disposed here, the one place guaranteed to run
+            # on real shutdown. A test harness that never runs `lifespan` at
+            # all (bare `httpx.ASGITransport`, `tests/integration/
+            # test_health.py`'s own documented constraint) simply never
+            # reaches this cleanup either, consistent with how this app
+            # already treats every other per-app-instance resource in that
+            # harness (`thread_locks`/`rate_limiter` are never explicitly
+            # torn down there today).
+            await app.state.healthz_engine.dispose()
     logger.info("app.shutdown")
 
 
@@ -469,6 +502,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = resolved_settings
+    # `/healthz`'s own engine (`check_database`, above) — constructed once
+    # per app instance and reused via its pool, not create/dispose-per-
+    # request (architect-review finding, 2026-08-26: the old code did
+    # exactly that churn on every single liveness-probe request, buying
+    # nothing `pool_pre_ping=True` doesn't already give a reused connection
+    # for free). Built here (synchronously), not inside `lifespan`: unlike
+    # `compiled_graph` (which needs `build_checkpointer`'s own `async with`
+    # setup), `create_async_engine` needs no async context to construct —
+    # opening this here instead keeps it available even under a test
+    # harness that never runs `lifespan` at all (`httpx.ASGITransport`,
+    # `tests/integration/test_health.py`'s own documented constraint;
+    # `resolved_settings.database_url` read directly here is exactly why
+    # the pre-fix version of `check_database` didn't have this problem).
+    app.state.healthz_engine = create_async_engine(
+        resolved_settings.database_url, pool_pre_ping=True
+    )
     # Per-app-instance, matching `app.state.settings`/`app.state.compiled_graph`
     # rather than a process-wide singleton (unlike `get_budget_tracker()`
     # etc.) — each test creates its own `create_app()`, and thread locks
@@ -528,11 +577,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/healthz")
-    async def healthz(response: Response) -> dict[str, object]:
+    async def healthz(response: Response, request: Request) -> dict[str, object]:
         checks: dict[str, str] = {}
         healthy = True
         try:
-            await check_database(resolved_settings.database_url)
+            await check_database(request.app.state.healthz_engine)
             checks["database"] = "ok"
         except Exception as exc:
             checks["database"] = "unreachable"
@@ -903,6 +952,113 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 outcome=result.outcome,
                 selected_hs_code=result.selected_hs_code,
                 candidates=candidates_out,
+            ),
+            status_code=200,
+        )
+
+    @app.post("/threads/{thread_id}/trade-report")
+    async def post_trade_report(
+        thread_id: str, query: TradeReportQuery, request: Request
+    ) -> Response:
+        """India trade-analysis pipeline (`app.report.facts`/
+        `app.report.narrative`) — a separate, additive capability from
+        `POST /threads/{id}/messages`'s UN-Comtrade-only flow: reads the
+        warehouse tables this pipeline's own ingestion jobs populate, never
+        the Comtrade tool client `post_message` uses. Bare response (not
+        `{type, data}`-enveloped), matching `post_search` — this never
+        touches the graph/checkpointer either."""
+        settings: Settings = request.app.state.settings
+        trace_id = _current_trace_id()
+        structlog.contextvars.bind_contextvars(tenant_id=query.tenant_id, user_id=query.user_id)
+
+        if not check_hs_code_allowlisted(query.hs_code):
+            return _bare_response(
+                ErrorResponse(
+                    error_code="INVALID_HS_CODE",
+                    message=f"{query.hs_code!r} is not a recognized HS6 code.",
+                    retryable=False,
+                    trace_id=trace_id,
+                ),
+                status_code=400,
+            )
+
+        # DGCIS/Comtrade never have complete annual data for the current
+        # calendar year (the same "current_year - 1" convention already
+        # established by `app.nodes.validate_query`'s "latest available"
+        # heuristic and `TradeQuery`'s own year-bound docstring).
+        today = datetime.now(UTC).date()
+        end_year = today.year - 1
+        start_year = end_year - query.years + 1
+        window_start = date(start_year, 1, 1)
+        window_end = date(end_year, 12, 31)
+
+        try:
+            engine = get_warehouse_engine()
+            taxonomy_entry = get_taxonomy_entry(query.hs_code)
+            commodity_description = (
+                taxonomy_entry.description if taxonomy_entry is not None else query.hs_code
+            )
+            include_agriculture_sources = await is_agriculture_relevant(
+                query.hs_code,
+                commodity_description=commodity_description,
+                model_client=get_model_for_role("utility", provider=settings.llm_provider),
+                budget_tracker=get_budget_tracker(),
+                thread_id=thread_id,
+                tenant_id=query.tenant_id,
+            )
+            facts = await assemble_facts(
+                engine,
+                hs6=query.hs_code,
+                flow=query.flow,
+                window_start=window_start,
+                window_end=window_end,
+                top_n=query.top_n,
+                as_of=today,
+                include_agriculture_sources=include_agriculture_sources,
+            )
+            model_client = get_model_for_role("analysis", provider=settings.llm_provider)
+            result = await generate_narrative(
+                facts,
+                model_client=model_client,
+                budget_tracker=get_budget_tracker(),
+                thread_id=thread_id,
+                tenant_id=query.tenant_id,
+            )
+        except BudgetExceededError:
+            # Checked inside `generate_narrative` itself, immediately before
+            # each real model call (matches `post_search`'s identical
+            # sequencing for `search_products`'s own multi-call path) — not
+            # pre-checked here, same reasoning as this module's own
+            # docstring point 4.
+            return _bare_response(
+                ErrorResponse(
+                    error_code="BUDGET_EXCEEDED",
+                    message="The model-call budget for this thread or day has been reached.",
+                    retryable=True,
+                    trace_id=trace_id,
+                ),
+                status_code=_status_code_for_error("BUDGET_EXCEEDED"),
+            )
+        except Exception:
+            # Defensive catch-all, matching `post_search`'s identical one —
+            # every response is schema-validated, never a raw stack trace.
+            logger.exception("thread.trade_report.unexpected_failure", thread_id=thread_id)
+            return _bare_response(
+                ErrorResponse(
+                    error_code="INTERNAL_ERROR",
+                    message="The trade report could not be completed due to an internal error.",
+                    retryable=False,
+                    trace_id=trace_id,
+                ),
+                status_code=_status_code_for_error("INTERNAL_ERROR"),
+            )
+
+        return _bare_response(
+            TradeReportResponse(
+                thread_id=thread_id,
+                facts=facts,
+                narrative=result.narrative,
+                narrative_source=result.source,
             ),
             status_code=200,
         )
