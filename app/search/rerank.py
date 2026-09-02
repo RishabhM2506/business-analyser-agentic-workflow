@@ -24,14 +24,6 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 PROMPT_VERSION = "rerank_hs_code-v1"
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "rerank_hs_code.md"
 
-# Auto-select the top-scoring candidate (sorted by score in code below,
-# never trusting the model's own list order) only above this score.
-# Conservative on purpose (flagged must-verify in docs/PLAN.md — no
-# measured score distribution exists yet): auto-select skips straight into
-# the trade-data pipeline with no confirmation, while disambiguation costs
-# the user one extra click — "ask when in doubt" is the safer default.
-HIGH_CONFIDENCE_THRESHOLD = 0.75
-
 # Live-reproduced 2026-08-20 (real Gemini + real embeddings corpus, first
 # genuine end-to-end smoke test): a deliberately nonsense query
 # ("zzzqqqxxx asdkjhaskjdh nonsense gibberish") was NOT caught by

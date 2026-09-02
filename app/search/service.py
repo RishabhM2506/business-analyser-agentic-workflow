@@ -1,9 +1,26 @@
 """Top-level orchestrator for free-text product search
 (`POST /threads/{thread_id}/search`, `app/main.py`) — composes
 `app.search.candidates` (find), `app.search.rerank` (rank + ground), and
-`app.budget` into the three-outcome contract
-(`auto_selected` / `disambiguate` / `no_candidates_found`) that
+`app.budget` into the two-outcome contract
+(`disambiguate` / `no_candidates_found`) that
 `app.schemas.response.ProductSearchResponse` exposes.
+
+**Always confirm, never auto-navigate** (2026-09-02 product decision):
+a search that finds anything real always ends on `disambiguate` — up to
+`MAX_DISAMBIGUATE_CANDIDATES` qualifying candidates, ranked best first,
+for the user to pick from themselves. There used to be a third outcome,
+`auto_selected`, that skipped straight to the analysis page for a
+high-confidence top match (`relevance_score >= 0.75`) — removed
+deliberately: silently picking a code on the user's behalf, even a
+confident guess, is exactly the kind of unconfirmed assumption this
+pipeline's evidence-first discipline avoids everywhere else (never
+fabricate a duty rate, never infer a missing figure as zero — extending
+the same "don't decide silently, let it be confirmed" principle to which
+*product* the rest of the pipeline analyzes). The frontend is
+responsible for the "or describe it again" affordance that always
+accompanies the shown candidates — this module only decides what
+qualifies as a real candidate; UI-only interactions (choosing to redo
+the search) need no backend round trip at all.
 
 Deliberately returns a plain dataclass, not a schema instance — mirrors
 `app.graph` returning `AnalysisState` (not a response schema) to
@@ -25,14 +42,17 @@ from app.models import ModelClient
 from app.search.bm25 import search_bm25
 from app.search.candidates import ProductSearchProvider
 from app.search.normalize import normalize_query
-from app.search.rerank import (
-    HIGH_CONFIDENCE_THRESHOLD,
-    LOW_CONFIDENCE_FLOOR,
-    RankedCandidate,
-    rerank_candidates,
-)
+from app.search.rerank import LOW_CONFIDENCE_FLOOR, RankedCandidate, rerank_candidates
 
-SearchOutcome = Literal["auto_selected", "disambiguate", "no_candidates_found"]
+SearchOutcome = Literal["disambiguate", "no_candidates_found"]
+
+# "Qualified" for display = clears the same LOW_CONFIDENCE_FLOOR that
+# already decides whether the *top* candidate is worth showing at all
+# (below) — reused here as the per-candidate bar too, rather than a new,
+# separately-tuned threshold: a candidate the reranker itself scored below
+# the "this might not even be a real match" line has no business being
+# offered as one of the up-to-5 choices either.
+MAX_DISAMBIGUATE_CANDIDATES = 5
 
 
 @dataclass(frozen=True)
@@ -41,13 +61,12 @@ class ProductSearchResult:
 
     `ranked_candidates` is already in final display order (descending
     `relevance_score`, computed in code by `rerank_candidates` — never the
-    model's own list order) and empty for `no_candidates_found`, where no
-    model call was ever made. `description_by_hs_code` lets the route
-    attach each candidate's taxonomy description without a second lookup
-    against `app.knowledge.provider`."""
+    model's own list order), already capped at `MAX_DISAMBIGUATE_CANDIDATES`,
+    and empty for `no_candidates_found`, where no model call was ever made.
+    `description_by_hs_code` lets the route attach each candidate's taxonomy
+    description without a second lookup against `app.knowledge.provider`."""
 
     outcome: SearchOutcome
-    selected_hs_code: str | None
     ranked_candidates: list[RankedCandidate]
     description_by_hs_code: dict[str, str]
 
@@ -126,10 +145,7 @@ async def search_products(
 
     if not candidates:
         return ProductSearchResult(
-            outcome="no_candidates_found",
-            selected_hs_code=None,
-            ranked_candidates=[],
-            description_by_hs_code={},
+            outcome="no_candidates_found", ranked_candidates=[], description_by_hs_code={}
         )
 
     description_by_hs_code = {candidate.hs_code: candidate.description for candidate in candidates}
@@ -144,14 +160,6 @@ async def search_products(
     )
 
     top = ranked_candidates[0]
-    if top.relevance_score >= HIGH_CONFIDENCE_THRESHOLD:
-        return ProductSearchResult(
-            outcome="auto_selected",
-            selected_hs_code=top.hs_code,
-            ranked_candidates=ranked_candidates,
-            description_by_hs_code=description_by_hs_code,
-        )
-
     if top.relevance_score < LOW_CONFIDENCE_FLOOR:
         # The reranker's own best-scored candidate still isn't a real
         # match (see this function's docstring, point 2) — discard the
@@ -160,15 +168,16 @@ async def search_products(
         # pre-reranker floor's identical empty-candidates shape so both
         # floors produce one consistent `no_candidates_found` contract.
         return ProductSearchResult(
-            outcome="no_candidates_found",
-            selected_hs_code=None,
-            ranked_candidates=[],
-            description_by_hs_code={},
+            outcome="no_candidates_found", ranked_candidates=[], description_by_hs_code={}
         )
 
+    # Never more than MAX_DISAMBIGUATE_CANDIDATES, and never a candidate
+    # the reranker itself scored below the "real match" floor — see this
+    # module's own docstring for why every search that finds anything real
+    # ends here rather than auto-navigating.
+    qualified = [c for c in ranked_candidates if c.relevance_score >= LOW_CONFIDENCE_FLOOR]
     return ProductSearchResult(
         outcome="disambiguate",
-        selected_hs_code=None,
-        ranked_candidates=ranked_candidates,
+        ranked_candidates=qualified[:MAX_DISAMBIGUATE_CANDIDATES],
         description_by_hs_code=description_by_hs_code,
     )

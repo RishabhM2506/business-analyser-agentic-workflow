@@ -47,8 +47,8 @@ class _FixedScoreModelClient:
     """Test double that ranks the real candidates it was handed
     (extracted from `user_content`, same 6-digit-extraction trick
     `app.models.MockLLM` itself uses) at a caller-chosen fixed score --
-    lets tests deterministically force `auto_selected` vs `disambiguate`
-    without depending on MockLLM's own fixed 0.5 constant."""
+    lets tests deterministically force a high- or low-confidence rerank
+    result without depending on MockLLM's own fixed 0.5 constant."""
 
     def __init__(self, *, score: float) -> None:
         self._score = score
@@ -73,8 +73,7 @@ class _InventedCodeModelClient:
 async def test_post_search_coffee_query_returns_disambiguate_under_mock_llm() -> None:
     """Under `LLM_PROVIDER=mock`, `MockLLM` assigns every candidate the
     same fixed 0.5 `relevance_score` (app/models.py's `_MOCK_FLOAT_VALUE`)
-    -- always below `HIGH_CONFIDENCE_THRESHOLD` (0.75), so the mock path is
-    deterministically `disambiguate`, never `auto_selected`."""
+    -- so the mock path is deterministically `disambiguate`."""
     thread_id = str(uuid.uuid4())
     async with _client_for(_isolated_settings()) as client:
         response = await client.post(f"/threads/{thread_id}/search", json={"query_text": "coffee"})
@@ -86,7 +85,7 @@ async def test_post_search_coffee_query_returns_disambiguate_under_mock_llm() ->
     assert body["thread_id"] == thread_id
     assert body["query_text"] == "coffee"
     assert body["outcome"] == "disambiguate"
-    assert body["selected_hs_code"] is None
+    assert "selected_hs_code" not in body  # removed field - never auto-selects, see below
     assert len(body["candidates"]) > 0
     hs_codes = [c["hs_code"] for c in body["candidates"]]
     assert any(code.startswith("0901") for code in hs_codes)  # coffee family present somewhere
@@ -94,9 +93,17 @@ async def test_post_search_coffee_query_returns_disambiguate_under_mock_llm() ->
 
 
 @pytest.mark.integration
-async def test_post_search_high_confidence_result_auto_selects(
+async def test_post_search_high_confidence_result_still_returns_disambiguate_not_auto_select(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """2026-09-02 product decision: a search never auto-navigates on the
+    user's behalf, however confident - `outcome` has exactly two values
+    now (`disambiguate` / `no_candidates_found`), `auto_selected` was
+    removed entirely. This is the regression test for that: a rerank
+    result that would previously have cleared the old 0.75 auto-select
+    threshold must still come back as `disambiguate`, with the
+    high-scoring candidate simply first in the list, not silently acted
+    on."""
     monkeypatch.setattr(
         main_module, "get_model_for_role", lambda role, provider: _FixedScoreModelClient(score=0.95)
     )
@@ -107,9 +114,35 @@ async def test_post_search_high_confidence_result_auto_selects(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["outcome"] == "auto_selected"
-    assert body["selected_hs_code"] is not None
-    assert body["selected_hs_code"] == body["candidates"][0]["hs_code"]
+    assert body["outcome"] == "disambiguate"
+    assert "selected_hs_code" not in body
+    assert len(body["candidates"]) > 0
+    assert all(c["relevance_score"] == 0.95 for c in body["candidates"])
+
+
+@pytest.mark.integration
+async def test_post_search_caps_candidates_at_five_even_when_more_qualify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`app.search.service.MAX_DISAMBIGUATE_CANDIDATES` (5): a query whose
+    real retrieval + fusion step surfaces more than 5 candidates, all
+    scored well above the confidence floor, must still come back capped
+    at exactly 5 - never all of them. "coffee" against the real taxonomy
+    genuinely fuses more than 5 real HS6 candidates (the whole coffee/tea/
+    mate family plus fusion noise), so this exercises the real pipeline,
+    not a synthetic fixture."""
+    monkeypatch.setattr(
+        main_module, "get_model_for_role", lambda role, provider: _FixedScoreModelClient(score=0.9)
+    )
+    thread_id = str(uuid.uuid4())
+
+    async with _client_for(_isolated_settings()) as client:
+        response = await client.post(f"/threads/{thread_id}/search", json={"query_text": "coffee"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["outcome"] == "disambiguate"
+    assert len(body["candidates"]) == 5
 
 
 @pytest.mark.integration
@@ -151,7 +184,7 @@ async def test_post_search_nonsense_query_returns_no_candidates_found_after_one_
     assert response.status_code == 200
     body = response.json()
     assert body["outcome"] == "no_candidates_found"
-    assert body["selected_hs_code"] is None
+    assert "selected_hs_code" not in body
     assert body["candidates"] == []
     assert calls["count"] == 1  # one budget-checked normalization call, never rerank
 
@@ -182,7 +215,7 @@ async def test_post_search_uniformly_low_reranked_scores_also_return_no_candidat
     assert response.status_code == 200
     body = response.json()
     assert body["outcome"] == "no_candidates_found"
-    assert body["selected_hs_code"] is None
+    assert "selected_hs_code" not in body
     assert body["candidates"] == []
 
 
