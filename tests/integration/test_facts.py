@@ -12,6 +12,7 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import delete, insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.report.facts import assemble_facts
@@ -21,6 +22,7 @@ from app.warehouse.schema import (
     analytics_partner_rankings,
     analytics_unit_value_series,
     ref_hs6_hs8_crosswalk,
+    ref_llm_datapoints,
     ref_regulatory_notes,
 )
 
@@ -54,6 +56,7 @@ async def _cleanup(warehouse_engine: AsyncEngine) -> None:
         await conn.execute(
             delete(ref_regulatory_notes).where(ref_regulatory_notes.c.hs6 == _TEST_HS6)
         )
+        await conn.execute(delete(ref_llm_datapoints).where(ref_llm_datapoints.c.hs6 == _TEST_HS6))
 
 
 async def test_assemble_facts_real_shape(warehouse_engine: AsyncEngine) -> None:
@@ -238,3 +241,192 @@ async def test_assemble_facts_no_warning_when_a_regulatory_note_exists(
 
     assert facts.regulatory_note == "Test regulatory note."
     assert facts.regulatory_note_missing_warning is False  # a note exists, so no warning fires
+
+
+# --- ref_llm_datapoints / llm_datapoints (2026-09-02, Step 4 hardening) -------
+
+
+async def test_assemble_facts_reads_an_active_llm_datapoint_and_filters_by_field(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(ref_llm_datapoints).values(
+                hs6=_TEST_HS6,
+                field_name="mandi_price",
+                effective_period="2026-08",
+                value_json={"modal_price_inr_paise_per_qtl": 850000, "market": "Nashik"},
+                source_authority="Test Authority",
+                source_reference="Test market bulletin",
+                source_url="https://example.test/bulletin",
+                verified_date=date(2026, 9, 2),
+            )
+        )
+
+    facts = await assemble_facts(
+        warehouse_engine,
+        hs6=_TEST_HS6,
+        flow="import",
+        window_start=date(2023, 1, 1),
+        window_end=date(2023, 12, 31),
+        top_n=10,
+        as_of=date(2023, 12, 31),
+        include_agriculture_sources=True,
+    )
+
+    assert len(facts.llm_datapoints) == 1
+    entry = facts.llm_datapoints[0]
+    assert entry.field_name == "mandi_price"
+    assert entry.value == {"modal_price_inr_paise_per_qtl": 850000, "market": "Nashik"}
+    assert entry.source_authority == "Test Authority"
+    assert entry.source_url == "https://example.test/bulletin"
+
+    # Filtered correctly into the matching field's slice, not the others.
+    assert facts.mandi_price_llm_datapoints == [entry]
+    assert facts.msp_llm_datapoints == []
+    assert facts.international_production_llm_datapoints == []
+
+    # Never blended into the verified field it sits beside - the honest
+    # NOT_FOUND status (no real Agmarknet row for this fake test hs6)
+    # is completely unaffected by the cited datapoint existing.
+    assert facts.mandi_price.status == "NOT_FOUND"
+
+
+async def test_assemble_facts_excludes_a_retracted_llm_datapoint(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(ref_llm_datapoints).values(
+                [
+                    {
+                        "hs6": _TEST_HS6,
+                        "field_name": "mandi_price",
+                        "effective_period": "2026-08",
+                        "value_json": {"modal_price_inr_paise_per_qtl": 850000},
+                        "source_authority": "Test Authority",
+                        "source_reference": "Still active",
+                        "source_url": None,
+                        "verified_date": date(2026, 9, 2),
+                        "status": "ACTIVE",
+                        # Explicit, matching the second row's key set - a
+                        # multi-row `insert().values([...])` compiles its
+                        # column list from the *first* dict only, silently
+                        # dropping any key absent there even if a later row
+                        # includes it (a real SQLAlchemy Core gotcha hit
+                        # while writing this test, not a schema issue).
+                        "retracted_reason": None,
+                    },
+                    {
+                        "hs6": _TEST_HS6,
+                        "field_name": "mandi_price",
+                        "effective_period": "2026-07",
+                        "value_json": {"modal_price_inr_paise_per_qtl": 1},
+                        "source_authority": "Test Authority",
+                        "source_reference": "Later found to be wrong",
+                        "source_url": None,
+                        "verified_date": date(2026, 8, 1),
+                        "status": "RETRACTED",
+                        "retracted_reason": "Source page was actually about a different commodity",
+                    },
+                ]
+            )
+        )
+
+    facts = await assemble_facts(
+        warehouse_engine,
+        hs6=_TEST_HS6,
+        flow="import",
+        window_start=date(2023, 1, 1),
+        window_end=date(2023, 12, 31),
+        top_n=10,
+        as_of=date(2023, 12, 31),
+        include_agriculture_sources=True,
+    )
+
+    assert len(facts.llm_datapoints) == 1
+    assert facts.llm_datapoints[0].source_reference == "Still active"
+
+
+async def test_assemble_facts_llm_datapoints_empty_when_agriculture_sources_excluded(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """Same gate as the verified mandi_price/msp/international_production
+    fetches: a cited search result for a categorically-inapplicable field
+    (e.g. cement's "mandi price") is exactly as meaningless as that field's
+    own NOT_APPLICABLE status - never fetched, regardless of whether a row
+    happens to exist."""
+    async with warehouse_engine.begin() as conn:
+        await conn.execute(
+            insert(ref_llm_datapoints).values(
+                hs6=_TEST_HS6,
+                field_name="mandi_price",
+                effective_period="2026-08",
+                value_json={"modal_price_inr_paise_per_qtl": 850000},
+                source_authority="Test Authority",
+                source_reference="Test",
+                source_url=None,
+                verified_date=date(2026, 9, 2),
+            )
+        )
+
+    facts = await assemble_facts(
+        warehouse_engine,
+        hs6=_TEST_HS6,
+        flow="import",
+        window_start=date(2023, 1, 1),
+        window_end=date(2023, 12, 31),
+        top_n=10,
+        as_of=date(2023, 12, 31),
+        include_agriculture_sources=False,
+    )
+
+    assert facts.llm_datapoints == []
+    assert facts.mandi_price_llm_datapoints == []
+    assert facts.mandi_price.status == "NOT_APPLICABLE"
+
+
+async def test_ref_llm_datapoints_rejects_a_row_for_a_field_not_in_the_allowlist(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """The check constraint, not just application code, is what stops a
+    typo'd or unsupported field_name from ever landing in this table."""
+    with pytest.raises(IntegrityError, match="ck_rld_field_name"):
+        async with warehouse_engine.begin() as conn:
+            await conn.execute(
+                insert(ref_llm_datapoints).values(
+                    hs6=_TEST_HS6,
+                    field_name="not_a_real_field",
+                    effective_period="2026-08",
+                    value_json={},
+                    source_authority="Test Authority",
+                    source_reference="Test",
+                    source_url=None,
+                    verified_date=date(2026, 9, 2),
+                )
+            )
+
+
+async def test_ref_llm_datapoints_requires_a_reason_to_retract_a_row(
+    warehouse_engine: AsyncEngine,
+) -> None:
+    """A row can't be silently marked RETRACTED with no explanation - the
+    check constraint enforces that a retraction always carries its own
+    reason, the same way ref_duty_components's status/value_pct pairing is
+    enforced in the database, not just trusted from application code."""
+    with pytest.raises(IntegrityError, match="ck_rld_retracted_reason_matches_status"):
+        async with warehouse_engine.begin() as conn:
+            await conn.execute(
+                insert(ref_llm_datapoints).values(
+                    hs6=_TEST_HS6,
+                    field_name="mandi_price",
+                    effective_period="2026-08",
+                    value_json={},
+                    source_authority="Test Authority",
+                    source_reference="Test",
+                    source_url=None,
+                    verified_date=date(2026, 9, 2),
+                    status="RETRACTED",
+                    retracted_reason=None,
+                )
+            )

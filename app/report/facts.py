@@ -5,17 +5,50 @@ built) will extract every number from the model's prose and assert
 membership against a flattened set of every numeric leaf here.
 
 **Read-only over the analytics/ref layers, by design.** `assemble_facts`
-never touches `normalized_trade_flows` directly and never recomputes a
-metric — it only reads `analytics_partner_rankings`,
-`analytics_unit_value_series`, `analytics_mismatch_checks`,
-`analytics_coverage_summary`, `ref_duty_components` (via
-`ManualDutySource`), `ref_regulatory_notes`, and `ref_hs6_hs8_crosswalk`.
-This matches `schema.py`'s own stated architecture ("Analytics layer:
-precomputed on ingest, API reads only this") and the ingestion-vs-query
-plane separation (D13): every one of those tables must already be
-populated by its own precompute job (`rankings.py`, `unit_value.py`,
-`mismatch.py`, `coverage_gate.py`) before this function is called, never
-computed request-time.
+never touches `normalized_trade_flows` directly and never reads anything
+that requires its own precompute job or storage table — it only reads
+`analytics_partner_rankings`, `analytics_unit_value_series`,
+`analytics_mismatch_checks`, `analytics_coverage_summary`,
+`ref_duty_components` (via `ManualDutySource`), `ref_regulatory_notes`,
+and `ref_hs6_hs8_crosswalk`. This matches `schema.py`'s own stated
+architecture ("Analytics layer: precomputed on ingest, API reads only
+this") and the ingestion-vs-query plane separation (D13): every one of
+those tables must already be populated by its own precompute job
+(`rankings.py`, `unit_value.py`, `mismatch.py`, `coverage_gate.py`)
+before this function is called, never computed request-time.
+
+**One real, deliberate exception**: `hhi_by_year` and, as of 2026-09-02,
+`overall_cagr`/`overall_volatility`/`cagr_by_partner`/`volatility_by_partner`
+are stateless, pure-math values (`app.report.rankings.compute_hhi`,
+`app.analytics.timeseries_math.cagr`/`coefficient_of_variation`) *derived
+live, at request time, from rows already read above* — never from raw
+`normalized_trade_flows`, and never anything with a precompute job or
+storage table of its own to be out of sync with. This is a narrower claim
+than "never recomputes a metric" (this file used to say that; it was
+already inaccurate the day `hhi_by_year` shipped) — the invariant that
+actually holds is "never queries anything beyond the analytics/ref tables
+listed above."
+
+**`llm_datapoints` (2026-09-02, Step 4 hardening, Concern 2)**: a second,
+narrower kind of exception to "only reads the tables listed above" — reads
+`ref_llm_datapoints`, a citation-required table populated by a curator-run
+search script (`scripts/run_llm_datapoint_search.py`), never a live search
+at request time (this function makes no model call and no outbound HTTP
+call of any kind, matching every other read here). No approval gate: a
+row is live and readable the moment the script writes it (user-directed
+2026-09-02: the citation itself is the safety mechanism, not a human
+sign-off step) — only `status='RETRACTED'` rows (a curator's after-the-
+fact correction) are excluded. Surfaced as its own field, `llm_datapoints:
+list[LlmDatapointFact]`, plus a filtered slice per backfillable field
+(`mandi_price_llm_datapoints`, etc.) — deliberately **not** reconstructed
+into `MandiPriceFact`'s own shape: that type's `status` vocabulary
+(`VERIFIED`/`NOT_FOUND`/`NOT_APPLICABLE`) has no honest value for "a cited
+search found this," and blind-unpacking a JSON blob into a strict
+`extra="forbid"` schema risks a validation error silently dropping a
+real, curator-found datapoint over a field-naming mismatch. The generic
+`LlmDatapointFact` shape avoids both problems and keeps this exactly what
+Concern 2 asked for — a parallel, clearly-separate view, never blended
+into the verified field it sits beside.
 
 Scoped to one `flow` at a time, matching every other module built this
 session (`mismatch.py`, `rankings.py`, `unit_value.py`,
@@ -64,11 +97,13 @@ from datetime import date
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.analytics.timeseries_math import cagr, coefficient_of_variation
 from app.knowledge.provider import get_taxonomy_entry
 from app.pipeline.duty_source import ManualDutySource
 from app.pipeline.normalize import UNMAPPED_PREFIX
@@ -83,6 +118,7 @@ from app.warehouse.schema import (
     raw_faostat_records,
     raw_msp_records,
     ref_hs6_hs8_crosswalk,
+    ref_llm_datapoints,
     ref_regulatory_notes,
 )
 
@@ -147,6 +183,12 @@ class PartnerFact(BaseModel):
 
     rank: int
     country: str
+    # 2026-09-02, Step 4 hardening (Concern 1) — the raw code, alongside
+    # the already-resolved display name above, so a caller can join this
+    # row against `Facts.cagr_by_partner`/`volatility_by_partner` (both
+    # keyed by this same raw code) without re-deriving or re-resolving
+    # anything.
+    partner_country_code: str
     value_inr_paise: int
     status: str
 
@@ -194,6 +236,26 @@ class MismatchCheckFact(BaseModel):
     partner: str
     gap_pct: Decimal
     severity: str
+
+
+class LlmDatapointFact(BaseModel):
+    """One `ref_llm_datapoints` row (2026-09-02, Step 4 hardening, Concern
+    2) — a real, cited search result for a field the verified analytics/
+    ref layer has nothing for. `value` is deliberately a generic dict, not
+    unpacked into any specific typed Fact — see this module's own
+    docstring for why. `source_url` is `None` when the citation isn't a
+    URL (matching `ref_duty_components`'s own precedent, where that field
+    is likewise optional)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_name: str
+    effective_period: str
+    value: dict[str, Any]
+    source_authority: str
+    source_reference: str
+    source_url: str | None
+    verified_date: date
 
 
 class CoverageFact(BaseModel):
@@ -302,6 +364,17 @@ class Facts(BaseModel):
     month_wise_current_year: list[dict[str, object]]
     unit_value_trend: list[UnitValueTrendYear]
     hhi_by_year: list[HhiYear]
+    # 2026-09-02, Step 4 hardening (Concern 1: more metrics, computed from
+    # whatever real data exists) — `None` per-partner/overall whenever
+    # there isn't honestly enough real data (see
+    # `app.analytics.timeseries_math`'s own docstring for the exact
+    # "not enough data" condition each follows). Same live-derive-from-
+    # already-read-rows shape as `hhi_by_year` above, not a new
+    # architectural exception (see this module's own docstring).
+    overall_cagr: float | None
+    overall_volatility: float | None
+    cagr_by_partner: dict[str, float | None]
+    volatility_by_partner: dict[str, float | None]
     landed_cost: LandedCostResult | None
     landed_cost_as_of_period: str | None
     mismatch_checks: list[MismatchCheckFact]
@@ -312,6 +385,17 @@ class Facts(BaseModel):
     mandi_price: MandiPriceFact
     msp: MspFact
     international_production: InternationalProductionFact
+    # 2026-09-02, Step 4 hardening (Concern 2: cited LLM-sourced
+    # supplementary data points) — every ACTIVE ref_llm_datapoints row for
+    # this hs6, plus a filtered slice per backfillable field for direct
+    # display alongside that field's own verified value. Empty lists (not
+    # `None`) in the common case where nothing has been searched for this
+    # product yet — same "list, not optional, empty means genuinely
+    # nothing" convention as `mismatch_checks` above.
+    llm_datapoints: list[LlmDatapointFact]
+    mandi_price_llm_datapoints: list[LlmDatapointFact]
+    msp_llm_datapoints: list[LlmDatapointFact]
+    international_production_llm_datapoints: list[LlmDatapointFact]
 
 
 @dataclass(frozen=True)
@@ -362,6 +446,7 @@ def _to_partner_facts(ranked_rows: list[_RankingRow]) -> list[PartnerFact]:
             PartnerFact(
                 rank=r.rank,
                 country=_display_name(r.partner_country_code),
+                partner_country_code=r.partner_country_code,
                 value_inr_paise=r.value_inr_paise,
                 status=r.status,
             )
@@ -404,6 +489,38 @@ def _build_annual_series_year(
         partners=_to_partner_facts(top),
         all_other_partners=AllOtherPartnersFact(value_inr_paise=other_value, status=other_status),
     )
+
+
+def _overall_value_series(annual_series: list[AnnualSeriesYear]) -> dict[int, float | None]:
+    """Product-level (not per-partner) year -> value series, straight from
+    `annual_series`'s own `total_inr_paise` field — free given
+    `annual_series` is already built, no new query or pivot (2026-09-02,
+    Step 4 hardening)."""
+    return {
+        y.year: (float(y.total_inr_paise) if y.total_inr_paise is not None else None)
+        for y in annual_series
+    }
+
+
+def _partner_value_series(
+    rankings_by_year: dict[int, list[_RankingRow]], *, years: list[int]
+) -> dict[str, dict[int, float | None]]:
+    """Pivot `rankings_by_year` (year -> [rows]) into the opposite
+    direction — partner_country_code -> {year: value} — for CAGR/
+    coefficient-of-variation, which are computed across years for a given
+    partner, not across partners within a given year (unlike `hhi_by_year`,
+    which stays in the original pivot direction). `dict.fromkeys(years)`
+    seeds every partner with every declared year up front, so a partner
+    missing from some years reads `None` there, never silently absent from
+    the dict entirely (2026-09-02, Step 4 hardening)."""
+    partner_series: dict[str, dict[int, float | None]] = {}
+    for year in years:
+        for r in rankings_by_year[year]:
+            partner_series.setdefault(r.partner_country_code, dict.fromkeys(years))
+            partner_series[r.partner_country_code][year] = (
+                float(r.value_inr_paise) if r.value_inr_paise is not None else None
+            )
+    return partner_series
 
 
 async def _fetch_unit_value_trend(
@@ -462,6 +579,38 @@ async def _fetch_mismatch_checks(
             partner=_display_name(r["partner_country_code"]),
             gap_pct=r["gap_pct"],
             severity=r["severity"],
+        )
+        for r in rows
+    ]
+
+
+async def _fetch_llm_datapoints(engine: AsyncEngine, *, hs6: str) -> list[LlmDatapointFact]:
+    """Every `status='ACTIVE'` `ref_llm_datapoints` row for `hs6` — a
+    `RETRACTED` row (a curator's after-the-fact correction) is the only
+    thing ever excluded; there is no approval step to also filter on (this
+    module's own docstring explains why, 2026-09-02, Step 4 hardening)."""
+    async with engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    select(ref_llm_datapoints).where(
+                        ref_llm_datapoints.c.hs6 == hs6,
+                        ref_llm_datapoints.c.status == "ACTIVE",
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return [
+        LlmDatapointFact(
+            field_name=r["field_name"],
+            effective_period=r["effective_period"],
+            value=r["value_json"],
+            source_authority=r["source_authority"],
+            source_reference=r["source_reference"],
+            source_url=r["source_url"],
+            verified_date=r["verified_date"],
         )
         for r in rows
     ]
@@ -824,6 +973,17 @@ async def assemble_facts(
         for year in years
     ]
 
+    # 2026-09-02, Step 4 hardening: per-partner CAGR/volatility.
+    partner_series = _partner_value_series(rankings_by_year, years=years)
+    cagr_by_partner = {code: cagr(series) for code, series in partner_series.items()}
+    volatility_by_partner = {
+        code: coefficient_of_variation(series) for code, series in partner_series.items()
+    }
+
+    overall_series = _overall_value_series(annual_series)
+    overall_cagr = cagr(overall_series)
+    overall_volatility = coefficient_of_variation(overall_series)
+
     latest_hhi_year = next((y for y in reversed(hhi_by_year) if y.hhi is not None), None)
     top1_share_exceeds_threshold = False
     if latest_hhi_year is not None:
@@ -852,7 +1012,14 @@ async def assemble_facts(
         international_production = await _fetch_international_production(
             engine, taxonomy_description=product_label
         )
+        # Same gate as the three verified fetches above, same reason: a
+        # cited search result for cement's "mandi price" would be exactly
+        # as categorically meaningless as the NOT_APPLICABLE status those
+        # three already get in the `else` branch (2026-09-02, Step 4
+        # hardening).
+        all_llm_datapoints = await _fetch_llm_datapoints(engine, hs6=hs6)
     else:
+        all_llm_datapoints = []
         mandi_price = MandiPriceFact(
             status="NOT_APPLICABLE",
             matched_commodity=None,
@@ -887,6 +1054,10 @@ async def assemble_facts(
         month_wise_current_year=[],
         unit_value_trend=await _fetch_unit_value_trend(engine, hs6=hs6, flow=flow, years=years),
         hhi_by_year=hhi_by_year,
+        overall_cagr=overall_cagr,
+        overall_volatility=overall_volatility,
+        cagr_by_partner=cagr_by_partner,
+        volatility_by_partner=volatility_by_partner,
         landed_cost=landed_cost,
         landed_cost_as_of_period=landed_cost_as_of_period,
         mismatch_checks=await _fetch_mismatch_checks(engine, hs6=hs6, flow=flow, years=years),
@@ -899,4 +1070,10 @@ async def assemble_facts(
         mandi_price=mandi_price,
         msp=msp,
         international_production=international_production,
+        llm_datapoints=all_llm_datapoints,
+        mandi_price_llm_datapoints=[d for d in all_llm_datapoints if d.field_name == "mandi_price"],
+        msp_llm_datapoints=[d for d in all_llm_datapoints if d.field_name == "msp"],
+        international_production_llm_datapoints=[
+            d for d in all_llm_datapoints if d.field_name == "international_production"
+        ],
     )

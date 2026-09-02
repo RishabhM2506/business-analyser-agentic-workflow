@@ -20,7 +20,22 @@ allowlist is needed here. Money fields ending `_inr_paise` (and
 `inr_paise_per_kg`) are grounded in **both** their raw-paise form and a
 rupee-crore conversion, since the rendered prompt (and any narrative
 copying it) naturally states the crore figure, not raw paise.
-"""
+
+**`llm_datapoints` (2026-09-02, Step 4 hardening, Concern 2) is
+deliberately excluded from `render_facts_for_prompt` below** — the model
+never sees a cited-but-not-independently-verified figure, so it can never
+narrate one, full stop. This is the same "structured-only for now"
+deferral this session's Step 3 hardening pass already applied to its own
+new derived metrics: safely teaching a model to narrate a number while
+visibly distinguishing "cited, not verified" from every other number in
+this document is a real, separate design problem (how would a reader even
+tell the two apart in prose without the narrative itself pointing it
+out?) that deserves its own dedicated review, not a bullet point folded
+into this pass. `flatten_facts_numbers` below still technically walks
+`llm_datapoints`' numeric leaves (it's fully generic over `Facts`' shape),
+which only makes `check_narrative_grounded` *more* permissive for those
+specific numbers — harmless in practice, since a model that never sees a
+number in its prompt has no way to guess it by coincidence."""
 
 from __future__ import annotations
 

@@ -41,7 +41,9 @@ class Provenance(BaseModel):
 
 
 class CountryRow(BaseModel):
-    """One partner-country row within a `TradeTable`."""
+    """One partner-country row within a `TradeTable` — or, for the sentinel
+    `partner_code="_REST_OF_WORLD_"` row (`TradeTable.rest_of_world`), the
+    summed total of every real country ranked below the top-N cutoff."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -50,6 +52,20 @@ class CountryRow(BaseModel):
     values_by_year: dict[int, float | None]
     cumulative_5yr: float
     rank: int  # ranked by cumulative_5yr, per Gate 0 answer
+    # 2026-09-02, Step 3 hardening: derived per-partner statistics, computed
+    # in `app.nodes.aggregate` from this row's own `values_by_year` only —
+    # never fed to the LLM narrator (`app.guardrails._flatten_value_numbers`
+    # only ever walks `cumulative_5yr`/`values_by_year`, deliberately not
+    # these fields — see that module's own docstring: teaching the model to
+    # safely narrate a derived figure is a distinct, separately-reviewed
+    # change, not bundled into this one). Structured-only for now; the
+    # frontend renders them directly, same as `years_no_data` today.
+    # `None` (not a fabricated 0/false) whenever there isn't enough real
+    # data to compute the figure honestly — see each computing function's
+    # own docstring for its exact "not enough data" condition.
+    coefficient_of_variation: float | None = Field(default=None)
+    is_high_volatility: bool = Field(default=False)
+    cagr: float | None = Field(default=None)
 
 
 class TradeTable(BaseModel):
@@ -98,6 +114,56 @@ class TradeTable(BaseModel):
     fetch_issue_years: list[int] = Field(default_factory=list)
     excluded_partner_codes: list[str]  # transparency: aggregate/"nes" codes stripped
     rows: list[CountryRow]  # top 10
+    # 2026-09-02, Step 3 hardening (Concern 1: "preserve the denominator"):
+    # every real country ranked below the top-N cutoff, summed into one
+    # row, so the table's own total still reconciles to the true total
+    # rather than silently shrinking whenever a country gets truncated.
+    # Deliberately kept OUT of `rows` (not appended as an 11th entry) so
+    # every existing `rows`-consumer (the guardrail's number-grounding,
+    # the frontend's rank-sorted render) is completely unaffected by this
+    # field's addition. `None` when nothing was truncated (`len(rows)` is
+    # already every real country there was) — never a fabricated all-zero
+    # row.
+    rest_of_world: CountryRow | None = Field(default=None)
+    # Comtrade's own `partnerCode="0"` ("World") row, captured per year
+    # before it's excluded from ranking (previously discarded entirely) —
+    # an independent, Comtrade-reported ground truth for "what should the
+    # top-N + rest_of_world sum to." `None` for a year Comtrade didn't
+    # report a World total for at all (distinct from a reported `0.0`).
+    world_total_comtrade: dict[int, float | None] = Field(default_factory=dict)
+    # Whether `sum(row.values_by_year[year] for row in rows) +
+    # (rest_of_world.values_by_year[year] or 0)` is within 1% of
+    # `world_total_comtrade[year]` for that year. `None` when either side
+    # is missing for that year — never guessed from a partial comparison.
+    world_total_reconciles: dict[int, bool | None] = Field(default_factory=dict)
+    # Herfindahl-Hirschman concentration index (0-1, higher = more
+    # concentrated among fewer partners) computed over every real
+    # country's own cumulative value (not the truncated top-N-plus-one-
+    # rest_of_world-bucket view, which would inflate the index — squaring
+    # one lumped "rest of world" total overstates concentration relative
+    # to summing each of those countries' own, individually-smaller,
+    # squared shares). `None` when the real-country total is zero.
+    hhi: float | None = Field(default=None)
+
+
+class TradeBalance(BaseModel):
+    """Net trade (exports minus imports) for the analyzed product, using
+    each side's Comtrade-reported World total (`TradeTable.
+    world_total_comtrade`) as the denominator — the honest full total, not
+    just the sum of whichever top-N partners happened to be ranked. A
+    positive `by_year`/`cumulative` value means India is a net exporter of
+    this product for that year/window; negative means net importer.
+    2026-09-02, Step 3 hardening (Concern 3: trade balance)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # `None` for a year where either side's World total is missing — never
+    # a one-sided, misleading "balance" computed from half the picture.
+    by_year: dict[int, float | None]
+    # Sum of the non-`None` yearly balances (same "skip missing years,
+    # never interpolate" discipline as `app.nodes.aggregate.
+    # _cumulative_value`) — `None` only when every year is `None`.
+    cumulative: float | None
 
 
 class TradeAnalysisResponse(BaseModel):
@@ -111,6 +177,7 @@ class TradeAnalysisResponse(BaseModel):
     item_description: str
     imports: TradeTable
     exports: TradeTable
+    trade_balance: TradeBalance
     analytical_summary: str
     provenance: Provenance
 

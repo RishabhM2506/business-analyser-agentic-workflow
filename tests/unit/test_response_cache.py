@@ -11,7 +11,7 @@ import pytest
 
 from app.cache.response_cache import ResponseCache, filter_hash, get_response_cache
 from app.schemas.query import TradeQuery
-from app.schemas.response import Provenance, TradeAnalysisResponse, TradeTable
+from app.schemas.response import Provenance, TradeAnalysisResponse, TradeBalance, TradeTable
 
 _YEARS = (2019, 2023)
 
@@ -27,6 +27,7 @@ def _response(*, thread_id: str = "t-1", message_id: str = "m-1") -> TradeAnalys
         item_description="A description.",
         imports=table,
         exports=table,
+        trade_balance=TradeBalance(by_year={}, cumulative=None),
         analytical_summary="A summary.",
         provenance=Provenance(
             source="UN Comtrade (comtradeapi.un.org)",

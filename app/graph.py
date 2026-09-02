@@ -185,6 +185,7 @@ def assemble_response(state: AnalysisState) -> dict[str, Any]:
     analytical_summary = state.get("analytical_summary")
     imports_table = state.get("imports_table")
     exports_table = state.get("exports_table")
+    trade_balance = state.get("trade_balance")
     thread_id = state.get("thread_id")
     message_id = state.get("message_id")
 
@@ -194,6 +195,7 @@ def assemble_response(state: AnalysisState) -> dict[str, Any]:
         or analytical_summary is None
         or imports_table is None
         or exports_table is None
+        or trade_balance is None
         or thread_id is None
         or message_id is None
     ):
@@ -213,6 +215,7 @@ def assemble_response(state: AnalysisState) -> dict[str, Any]:
         item_description=item_description,
         imports=imports_table,
         exports=exports_table,
+        trade_balance=trade_balance,
         analytical_summary=analytical_summary,
         provenance=Provenance(
             source="UN Comtrade (comtradeapi.un.org)",

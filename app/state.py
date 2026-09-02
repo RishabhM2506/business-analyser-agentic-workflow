@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
-from app.schemas.response import TradeAnalysisResponse, TradeTable
+from app.schemas.response import TradeAnalysisResponse, TradeBalance, TradeTable
 from app.tools.comtrade_client import ComtradeRecord
 
 
@@ -141,6 +141,11 @@ class AnalysisState(TypedDict, total=False):
 
     imports_table: TradeTable
     exports_table: TradeTable
+    # 2026-09-02, Step 3 hardening: always computed by `app.nodes.aggregate`
+    # alongside its two siblings above (never independently missing) — net
+    # trade using each table's own `world_total_comtrade`, not just the
+    # top-N sum.
+    trade_balance: TradeBalance
 
     taxonomy_text: str
 

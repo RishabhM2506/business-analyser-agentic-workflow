@@ -15,7 +15,7 @@ from app.nodes.describe_item import PROMPT_VERSION as DESCRIBE_ITEM_PROMPT_VERSI
 from app.nodes.summarize import PROMPT_VERSION as SUMMARIZE_PROMPT_VERSION
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
-from app.schemas.response import CountryRow, TradeTable
+from app.schemas.response import CountryRow, TradeBalance, TradeTable
 from app.state import AnalysisState
 
 
@@ -44,6 +44,7 @@ def _complete_state(**overrides: object) -> AnalysisState:
         "analytical_summary": "A short summary.",
         "imports_table": _table(),
         "exports_table": _table(),
+        "trade_balance": TradeBalance(by_year={2021: 50.0, 2022: 50.0}, cumulative=100.0),
         "thread_id": "thread-1",
         "message_id": "message-1",
     }
@@ -94,6 +95,7 @@ def test_assemble_response_builds_full_response_from_complete_state() -> None:
         "analytical_summary",
         "imports_table",
         "exports_table",
+        "trade_balance",
         "thread_id",
         "message_id",
     ],
