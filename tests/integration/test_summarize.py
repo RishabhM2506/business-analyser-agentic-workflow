@@ -73,8 +73,8 @@ class _FabricatingModelClient:
 
 
 class _RaisingModelClient:
-    """Simulates a total model-call failure, e.g. every key in a
-    load-balanced pool exhausted (`app.models.LoadBalancedGeminiModelClient`
+    """Simulates a total model-call failure, e.g. every credential in the
+    pool exhausted (`app.gemini_scheduler.scheduler.GeminiScheduler`
     re-raises the real last exception on total exhaustion)."""
 
     async def generate_structured(
