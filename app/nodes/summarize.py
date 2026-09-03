@@ -121,11 +121,39 @@ async def summarize(state: AnalysisState) -> dict[str, Any]:
         f"{render_table('IMPORTS', imports_table)}\n\n"
         f"{render_table('EXPORTS', exports_table)}"
     )
-    result = await client.generate_structured(
-        system_prompt=_load_system_prompt(),
-        user_content=user_content,
-        schema=SummarizeOutput,
-    )
+    try:
+        result = await client.generate_structured(
+            system_prompt=_load_system_prompt(),
+            user_content=user_content,
+            schema=SummarizeOutput,
+        )
+    except Exception:
+        # A total model-call failure (e.g. every key in a load-balanced
+        # pool exhausted) previously propagated uncaught, past this node,
+        # past `compiled_graph.ainvoke`, into `post_message`'s generic
+        # `except Exception` handler as an unclassified `INTERNAL_ERROR` -
+        # contradicting this file's own "a defined error fallback, never a
+        # silent partial render" principle (below). `UPSTREAM_TIMEOUT`
+        # already exists in `app.main`'s status-code map and
+        # `ErrorResponse`'s own docstring example precisely for this case;
+        # it was never actually raised anywhere until now (2026-09-03 fix,
+        # live-reproduced: `gemini-flash-latest` 503/504 across the whole
+        # key pool on a real `/messages` call).
+        logger.warning(
+            "summarize.model_call_failed",
+            hs_code=query.hs_code,
+            trace_id=get_or_mint_trace_id(state),
+        )
+        return {
+            "error": ErrorResponse(
+                error_code="UPSTREAM_TIMEOUT",
+                message=(
+                    "The analysis model is temporarily unavailable. Please try again shortly."
+                ),
+                retryable=True,
+                trace_id=get_or_mint_trace_id(state),
+            )
+        }
 
     if not check_numbers_grounded(
         result.analytical_summary, imports_table, exports_table, hs_code=query.hs_code
