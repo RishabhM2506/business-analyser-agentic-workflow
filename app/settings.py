@@ -18,8 +18,29 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class GeminiCredentialConfig(BaseModel):
+    """One entry in `Settings.gemini_credentials` -- names the env var
+    holding the real key rather than embedding the key itself, so this
+    config is always safe to log/inspect (`app.gemini_scheduler.
+    credentials.build_credential_pool` does the actual env-var lookup).
+    `project_id` is the Google Cloud project this credential's quota
+    belongs to -- multiple credentials sharing a `project_id` are
+    correctly treated as one quota pool, never multiplied (Gemini Provider
+    Scheduler, 2026-09-04)."""
+
+    id: str
+    env_var: str
+    project_id: str
+    account_label: str | None = None
+    # None = this credential supports every model the app is configured to
+    # use (`model_utility`/`model_analysis`) -- most credentials don't need
+    # to restrict this.
+    models: list[str] | None = None
+    enabled: bool = True
 
 
 class Settings(BaseSettings):
@@ -39,15 +60,26 @@ class Settings(BaseSettings):
     # committed, separate keys per environment) ------------------------------
     comtrade_api_key: str
     gemini_api_key: str
-    # Additional Gemini API keys for the round-robin/failover load balancer
-    # (2026-08-26 addition, `app.models.LoadBalancedGeminiModelClient`) —
-    # JSON array, same convention as `cors_allowed_origins` below. `[]`
+    # Additional Gemini API keys for the Gemini Provider Scheduler
+    # (2026-08-26 addition, originally for `app.models.
+    # LoadBalancedGeminiModelClient`; now `app.gemini_scheduler`, see
+    # docs/GEMINI_SCHEDULER.md) — JSON array, same convention as
+    # `cors_allowed_origins` below. `[]`
     # (the default) means "just gemini_api_key, no pooling," so every
     # existing deployment that hasn't set this keeps its current
     # single-key `GeminiModelClient` behavior unchanged.
     # `gemini_api_key` is always the pool's first key — never duplicated
     # in this list, see `Settings.gemini_key_pool`.
     gemini_api_keys_extra: list[str] = Field(default_factory=list)
+    # Structured, project-grouped credential config for the Gemini Provider
+    # Scheduler (`app.gemini_scheduler`, 2026-09-04) -- JSON array, same
+    # convention as `gemini_api_keys_extra` above. `[]` (the default) means
+    # "derive the pool from gemini_api_key/gemini_api_keys_extra instead,
+    # one synthetic project per key" (`app.gemini_scheduler.credentials.
+    # build_credential_pool`), so every existing deployment keeps working
+    # unchanged. Adding a credential (including #11+) is a config-only
+    # change: add an entry here naming a new env var, set that env var.
+    gemini_credentials: list[GeminiCredentialConfig] = Field(default_factory=list)
     # data.gov.in resource key for the Agmarknet daily mandi-price feed
     # (app/pipeline/agmarknet.py). Required even when the Agmarknet job
     # isn't running, matching this file's existing "fails loudly at
@@ -127,6 +159,21 @@ class Settings(BaseSettings):
         request round-robins into and fails against — silently drop blanks
         rather than trusting the env var was well-formed."""
         return [key for key in value if key.strip()]
+
+    @field_validator("gemini_credentials")
+    @classmethod
+    def _reject_duplicate_credential_ids(
+        cls, value: list[GeminiCredentialConfig]
+    ) -> list[GeminiCredentialConfig]:
+        """A duplicate `id` would make later per-credential state (health,
+        concurrency, logging) ambiguous between two different keys -- fail
+        loudly at startup rather than silently letting one shadow the
+        other, matching this class's own "fails loudly" contract."""
+        ids = [config.id for config in value]
+        duplicates = {id_ for id_ in ids if ids.count(id_) > 1}
+        if duplicates:
+            raise ValueError(f"gemini_credentials has duplicate id(s): {sorted(duplicates)}")
+        return value
 
     @property
     def gemini_key_pool(self) -> list[str]:
