@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import pytest
 
-from app.graph import COMBINED_PROMPT_VERSION, _checkpointer_conn_info, assemble_response
+from app.graph import (
+    _CHECKPOINTED_APP_TYPES,
+    COMBINED_PROMPT_VERSION,
+    _checkpointer_conn_info,
+    assemble_response,
+)
 from app.nodes.describe_item import PROMPT_VERSION as DESCRIBE_ITEM_PROMPT_VERSION
 from app.nodes.summarize import PROMPT_VERSION as SUMMARIZE_PROMPT_VERSION
 from app.schemas.errors import ErrorResponse
@@ -149,3 +154,15 @@ def test_checkpointer_conn_info_translates_postgres_url_and_drops_driver_suffix(
 def test_checkpointer_conn_info_rejects_unsupported_backend() -> None:
     with pytest.raises(ValueError, match="Unsupported database_url backend"):
         _checkpointer_conn_info("mysql://user:pass@host/db")
+
+
+@pytest.mark.unit
+def test_checkpointed_app_types_includes_every_state_stored_pydantic_type() -> None:
+    """2026-09-03 fix, live-reproduced: `AnalysisState.trade_balance`
+    (`TradeBalance`) was added alongside `FetchIssue` in the same PR but
+    left off this allowlist, causing a real "Blocked deserialization"
+    warning from LangGraph's checkpoint serde on a later turn of the same
+    thread. `FetchIssue` had already needed the same fix once before, for
+    the same reason - this test exists so a third one doesn't slip through
+    silently."""
+    assert TradeBalance in _CHECKPOINTED_APP_TYPES

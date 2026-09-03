@@ -72,6 +72,17 @@ class _FabricatingModelClient:
         )
 
 
+class _RaisingModelClient:
+    """Simulates a total model-call failure, e.g. every key in a
+    load-balanced pool exhausted (`app.models.LoadBalancedGeminiModelClient`
+    re-raises the real last exception on total exhaustion)."""
+
+    async def generate_structured(
+        self, *, system_prompt: str, user_content: str, schema: type[T]
+    ) -> T:
+        raise RuntimeError("503 UNAVAILABLE - high demand")
+
+
 class _GroundedModelClient:
     async def generate_structured(
         self, *, system_prompt: str, user_content: str, schema: type[T]
@@ -154,6 +165,43 @@ async def test_summarize_fabricated_number_is_caught_by_output_guardrail(
     assert rejection_logs[0]["ungrounded_numbers"] == [99999999.0]
     assert "99,999,999" in rejection_logs[0]["rejected_summary"]
     assert error.trace_id == "t-99"
+
+
+@pytest.mark.integration
+async def test_summarize_model_call_failure_returns_upstream_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-09-03 fix, live-reproduced: a total model-call failure (e.g.
+    every key in a load-balanced pool exhausted) previously propagated
+    uncaught past this node into an unclassified `INTERNAL_ERROR` 500 -
+    contradicting this module's own "defined error fallback, never a
+    silent partial render" principle."""
+    monkeypatch.setattr(
+        summarize_module, "get_model_for_role", lambda role, provider: _RaisingModelClient()
+    )
+    _patch_budget(monkeypatch)
+    state: AnalysisState = {
+        "query": TradeQuery(hs_code="010121"),
+        "imports_table": _table(),
+        "exports_table": _table(),
+        "thread_id": "t-summarize-4",
+        "trace_id": "t-88",
+    }
+
+    with structlog.testing.capture_logs() as captured_logs:
+        result = await summarize(state)
+
+    assert "analytical_summary" not in result
+    error = result["error"]
+    assert isinstance(error, ErrorResponse)
+    assert error.error_code == "UPSTREAM_TIMEOUT"
+    assert error.retryable is True
+    assert error.trace_id == "t-88"
+
+    failure_logs = [log for log in captured_logs if log["event"] == "summarize.model_call_failed"]
+    assert len(failure_logs) == 1
+    assert failure_logs[0]["log_level"] == "warning"
+    assert failure_logs[0]["hs_code"] == "010121"
 
 
 @pytest.mark.integration

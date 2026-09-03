@@ -113,7 +113,13 @@ from app.nodes.summarize import summarize
 from app.nodes.validate_query import validate_query
 from app.schemas.errors import ErrorResponse
 from app.schemas.query import TradeQuery
-from app.schemas.response import CountryRow, Provenance, TradeAnalysisResponse, TradeTable
+from app.schemas.response import (
+    CountryRow,
+    Provenance,
+    TradeAnalysisResponse,
+    TradeBalance,
+    TradeTable,
+)
 from app.state import AnalysisState, FetchIssue, get_or_mint_trace_id, has_error
 from app.tools.comtrade_client import ComtradeRecord
 
@@ -149,6 +155,11 @@ _CHECKPOINTED_APP_TYPES: list[type] = [
     # allowlisting as every other `app.*` Pydantic type above — same real,
     # live-reproduced warning this list already exists to silence.
     FetchIssue,
+    # 2026-09-03 fix: `AnalysisState.trade_balance` (Step 3 hardening) was
+    # added alongside `FetchIssue` in the same PR but left off this list -
+    # same real, live-reproduced "Blocked deserialization" warning as above,
+    # caught while debugging an unrelated user-reported failure.
+    TradeBalance,
 ]
 
 
