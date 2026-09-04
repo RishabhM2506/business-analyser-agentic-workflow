@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.gemini_scheduler.fallback import ModelFallbackClient
 from app.gemini_scheduler.scheduler import GeminiScheduler
 from app.guardrails import extract_numbers
 from app.models import (
@@ -250,6 +251,10 @@ def test_get_model_for_role_gemini_provider_returns_gemini_client_without_networ
     # call (verified directly against the installed package) - safe to
     # exercise in CI with a placeholder key and no network access.
     monkeypatch.setenv("GEMINI_API_KEY", "unit-test-placeholder-key")
+    # Fallback disabled here to isolate the single-credential/no-fallback
+    # case this test is actually about - the default-fallback case is
+    # covered separately below.
+    monkeypatch.setenv("GEMINI_MODEL_FALLBACKS", "{}")
     from app.settings import get_settings
 
     get_settings.cache_clear()
@@ -268,6 +273,7 @@ def test_get_model_for_role_returns_gemini_scheduler_when_multiple_keys_configur
     monkeypatch.setenv(
         "GEMINI_API_KEYS_EXTRA", '["unit-test-placeholder-key-b", "unit-test-placeholder-key-c"]'
     )
+    monkeypatch.setenv("GEMINI_MODEL_FALLBACKS", "{}")
     from app.settings import get_settings
 
     get_settings.cache_clear()
@@ -297,6 +303,7 @@ def test_get_model_for_role_shares_the_fairness_counter_across_separate_requests
     monkeypatch.setenv(
         "GEMINI_API_KEYS_EXTRA", '["unit-test-placeholder-key-b", "unit-test-placeholder-key-c"]'
     )
+    monkeypatch.setenv("GEMINI_MODEL_FALLBACKS", "{}")
     from app.settings import get_settings
 
     get_settings.cache_clear()
@@ -309,6 +316,58 @@ def test_get_model_for_role_shares_the_fairness_counter_across_separate_requests
         assert (
             first._fairness_counter is second._fairness_counter
         )  # ...sharing the same counter regardless
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.unit
+def test_get_model_for_role_wraps_in_fallback_client_when_fallbacks_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "unit-test-placeholder-key-a")
+    monkeypatch.setenv(
+        "GEMINI_API_KEYS_EXTRA", '["unit-test-placeholder-key-b", "unit-test-placeholder-key-c"]'
+    )
+    monkeypatch.setenv(
+        "GEMINI_MODEL_FALLBACKS", '{"analysis": ["fallback-model-a", "fallback-model-b"]}'
+    )
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        client = get_model_for_role("analysis", provider="gemini")
+        assert isinstance(client, ModelFallbackClient)
+        assert len(client._clients) == 3  # primary + 2 configured fallbacks
+        primary, fallback_a, fallback_b = client._clients
+        assert isinstance(primary, GeminiScheduler)
+        assert primary._model == get_settings().model_analysis
+        assert isinstance(fallback_a, GeminiScheduler)
+        assert fallback_a._model == "fallback-model-a"
+        assert isinstance(fallback_b, GeminiScheduler)
+        assert fallback_b._model == "fallback-model-b"
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.unit
+def test_get_model_for_role_fallback_wrapping_works_for_a_single_credential_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback wrapping is independent of credential-pool size - even a
+    single-credential deployment benefits from a currently-idle model
+    version having real headroom the primary one doesn't."""
+    monkeypatch.setenv("GEMINI_API_KEY", "unit-test-placeholder-key")
+    monkeypatch.setenv("GEMINI_MODEL_FALLBACKS", '{"utility": ["fallback-model-c"]}')
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        client = get_model_for_role("utility", provider="gemini")
+        assert isinstance(client, ModelFallbackClient)
+        assert len(client._clients) == 2
+        primary, fallback = client._clients
+        assert isinstance(primary, GeminiModelClient)
+        assert isinstance(fallback, GeminiModelClient)
     finally:
         get_settings.cache_clear()
 

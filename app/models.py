@@ -472,7 +472,41 @@ class MockLLM:
 # `app.gemini_scheduler.scheduler.GeminiScheduler.__init__`'s own docstring
 # for the full finding (originally established for `LoadBalancedGeminiModelClient`,
 # the class this scheduler replaced, 2026-09-04).
-_role_fairness_counters: dict[NodeRole, itertools.count[int]] = {}
+_role_fairness_counters: dict[tuple[NodeRole, str], itertools.count[int]] = {}
+
+
+def _build_gemini_client(*, role: NodeRole, model_name: str) -> ModelClient:
+    """One real `ModelClient` for `model_name` -- a `GeminiScheduler` over
+    the full credential pool when more than one credential is configured,
+    otherwise a plain single-key `GeminiModelClient`. Shared by both the
+    primary-model and each fallback-model construction in `get_model_for_
+    role` below, since a fallback model needs the exact same credential-
+    pool/scheduler treatment the primary one gets -- only the model name
+    differs."""
+    from app.gemini_scheduler.concurrency import get_concurrency
+    from app.gemini_scheduler.credentials import build_credential_pool
+    from app.gemini_scheduler.health import get_health_store
+    from app.gemini_scheduler.quota import get_quota_store
+    from app.gemini_scheduler.scheduler import GeminiScheduler
+    from app.settings import get_settings
+
+    settings = get_settings()
+    credentials = build_credential_pool(settings)
+    if len(credentials) > 1:
+        # Keyed by (role, model_name), not just role -- each fallback
+        # model gets its own independent fairness-rotation counter, since
+        # `_select_and_acquire`'s own health/concurrency/quota lookups are
+        # already keyed by (project_id, model) the same way.
+        counter = _role_fairness_counters.setdefault((role, model_name), itertools.count())
+        return GeminiScheduler(
+            model=model_name,
+            credentials=credentials,
+            health_store=get_health_store(),
+            concurrency=get_concurrency(),
+            quota=get_quota_store(settings.gemini_rate_limits),
+            fairness_counter=counter,
+        )
+    return GeminiModelClient(model=model_name, api_key=credentials[0].api_key)
 
 
 def get_model_for_role(role: NodeRole, *, provider: Literal["gemini", "mock"]) -> ModelClient:
@@ -483,31 +517,31 @@ def get_model_for_role(role: NodeRole, *, provider: Literal["gemini", "mock"]) -
     gemini_credentials`, or the legacy `gemini_key_pool` fallback when that's
     empty), otherwise a plain single-key `GeminiModelClient` — byte-for-byte
     the same object every existing deployment already got when only one key
-    is configured. Every call site already treats the return value as an
-    opaque `ModelClient`, so this branch is invisible to callers either way
-    (docs/PLAN.md §3's "swapping providers is one file").
+    is configured. When `Settings.gemini_model_fallbacks[role]` names one or
+    more fallback models, the result is wrapped in a `ModelFallbackClient`
+    (`app.gemini_scheduler.fallback`) that tries each, in order, only on a
+    real capacity-exhaustion signal from the previous one — `[]` (the
+    per-role default when unconfigured) skips this wrapping entirely. Every
+    call site already treats the return value as an opaque `ModelClient`,
+    so all of this is invisible to callers either way (docs/PLAN.md §3's
+    "swapping providers is one file").
     """
     if provider == "mock":
         return MockLLM()
 
-    from app.gemini_scheduler.concurrency import get_concurrency
-    from app.gemini_scheduler.credentials import build_credential_pool
-    from app.gemini_scheduler.health import get_health_store
-    from app.gemini_scheduler.quota import get_quota_store
-    from app.gemini_scheduler.scheduler import GeminiScheduler
+    from app.gemini_scheduler.fallback import ModelFallbackClient
     from app.settings import get_settings
 
     settings = get_settings()
     model_name = settings.model_utility if role == "utility" else settings.model_analysis
-    credentials = build_credential_pool(settings)
-    if len(credentials) > 1:
-        counter = _role_fairness_counters.setdefault(role, itertools.count())
-        return GeminiScheduler(
-            model=model_name,
-            credentials=credentials,
-            health_store=get_health_store(),
-            concurrency=get_concurrency(),
-            quota=get_quota_store(settings.gemini_rate_limits),
-            fairness_counter=counter,
-        )
-    return GeminiModelClient(model=model_name, api_key=credentials[0].api_key)
+    primary_client = _build_gemini_client(role=role, model_name=model_name)
+
+    fallback_models = settings.gemini_model_fallbacks.get(role, [])
+    if not fallback_models:
+        return primary_client
+
+    clients = [primary_client] + [
+        _build_gemini_client(role=role, model_name=fallback_model)
+        for fallback_model in fallback_models
+    ]
+    return ModelFallbackClient(clients)

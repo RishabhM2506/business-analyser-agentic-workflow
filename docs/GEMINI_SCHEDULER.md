@@ -148,27 +148,48 @@ reactive daily-quota tracking above:
   `GeminiModelClient.generate_structured`'s return contract at every call site — out of proportion for
   this addition. RPM and RPD are exact; only TPM is approximate.
 
-**Default numbers** (`quota.DEFAULT_RATE_LIMITS`) are a best-effort synthesis of public reporting for
-`gemini-2.5-flash`/`gemini-2.5-flash-lite`-family free-tier limits, **not independently confirmed** against
-this project's own live numbers — Google's own rate-limits page doesn't publish fixed values, directing
-users to their per-project AI Studio dashboard (`aistudio.google.com/rate-limit`) instead, which this
-process has no access to:
+**Default numbers** (`quota.DEFAULT_RATE_LIMITS`) are **real numbers**, updated 2026-09-04 — read directly
+from the user's own AI Studio "Rate limits by model" dashboard for their actual project, cross-checked
+against real model IDs via a live, quota-free `client.models.list()` call. Google's own rate-limits page
+doesn't publish fixed values in its docs (directs users to that same per-project dashboard instead), so
+this is the real source of truth, not public reporting:
 
 | Model | RPM | TPM | RPD |
 |---|---|---|---|
-| `gemini-flash-latest` | 10 | 250,000 | 250 |
-| `gemini-flash-lite-latest` | 15 | 250,000 | 1,000 |
+| `gemini-flash-latest` (alias → `gemini-3.7-flash`/`gemini-3.8-flash` on this account) | 5 | 250,000 | 20 |
+| `gemini-flash-lite-latest` (alias → `gemini-3.5-flash-lite` on this account) | 15 | 250,000 | 500 |
+| `gemini-2.5-flash`, `gemini-3-flash-preview`, `gemini-3.5-flash`, `gemini-3.6-flash` (idle fallback candidates) | 5 | 250,000 | 20 |
+| `gemini-2.5-flash-lite` (idle fallback candidate) | 10 | 250,000 | 20 |
+| `gemini-3.1-flash-lite` (idle fallback candidate) | 15 | 250,000 | 500 |
+
+**Note the analysis-role model's real RPD (20) is far lower than the earlier best-effort guess (250) this
+doc originally shipped with** — a reminder that a "conservative-seeming" guess is still a guess; the real
+dashboard numbers are what matter.
 
 **Check the real numbers for each of your projects and override via `GEMINI_RATE_LIMITS` if they differ, or
-when you change plans** — exactly as requested; nothing here is hardcoded as a Python literal only, it's a
-`Settings` field:
-
-```json
-{"gemini-flash-latest": {"rpm": 10, "tpm": 250000, "rpd": 250}, "gemini-flash-lite-latest": {"rpm": 15, "tpm": 250000, "rpd": 1000}}
-```
-
-An unrecognized model name falls back to the more conservative of the two defaults, never an unlimited
+when you change plans** — nothing here is hardcoded as a Python literal only, it's a `Settings` field. An
+unrecognized model name falls back to the more conservative of the two primary entries, never an unlimited
 allowance.
+
+## Model fallback (`app/gemini_scheduler/fallback.py`, added 2026-09-04)
+
+Each real Gemini model version is its **own separate** RPM/TPM/RPD pool — confirmed directly from the same
+dashboard: "Gemini 3.7 Flash" showed `21/20` RPD, already exceeded, while "Gemini 2.5 Flash" sat at `0/20`,
+completely unused, on the exact same project at the exact same time. `ModelFallbackClient` wraps an ordered
+list of per-model `GeminiScheduler`s (configured via `Settings.gemini_model_fallbacks`, keyed by role) and
+tries the next one only when the previous model's *entire* credential pool is genuinely capacity-exhausted
+— never on a request-shape failure (400/schema-validation/safety-block), matching the spec's own guardrail
+against silently changing model in a way that could affect output quality.
+
+Default fallback chain (idle, same-account models as of 2026-09-04 — override via `GEMINI_MODEL_FALLBACKS`):
+
+- **`analysis`** (flash-tier, non-lite): `gemini-flash-latest` → `gemini-2.5-flash` → `gemini-3-flash-preview`
+  → `gemini-3.5-flash` → `gemini-3.6-flash`
+- **`utility`** (lite-tier): `gemini-flash-lite-latest` → `gemini-3.1-flash-lite` → `gemini-2.5-flash-lite`
+
+`get_model_for_role` (`app/models.py`) wires this in for both single- and multi-credential deployments —
+`[]` for a role in `gemini_model_fallbacks` disables fallback for it entirely, returning the plain
+unwrapped client exactly as before this addition.
 
 ## Concurrency
 
@@ -246,11 +267,17 @@ proactive configured cap, resets at the next Pacific midnight) in the logs to te
 
 ## Known limitations
 
-- **RPM/TPM/RPD default numbers are best-effort, not independently confirmed** against a real AI Studio
-  dashboard for these specific projects (see "RPM/TPM/RPD" above) — verify and override via
-  `GEMINI_RATE_LIMITS` once you've checked.
+- **RPM/TPM/RPD default numbers are real (sourced from a live dashboard, 2026-09-04) but for one specific
+  project** — if your other credentials' projects have different real limits (a different usage tier,
+  billing status, etc.), the shared `GEMINI_RATE_LIMITS` config applies the same numbers to all of them.
+  Re-verify periodically; Google can also repoint a `-latest` alias to a different underlying model at any
+  time, changing its real quota shape.
 - **TPM is an estimate, not exact** (`quota.estimate_tokens`'s `len(text) // 4` heuristic) — see "RPM/TPM/
   RPD" above for why the real post-call token count isn't wired in.
+- **Model fallback only ever swaps within the tier `gemini_model_fallbacks` was configured for** (flash-tier
+  for analysis, lite-tier for utility) — output quality/style differences *between* real model versions
+  (e.g. `gemini-2.5-flash` vs. `gemini-3.6-flash`) haven't been independently evaluated; fallback is scoped
+  to capacity-exhaustion only (see "Model fallback" above) specifically to bound this risk, not eliminate it.
 - Concurrency's own AIMD limits remain purely observed-signal-driven (not scheduled against the RPM/TPM
   numbers directly) — the two systems are complementary, not merged into one: quota admission decides
   *whether* a request may be sent at all right now; concurrency limits decide how many may be *in flight*
