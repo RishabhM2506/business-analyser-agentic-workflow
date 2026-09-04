@@ -493,6 +493,7 @@ def get_model_for_role(role: NodeRole, *, provider: Literal["gemini", "mock"]) -
     from app.gemini_scheduler.concurrency import get_concurrency
     from app.gemini_scheduler.credentials import build_credential_pool
     from app.gemini_scheduler.health import get_health_store
+    from app.gemini_scheduler.quota import get_quota_store
     from app.gemini_scheduler.scheduler import GeminiScheduler
     from app.settings import get_settings
 
@@ -506,6 +507,7 @@ def get_model_for_role(role: NodeRole, *, provider: Literal["gemini", "mock"]) -
             credentials=credentials,
             health_store=get_health_store(),
             concurrency=get_concurrency(),
+            quota=get_quota_store(settings.gemini_rate_limits),
             fairness_counter=counter,
         )
     return GeminiModelClient(model=model_name, api_key=credentials[0].api_key)

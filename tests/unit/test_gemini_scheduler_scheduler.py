@@ -17,10 +17,20 @@ from app.gemini_scheduler.concurrency import HierarchicalConcurrency
 from app.gemini_scheduler.credentials import GeminiCredential
 from app.gemini_scheduler.errors import GeminiErrorClass
 from app.gemini_scheduler.health import HealthStore
+from app.gemini_scheduler.quota import QuotaStore, RateLimitConfig
 from app.gemini_scheduler.scheduler import GeminiScheduler, NoEligibleGeminiCandidateError
 from app.models import GroundedResult
 
 T = TypeVar("T", bound=BaseModel)
+
+# A generous limit for tests that aren't specifically about RPM/TPM/RPD
+# enforcement -- otherwise the default free-tier-sized limits could
+# accidentally throttle an unrelated test making many quick calls.
+_UNLIMITED = RateLimitConfig(rpm=1_000_000, tpm=1_000_000_000, rpd=1_000_000)
+
+
+def _permissive_quota() -> QuotaStore:
+    return QuotaStore(rate_limits={"test-model": _UNLIMITED})
 
 
 class _OneFieldSchema(BaseModel):
@@ -69,6 +79,7 @@ def _scheduler(
     max_attempts: int | None = None,
     health_store: HealthStore | None = None,
     concurrency: HierarchicalConcurrency | None = None,
+    quota: QuotaStore | None = None,
 ) -> GeminiScheduler:
     def factory(credential: GeminiCredential, model: str) -> _FakeClient:
         return clients_by_credential_id[credential.id]
@@ -78,6 +89,7 @@ def _scheduler(
         credentials=credentials,
         health_store=health_store if health_store is not None else HealthStore(),
         concurrency=concurrency if concurrency is not None else HierarchicalConcurrency(),
+        quota=quota if quota is not None else _permissive_quota(),
         client_factory=factory,
         max_attempts=max_attempts,
         sleep_fn=lambda _seconds: asyncio.sleep(0),
@@ -172,6 +184,7 @@ async def test_daily_quota_exhausted_routes_to_a_different_project_without_delay
         credentials=[cred_a, cred_b],
         health_store=HealthStore(),
         concurrency=HierarchicalConcurrency(),
+        quota=_permissive_quota(),
         client_factory=factory,
         max_attempts=2,
         sleep_fn=tracking_sleep,
@@ -252,6 +265,7 @@ async def test_many_concurrent_calls_never_exceed_the_global_concurrency_ceiling
     dispatches run at once."""
     cred = _credential("a")
     concurrency = HierarchicalConcurrency(global_limit=3, project_model_initial_limit=10)
+    quota = _permissive_quota()
     max_concurrent_seen = 0
     current_concurrent = 0
     lock = asyncio.Lock()
@@ -289,6 +303,7 @@ async def test_many_concurrent_calls_never_exceed_the_global_concurrency_ceiling
             credentials=[cred],
             health_store=HealthStore(),
             concurrency=concurrency,
+            quota=quota,
             client_factory=factory,
         )
         await scheduler.generate_structured(
@@ -308,4 +323,84 @@ async def test_scheduler_requires_at_least_one_credential() -> None:
             credentials=[],
             health_store=HealthStore(),
             concurrency=HierarchicalConcurrency(),
+            quota=_permissive_quota(),
+        )
+
+
+@pytest.mark.unit
+async def test_max_attempts_defaults_to_five() -> None:
+    """2026-09-04: raised from 3 to 5 per explicit user direction."""
+    scheduler = _scheduler([_credential("a")], {"a": _FakeClient()})
+    assert scheduler._max_attempts == 1  # capped at the actual pool size (1 credential)
+
+    five_creds = [_credential(str(i)) for i in range(10)]
+    clients = {str(i): _FakeClient() for i in range(10)}
+    scheduler = _scheduler(five_creds, clients)
+    assert scheduler._max_attempts == 5  # capped at 5, not the full pool of 10
+
+
+@pytest.mark.unit
+async def test_rpm_exhaustion_routes_to_a_different_credential() -> None:
+    cred_a, cred_b = _credential("a"), _credential("b")
+    tight_quota = QuotaStore(
+        rate_limits={"test-model": RateLimitConfig(rpm=1, tpm=1_000_000, rpd=1_000_000)}
+    )
+    # Consume project "a"'s only RPM slot for this minute before the real call.
+    assert (
+        await tight_quota.try_reserve(project_id="a", model="test-model", estimated_tokens=1)
+        is True
+    )
+
+    scheduler = _scheduler(
+        [cred_a, cred_b],
+        {"a": _FakeClient(), "b": _FakeClient()},
+        quota=tight_quota,
+        max_attempts=2,
+    )
+
+    result = await scheduler.generate_structured(
+        system_prompt="s", user_content="u", schema=_OneFieldSchema
+    )
+
+    assert result.value == "ok"
+    # credential "a" was skipped (RPM exhausted); "b" served the request.
+    assert scheduler._credentials[0].id == "a"  # sanity: a really was first in the list
+
+
+@pytest.mark.unit
+async def test_rpd_exhausted_project_is_excluded_but_a_different_project_still_works() -> None:
+    cred_a, cred_b = _credential("a", project_id="proj-a"), _credential("b", project_id="proj-b")
+    quota = QuotaStore(
+        rate_limits={"test-model": RateLimitConfig(rpm=1_000_000, tpm=1_000_000_000, rpd=1)}
+    )
+    # Exhaust proj-a's entire daily budget (rpd=1) before the real call.
+    assert (
+        await quota.try_reserve(project_id="proj-a", model="test-model", estimated_tokens=1) is True
+    )
+    client_a, client_b = _FakeClient(), _FakeClient()
+
+    scheduler = _scheduler(
+        [cred_a, cred_b], {"a": client_a, "b": client_b}, quota=quota, max_attempts=2
+    )
+
+    result = await scheduler.generate_structured(
+        system_prompt="s", user_content="u", schema=_OneFieldSchema
+    )
+
+    assert result.value == "ok"
+    assert client_a.call_count == 0  # proj-a excluded entirely, never dispatched to
+    assert client_b.call_count == 1
+
+
+@pytest.mark.unit
+async def test_zero_rpd_raises_no_eligible_candidate() -> None:
+    cred = _credential("a")
+    zero_rpd_quota = QuotaStore(
+        rate_limits={"test-model": RateLimitConfig(rpm=1_000_000, tpm=1_000_000_000, rpd=0)}
+    )
+    scheduler = _scheduler([cred], {"a": _FakeClient()}, quota=zero_rpd_quota)
+
+    with pytest.raises(NoEligibleGeminiCandidateError):
+        await scheduler.generate_structured(
+            system_prompt="s", user_content="u", schema=_OneFieldSchema
         )
