@@ -12,7 +12,12 @@ async, and a `task_type=None` argument resolves internally to
 `"RETRIEVAL_QUERY"`/no fixed default respectively — passed explicitly here
 rather than relied on, matching `app/models.py`'s own "be explicit" habit.
 Real live call against the user's own key confirmed `gemini-embedding-2-preview`
-returns 3072-dim float vectors.
+returns 3072-dim float vectors. `Settings.model_embedding` switched to the GA
+`gemini-embedding-2` 2026-09-04, live-verified to produce identical vectors
+(cosine similarity `1.000000` across 5 real HS6 taxonomy texts, vs. a `0.71`
+baseline between two different texts under the same model) — same
+underlying model under two names, not a corpus-invalidating change; see
+that setting's own docstring for the full comparison.
 """
 
 from __future__ import annotations

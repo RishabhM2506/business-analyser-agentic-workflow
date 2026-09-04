@@ -154,7 +154,19 @@ class Settings(BaseSettings):
     # Shares `llm_provider`'s "gemini"/"mock" switch rather than a second
     # setting: there is no scenario where chat is mocked but embeddings are
     # real, or vice versa.
-    model_embedding: str = "gemini-embedding-2-preview"
+    #
+    # GA (`gemini-embedding-2`), not the original `-preview` build
+    # (2026-09-04 switch): live-verified by embedding the same 5 real HS6
+    # taxonomy descriptions with both and comparing vectors — cosine
+    # similarity was `1.000000` for every single one (vs. a `0.71` baseline
+    # between two genuinely *different* texts under the same model), i.e.
+    # they are the same underlying model under two names, not two distinct
+    # embedding spaces. Confirms switching needs no corpus re-embedding
+    # (`scripts/embed_taxonomy.py`'s own precomputed vectors stay valid) —
+    # the GA name is simply the more stable one to depend on long-term,
+    # since Google can deprecate/change a `-preview` build without the same
+    # guarantees a GA release gets.
+    model_embedding: str = "gemini-embedding-2"
 
     # --- Cost & recursion ceilings, fail closed (docs/PLAN.md §5.5) ---------
     max_model_calls_per_day: int = 500
