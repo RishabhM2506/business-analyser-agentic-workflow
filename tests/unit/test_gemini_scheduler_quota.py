@@ -159,16 +159,20 @@ def test_next_pacific_midnight_is_always_in_the_future() -> None:
 
 @pytest.mark.unit
 async def test_unrecognized_model_falls_back_to_conservative_limit() -> None:
-    store = QuotaStore(
-        rate_limits={"gemini-flash-latest": RateLimitConfig(rpm=10, tpm=1000, rpd=5)}
-    )
+    configured = RateLimitConfig(rpm=10, tpm=1000, rpd=5)
+    store = QuotaStore(rate_limits={"gemini-flash-latest": configured})
     # "some-other-model" isn't configured - must still enforce a real
-    # (conservative) limit, never silently allow unlimited throughput.
-    for _ in range(10):
-        assert (
-            await store.try_reserve(project_id="a", model="some-other-model", estimated_tokens=1)
-            is True
-        )
+    # (conservative) limit, never silently allow unlimited throughput. The
+    # exact fallback numbers are an implementation detail (`_FALLBACK_
+    # RATE_LIMIT`) this test deliberately doesn't hardcode - only that
+    # *some* real ceiling applies.
+    successes = 0
+    for _ in range(1000):
+        if await store.try_reserve(project_id="a", model="some-other-model", estimated_tokens=1):
+            successes += 1
+        else:
+            break
+    assert 0 < successes < 1000
     assert (
         await store.try_reserve(project_id="a", model="some-other-model", estimated_tokens=1)
         is False

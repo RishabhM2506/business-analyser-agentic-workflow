@@ -84,14 +84,36 @@ class Settings(BaseSettings):
     gemini_credentials: list[GeminiCredentialConfig] = Field(default_factory=list)
     # Proactive RPM/TPM/RPD admission control (`app.gemini_scheduler.quota`,
     # 2026-09-04) -- JSON object keyed by exact model name, same convention
-    # as the list fields above. Defaults to `quota.DEFAULT_RATE_LIMITS`
-    # (a best-effort synthesis of Gemini's free-tier limits — see that
-    # module's own docstring for sourcing/caveats: Google's own rate-limits
-    # page doesn't publish fixed numbers). Override here once you've
-    # checked the real numbers for your projects at
-    # aistudio.google.com/rate-limit, or when you change plans.
+    # as the list fields above. Defaults to `quota.DEFAULT_RATE_LIMITS` —
+    # real numbers read from a live AI Studio dashboard (see that module's
+    # own docstring for full sourcing). Override here if your project's
+    # real numbers at aistudio.google.com/rate-limit differ, or when you
+    # change plans.
     gemini_rate_limits: dict[str, RateLimitConfig] = Field(
         default_factory=lambda: dict(DEFAULT_RATE_LIMITS)
+    )
+    # Ordered fallback model names per node role (`app.gemini_scheduler.
+    # fallback.ModelFallbackClient`, 2026-09-04) — tried, in order, only
+    # when the previous model's entire credential pool is genuinely
+    # capacity-exhausted (never on a request-shape failure — see that
+    # module's own docstring for the exact trigger). Real, currently-idle
+    # models on the same account as of 2026-09-04 (confirmed via the same
+    # AI Studio dashboard `gemini_rate_limits` above was sourced from) —
+    # each is its own separate RPM/TPM/RPD pool, so this is genuine
+    # additional daily capacity, not another attempt against the same
+    # exhausted one. `[]` (empty list) for a role disables fallback for it
+    # entirely — every existing deployment that hasn't set this keeps
+    # single-model behavior unchanged.
+    gemini_model_fallbacks: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            "analysis": [
+                "gemini-2.5-flash",
+                "gemini-3-flash-preview",
+                "gemini-3.5-flash",
+                "gemini-3.6-flash",
+            ],
+            "utility": ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite"],
+        }
     )
     # data.gov.in resource key for the Agmarknet daily mandi-price feed
     # (app/pipeline/agmarknet.py). Required even when the Agmarknet job

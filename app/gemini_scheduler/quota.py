@@ -12,23 +12,30 @@ window -- a fixed window unfairly bursts/denies right at a boundary) to
 consume a variable amount per call, since TPM consumes N estimated tokens
 per call, not always 1 the way RPM does.
 
-**Honest limitation on the default numbers below**: Google's own rate-limits
-page (`ai.google.dev/gemini-api/docs/rate-limits`, fetched live 2026-09-04)
-does **not** publish fixed free-tier RPM/TPM/RPD numbers -- it states
-"Rate limits depend on... your usage tier" and directs users to their own
-live AI Studio dashboard (`aistudio.google.com/rate-limit`) instead, which
-this process has no access to. That same page *does* directly confirm two
-facts used elsewhere in this package: rate limits apply **per project, not
-per API key** (validates `credentials.py`'s project-grouping design), and
-RPD quotas reset at **midnight Pacific time** (used by `_next_pacific_midnight`
-below). The RPM/TPM/RPD numbers in `DEFAULT_RATE_LIMITS` are a conservative
-best-effort synthesis of public reporting for `gemini-2.5-flash`/
-`gemini-2.5-flash-lite`-family models as of 2026-09-04, **not independently
-confirmed against this project's own AI Studio dashboard** -- check
-`aistudio.google.com/rate-limit` for the real numbers and override via
-`Settings.gemini_rate_limits` (env var `GEMINI_RATE_LIMITS`) if they differ,
-exactly as this feature was requested: "set as per the free tier plan, we
-will change when we change any plan."
+**On the default numbers below**: Google's own rate-limits page
+(`ai.google.dev/gemini-api/docs/rate-limits`, fetched live 2026-09-04) does
+**not** publish fixed free-tier RPM/TPM/RPD numbers -- it states "Rate
+limits depend on... your usage tier" and directs users to their own live
+AI Studio dashboard (`aistudio.google.com/rate-limit`) instead. That same
+page *does* directly confirm two facts used elsewhere in this package:
+rate limits apply **per project, not per API key** (validates
+`credentials.py`'s project-grouping design), and RPD quotas reset at
+**midnight Pacific time** (used by `_next_pacific_midnight` below).
+
+The numbers in `DEFAULT_RATE_LIMITS` were **updated 2026-09-04 to the
+real values**, read directly from a live AI Studio dashboard screenshot
+the user provided for their own project ("Default Gemini Project"), cross-
+checked against real model IDs via a quota-free `client.models.list()`
+call (see that constant's own comment for the full sourcing and the one
+remaining inference: which real model each of Google's `-latest` aliases
+currently resolves to). These replace an earlier best-effort estimate that
+turned out to be too generous for the analysis-role model (guessed RPD 250,
+real RPD 20) -- a reminder that a guess, however conservative-seeming, is
+still a guess; prefer real dashboard numbers whenever they're available.
+Still worth re-checking periodically: Google can repoint a `-latest` alias
+to a different underlying model at any time, and this project's own usage
+tier/plan can change -- override via `Settings.gemini_rate_limits` (env var
+`GEMINI_RATE_LIMITS`) whenever either happens.
 
 **Honest limitation on TPM specifically**: `estimate_tokens` is a rough
 `len(text) // 4` character-based approximation (a standard rough estimate
@@ -69,18 +76,50 @@ class RateLimitConfig(BaseModel, frozen=True):
     rpd: int
 
 
-# See this module's own docstring for sourcing and the explicit caveat that
-# these are best-effort, not independently confirmed against a real AI
-# Studio dashboard. Keyed by the exact model name `Settings.model_utility`/
-# `model_analysis` are configured to (`gemini-flash-latest`/
-# `gemini-flash-lite-latest` today) -- an unrecognized model name falls
-# back to `_FALLBACK_RATE_LIMIT` (the more conservative of the two),
-# rather than silently applying no limit at all.
+# REAL numbers (2026-09-04), not the earlier best-effort estimate -- read
+# directly from the user's own AI Studio "Rate limits by model" dashboard
+# for their actual project ("Default Gemini Project"), confirmed against
+# real model IDs via a live, quota-free `client.models.list()` call (the
+# dashboard shows display names like "Gemini 3.8 Flash"; the API needs the
+# real ID, e.g. `gemini-3.8-flash`). `gemini-flash-latest`/
+# `gemini-flash-lite-latest` are Google's own aliases -- the dashboard has
+# no separate row for an alias, only its currently-resolved underlying
+# model (`gemini-3.7-flash`/`gemini-3.8-flash` and `gemini-3.5-flash-lite`
+# respectively, both confirmed by real nonzero usage in the same
+# dashboard), so the alias entries below use that resolved model's real
+# numbers as a working assumption -- re-check if Google repoints either
+# alias to a model with a different quota shape.
+#
+# The non-alias entries below (idle on this account as of 2026-09-04) exist
+# so `app.gemini_scheduler.fallback` can route to a *different model*, not
+# just a different credential, when the primary alias's entire pool is
+# genuinely capacity-exhausted -- each real model version is its own
+# separate RPD/RPM/TPM pool, confirmed directly by the dashboard (e.g.
+# "Gemini 3.7 Flash" showing 21/20 RPD *exceeded* while "Gemini 2.5 Flash"
+# sits at 0/20, completely unused, on the very same project).
+#
+# An unrecognized model name not listed here falls back to
+# `_FALLBACK_RATE_LIMIT` (the more conservative of the two primary
+# entries), never an unlimited allowance.
 DEFAULT_RATE_LIMITS: dict[str, RateLimitConfig] = {
-    "gemini-flash-latest": RateLimitConfig(rpm=10, tpm=250_000, rpd=250),
-    "gemini-flash-lite-latest": RateLimitConfig(rpm=15, tpm=250_000, rpd=1000),
+    "gemini-flash-latest": RateLimitConfig(rpm=5, tpm=250_000, rpd=20),
+    "gemini-flash-lite-latest": RateLimitConfig(rpm=15, tpm=250_000, rpd=500),
+    # Idle same-tier fallback candidates for the analysis role (matches
+    # gemini-flash-latest's real 5/250K/20 shape on this account).
+    "gemini-2.5-flash": RateLimitConfig(rpm=5, tpm=250_000, rpd=20),
+    "gemini-3-flash-preview": RateLimitConfig(rpm=5, tpm=250_000, rpd=20),
+    "gemini-3.5-flash": RateLimitConfig(rpm=5, tpm=250_000, rpd=20),
+    "gemini-3.6-flash": RateLimitConfig(rpm=5, tpm=250_000, rpd=20),
+    "gemini-3.7-flash": RateLimitConfig(rpm=5, tpm=250_000, rpd=20),
+    "gemini-3.8-flash": RateLimitConfig(rpm=5, tpm=250_000, rpd=20),
+    # Idle fallback candidates for the utility role. Real numbers differ
+    # meaningfully between these two -- confirmed directly from the
+    # dashboard, not assumed to match gemini-flash-lite-latest's shape.
+    "gemini-2.5-flash-lite": RateLimitConfig(rpm=10, tpm=250_000, rpd=20),
+    "gemini-3.1-flash-lite": RateLimitConfig(rpm=15, tpm=250_000, rpd=500),
+    "gemini-3.5-flash-lite": RateLimitConfig(rpm=15, tpm=250_000, rpd=500),
 }
-_FALLBACK_RATE_LIMIT = RateLimitConfig(rpm=10, tpm=250_000, rpd=250)
+_FALLBACK_RATE_LIMIT = RateLimitConfig(rpm=5, tpm=250_000, rpd=20)
 
 _IDLE_EVICTION_SECONDS = 300.0
 _SWEEP_INTERVAL_CALLS = 500
