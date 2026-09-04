@@ -48,6 +48,8 @@ GeminiScheduler (app/gemini_scheduler/scheduler.py)   <- the ModelClient the app
     |                      credential health (per credential) - three independent scopes, never one
     |                      global boolean
     +-- concurrency.py    hierarchical AIMD: global limiter + one limiter per (project, model)
+    +-- quota.py           proactive RPM/TPM (per project+model) + RPD (per project) admission,
+                            sourced from configured limits (Settings.gemini_rate_limits)
 ```
 
 Full design rationale lives in each module's own docstring (this repo's convention — see e.g.
@@ -59,24 +61,31 @@ territory.
 For each attempt:
 
 1. **Filter** the credential pool to candidates that are: not already tried this call, model-compatible,
-   credential-healthy (`health.is_credential_healthy`), and not daily-exhausted
-   (`health.is_daily_exhausted`).
+   credential-healthy (`health.is_credential_healthy`), not reactively daily-exhausted
+   (`health.is_daily_exhausted` — Gemini's own real `429`), and not proactively over the configured daily
+   cap (`quota.rpd_would_exceed`) — **excludes a project's own key from the pool for the rest of the day
+   the moment it's hit a daily quota signal, either kind**.
 2. **Score** the survivors: `health_score * 2.0 + min(concurrency_headroom, 5) * 0.1`, with a rotating
    tiebreak (`health.HealthStore` + a shared `itertools.count`, the same fairness trick
    `LoadBalancedGeminiModelClient` established) so equally-scored candidates take turns rather than one
    always winning.
-3. **Atomically claim** the top-scored candidate's circuit-breaker slot (`health.try_acquire` — a HALF_OPEN
-   circuit only grants one concurrent trial) and its concurrency slot (`concurrency.try_acquire`), together.
-   If concurrency is saturated after the circuit slot was claimed, the claim is released without recording
-   any outcome (`health.cancel_acquire`) and the next-best candidate is tried.
+3. **Atomically claim**, in order, the top-scored candidate's circuit-breaker slot (`health.try_acquire` —
+   a HALF_OPEN circuit only grants one concurrent trial), its concurrency slot (`concurrency.try_acquire`),
+   and its RPM/TPM quota headroom (`quota.try_reserve`) — all three, or none. If any later claim fails, every
+   earlier one taken for this candidate is released before moving to the next-best candidate (never a leaked
+   partial reservation).
 4. **Dispatch** the real call. On success: record success, additive-increase that candidate's concurrency
    limit, release the slot. On failure: classify the error, record it against health, multiplicative-decrease
    concurrency if it was a real capacity-pressure signal (429/503), release the slot.
 
-If nothing is eligible but a health-eligible candidate exists that's only blocked on concurrency, the
-scheduler waits briefly (a short fixed poll, separate budget from dispatch attempts — see
-`scheduler._DEFAULT_MAX_CAPACITY_WAIT_ATTEMPTS`) rather than failing immediately, since that saturation
-resolves as soon as any in-flight call finishes.
+If nothing is eligible but a health-eligible candidate exists that's only blocked on concurrency or RPM/TPM,
+the scheduler waits briefly (a short fixed poll, separate budget from dispatch attempts — see
+`scheduler._DEFAULT_MAX_CAPACITY_WAIT_ATTEMPTS`) rather than failing immediately, since both resolve
+naturally (a slot frees up, or the per-minute window rolls forward) without any provider-side recovery.
+
+**Up to 5 distinct credentials** are tried per call (`scheduler._DEFAULT_MAX_ATTEMPTS`, raised from 3 to 5
+on 2026-09-04) — capped regardless of pool size, so a bigger pool doesn't multiply worst-case latency for a
+synchronous HTTP request.
 
 **Retry policy** (`errors.retry_action_for`) is a 3-way split, not a boolean:
 
@@ -120,6 +129,46 @@ per-project reset time isn't independently confirmed for these accounts either.
 **401** disables only the specific credential (`DEFAULT_CREDENTIAL_COOLDOWN_SECONDS`, 1h) — a sibling
 credential in the same project is unaffected, since an invalid/revoked key says nothing about the
 project's own health.
+
+## RPM/TPM/RPD (`app/gemini_scheduler/quota.py`, added 2026-09-04)
+
+Proactive admission control, checked *before* every dispatch, complementing (not replacing) `health.py`'s
+reactive daily-quota tracking above:
+
+- **RPM/TPM**: a continuous-refill token bucket per `(project_id, model)` — same non-bursty-at-boundaries
+  design as `app/rate_limit.py`'s existing per-IP limiter, generalized to consume a variable amount (TPM
+  consumes N estimated tokens per call, RPM always consumes 1).
+- **RPD**: a counter per `project_id` (RPD is project-wide, like `health.py`'s daily-quota tracking, not
+  per-model), resetting at the **real, confirmed** next Pacific midnight (`ai.google.dev/gemini-api/docs/
+  rate-limits`, fetched live 2026-09-04: *"Requests per day (RPD) quotas reset at midnight Pacific
+  time"* — not a rolling 24h window the way `health.py`'s reactive tracking conservatively defaults to).
+- **TPM's token count is an estimate**, not exact: `quota.estimate_tokens` is a rough `len(text) // 4`
+  character heuristic. Gemini's real tokenizer isn't exposed pre-call, and getting the *real* post-call
+  count (confirmed present on `AIMessage.usage_metadata` in the installed SDK) would require changing
+  `GeminiModelClient.generate_structured`'s return contract at every call site — out of proportion for
+  this addition. RPM and RPD are exact; only TPM is approximate.
+
+**Default numbers** (`quota.DEFAULT_RATE_LIMITS`) are a best-effort synthesis of public reporting for
+`gemini-2.5-flash`/`gemini-2.5-flash-lite`-family free-tier limits, **not independently confirmed** against
+this project's own live numbers — Google's own rate-limits page doesn't publish fixed values, directing
+users to their per-project AI Studio dashboard (`aistudio.google.com/rate-limit`) instead, which this
+process has no access to:
+
+| Model | RPM | TPM | RPD |
+|---|---|---|---|
+| `gemini-flash-latest` | 10 | 250,000 | 250 |
+| `gemini-flash-lite-latest` | 15 | 250,000 | 1,000 |
+
+**Check the real numbers for each of your projects and override via `GEMINI_RATE_LIMITS` if they differ, or
+when you change plans** — exactly as requested; nothing here is hardcoded as a Python literal only, it's a
+`Settings` field:
+
+```json
+{"gemini-flash-latest": {"rpm": 10, "tpm": 250000, "rpd": 250}, "gemini-flash-lite-latest": {"rpm": 15, "tpm": 250000, "rpd": 1000}}
+```
+
+An unrecognized model name falls back to the more conservative of the two defaults, never an unlimited
+allowance.
 
 ## Concurrency
 
@@ -189,18 +238,23 @@ Every decision point logs a structured `gemini_scheduler.*` event (never a raw k
 - `gemini_scheduler.dispatch_succeeded` / `attempt_failed` (with `error_class`) / `all_candidates_exhausted`
 - `gemini_scheduler.circuit_opened` / `circuit_half_open` / `circuit_closed`
 - `gemini_scheduler.daily_quota_exhausted` / `credential_disabled`
+- `gemini_scheduler.rpd_cap_reached` (logged once, on the transition to zero remaining for the day)
 
-A project stuck excluded from routing: check `daily_quota_exhausted` (24h cooldown) vs. `circuit_opened`
-(15s–300s cooldown, auto-recovers via `circuit_half_open`) in the logs to tell which scope is active.
+A project stuck excluded from routing: check `daily_quota_exhausted` (health.py's reactive 24h cooldown)
+vs. `circuit_opened` (15s–300s cooldown, auto-recovers via `circuit_half_open`) vs. `rpd_cap_reached` (the
+proactive configured cap, resets at the next Pacific midnight) in the logs to tell which scope is active.
 
 ## Known limitations
 
-- **No real Google-advertised RPM/TPM/RPD numbers** are used anywhere — concurrency is purely
-  observed-signal AIMD, not scheduled against a known ceiling with a safety factor. If real per-project
-  quota numbers are ever obtained (Google Cloud Console), a token-aware admission layer using them would
-  be a natural follow-on, not built now since fabricating numbers to schedule against would be worse than
-  not guessing.
-- **No token/TPM estimation** — requests are counted, not sized by estimated input tokens.
+- **RPM/TPM/RPD default numbers are best-effort, not independently confirmed** against a real AI Studio
+  dashboard for these specific projects (see "RPM/TPM/RPD" above) — verify and override via
+  `GEMINI_RATE_LIMITS` once you've checked.
+- **TPM is an estimate, not exact** (`quota.estimate_tokens`'s `len(text) // 4` heuristic) — see "RPM/TPM/
+  RPD" above for why the real post-call token count isn't wired in.
+- Concurrency's own AIMD limits remain purely observed-signal-driven (not scheduled against the RPM/TPM
+  numbers directly) — the two systems are complementary, not merged into one: quota admission decides
+  *whether* a request may be sent at all right now; concurrency limits decide how many may be *in flight*
+  simultaneously.
 - **429-daily-vs-temporary classification is best-effort text matching**, not yet confirmed against a real
   daily-exhaustion response (see "Health scoring" above).
 - **Single-process only.** If this app is ever deployed as multiple instances or behind a real async job

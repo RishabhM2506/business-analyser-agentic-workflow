@@ -1,18 +1,22 @@
-"""`GeminiScheduler` (Phase 5): the actual `ModelClient` implementation the
-rest of the app talks to -- ties together `app.gemini_scheduler.errors`
-(classification), `.credentials` (the project-grouped pool), `.health`
-(circuit breaker/daily-quota/credential health), and `.concurrency`
-(hierarchical AIMD) into one routing/retry loop. Replaces `app.models.
-LoadBalancedGeminiModelClient`'s blind per-key round-robin.
+"""`GeminiScheduler` (Phase 5, RPM/TPM/RPD admission added 2026-09-04): the
+actual `ModelClient` implementation the rest of the app talks to -- ties
+together `app.gemini_scheduler.errors` (classification), `.credentials`
+(the project-grouped pool), `.health` (circuit breaker/daily-quota/
+credential health), `.concurrency` (hierarchical AIMD), and `.quota`
+(proactive RPM/TPM/RPD admission) into one routing/retry loop. Replaces
+`app.models.LoadBalancedGeminiModelClient`'s blind per-key round-robin.
 
 **Answers "what capacity is safely available right now?", not "which key
 comes next?"** (the spec's own framing): every attempt (1) filters
 candidates to ones whose credential is healthy, whose project isn't
-daily-exhausted, and whose circuit isn't OPEN; (2) scores the survivors by
-health + concurrency headroom, with a small fairness tiebreak so healthy
-candidates don't starve each other; (3) atomically claims both the circuit
-breaker's slot (a HALF_OPEN circuit permits exactly one concurrent trial)
-and a concurrency slot before ever making a real network call.
+daily-exhausted (either reactively, per Gemini's own real `429`, or
+proactively, per the configured RPD cap), and whose circuit isn't OPEN;
+(2) scores the survivors by health + concurrency headroom, with a small
+fairness tiebreak so healthy candidates don't starve each other; (3)
+atomically claims the circuit breaker's slot (a HALF_OPEN circuit permits
+exactly one concurrent trial), a concurrency slot, and RPM/TPM quota
+headroom -- all three, undone together if any one fails -- before ever
+making a real network call.
 
 **Preserves the exact "re-raise the real last exception, never wrap"
 contract** `LoadBalancedGeminiModelClient` established (`app/models.py`'s
@@ -41,6 +45,7 @@ from app.gemini_scheduler.errors import (
     retry_action_for,
 )
 from app.gemini_scheduler.health import CircuitState, HealthStore
+from app.gemini_scheduler.quota import QuotaStore, estimate_tokens
 
 if TYPE_CHECKING:
     from app.models import GroundedResult, ModelClient
@@ -50,7 +55,7 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger("app")
 T = TypeVar("T", bound=BaseModel)
 R = TypeVar("R")
 
-_DEFAULT_MAX_ATTEMPTS = 3
+_DEFAULT_MAX_ATTEMPTS = 5
 _DEFAULT_BASE_DELAY_SECONDS = 0.5
 _DEFAULT_MAX_DELAY_SECONDS = 20.0
 # Concurrency-slot contention resolves as soon as *any* in-flight call
@@ -115,6 +120,7 @@ class GeminiScheduler:
         credentials: list[GeminiCredential],
         health_store: HealthStore,
         concurrency: HierarchicalConcurrency,
+        quota: QuotaStore,
         client_factory: Callable[[GeminiCredential, str], ModelClient] | None = None,
         max_attempts: int | None = None,
         base_delay_seconds: float = _DEFAULT_BASE_DELAY_SECONDS,
@@ -129,6 +135,7 @@ class GeminiScheduler:
         self._credentials = credentials
         self._health = health_store
         self._concurrency = concurrency
+        self._quota = quota
         self._client_factory = client_factory or _default_client_factory
         # Bounded, matching `_DEFAULT_MAX_KEY_ATTEMPTS`'s own reasoning in
         # app/models.py: each attempt carries its own real network timeout,
@@ -153,7 +160,8 @@ class GeminiScheduler:
         return await self._dispatch(
             lambda client: client.generate_structured(
                 system_prompt=system_prompt, user_content=user_content, schema=schema
-            )
+            ),
+            estimated_tokens=estimate_tokens(system_prompt + user_content),
         )
 
     async def generate_grounded(
@@ -162,10 +170,13 @@ class GeminiScheduler:
         return await self._dispatch(
             lambda client: client.generate_grounded(
                 system_prompt=system_prompt, user_content=user_content, schema=schema
-            )
+            ),
+            estimated_tokens=estimate_tokens(system_prompt + user_content),
         )
 
-    async def _dispatch(self, call: Callable[[ModelClient], Awaitable[R]]) -> R:
+    async def _dispatch(
+        self, call: Callable[[ModelClient], Awaitable[R]], *, estimated_tokens: int
+    ) -> R:
         tried: set[str] = set()
         last_exc: Exception | None = None
         last_action: RetryAction | None = None
@@ -181,7 +192,9 @@ class GeminiScheduler:
             # move on immediately, not "wait then retry the same thing").
             if attempt > 0 and last_action == RetryAction.RETRY_WITH_BACKOFF:
                 await self._sleep(self._backoff_delay(attempt))
-            candidate, capacity_pressure = await self._select_and_acquire(exclude=tried)
+            candidate, capacity_pressure = await self._select_and_acquire(
+                exclude=tried, estimated_tokens=estimated_tokens
+            )
             if candidate is None:
                 if capacity_pressure and capacity_waits < _DEFAULT_MAX_CAPACITY_WAIT_ATTEMPTS:
                     # A candidate was eligible but every concurrency slot
@@ -256,18 +269,24 @@ class GeminiScheduler:
         raise last_exc
 
     async def _select_and_acquire(
-        self, *, exclude: set[str]
+        self, *, exclude: set[str], estimated_tokens: int
     ) -> tuple[GeminiCredential | None, bool]:
         """Filters, scores, and atomically claims a candidate's circuit +
-        concurrency slot. Returns `(candidate, _)` once both are claimed
-        (never a candidate the caller isn't already cleared to dispatch
-        against), or `(None, had_capacity_pressure)` when nothing could be
-        claimed -- `had_capacity_pressure` distinguishes two different
-        reasons for `None`, which `_dispatch` must treat very differently:
-        a candidate was health/circuit-eligible but every concurrency slot
-        was momentarily full (transient -- worth a short wait, not a
+        concurrency + RPM/TPM quota slot. Returns `(candidate, _)` once all
+        three are claimed (never a candidate the caller isn't already
+        cleared to dispatch against), or `(None, had_capacity_pressure)`
+        when nothing could be claimed -- `had_capacity_pressure`
+        distinguishes two different reasons for `None`, which `_dispatch`
+        must treat very differently: a candidate was health/circuit/RPD-
+        eligible but every concurrency slot or RPM/TPM allowance was
+        momentarily full (transient -- worth a short wait, not a
         credential-exhaustion failure), versus nothing was eligible at all
-        (durable -- `NoEligibleGeminiCandidateError`/re-raise territory)."""
+        (durable -- `NoEligibleGeminiCandidateError`/re-raise territory).
+
+        RPD (like daily-quota exhaustion) is checked here, in the upfront
+        eligibility filter, not the claim loop below: a project with zero
+        requests-per-day headroom left is durably ineligible for the rest
+        of the day, not worth a short retry the way RPM/TPM pressure is."""
         eligible: list[GeminiCredential] = []
         for credential in self._credentials:
             if credential.id in exclude:
@@ -277,6 +296,8 @@ class GeminiScheduler:
             if not await self._health.is_credential_healthy(credential.id):
                 continue
             if await self._health.is_daily_exhausted(credential.project_id):
+                continue
+            if await self._quota.rpd_would_exceed(credential.project_id, self._model):
                 continue
             eligible.append(credential)
         if not eligible:
@@ -325,6 +346,20 @@ class GeminiScheduler:
                 # claim without recording any outcome (see health.
                 # cancel_acquire's own docstring).
                 await self._health.cancel_acquire(credential.project_id, self._model)
+                capacity_pressure = True
+                continue
+            quota_reserved = await self._quota.try_reserve(
+                project_id=credential.project_id,
+                model=self._model,
+                estimated_tokens=estimated_tokens,
+            )
+            if not quota_reserved:
+                # Same "never dispatched, undo every claim taken so far"
+                # shape as the concurrency-saturation branch above -- RPM/
+                # TPM pressure resolves within the current minute, so this
+                # is transient too, not a credential-exhaustion failure.
+                await self._health.cancel_acquire(credential.project_id, self._model)
+                await self._concurrency.release(credential.project_id, self._model)
                 capacity_pressure = True
                 continue
             return credential, False

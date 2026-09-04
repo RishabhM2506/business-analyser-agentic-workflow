@@ -21,6 +21,8 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.gemini_scheduler.quota import DEFAULT_RATE_LIMITS, RateLimitConfig
+
 
 class GeminiCredentialConfig(BaseModel):
     """One entry in `Settings.gemini_credentials` -- names the env var
@@ -80,6 +82,17 @@ class Settings(BaseSettings):
     # unchanged. Adding a credential (including #11+) is a config-only
     # change: add an entry here naming a new env var, set that env var.
     gemini_credentials: list[GeminiCredentialConfig] = Field(default_factory=list)
+    # Proactive RPM/TPM/RPD admission control (`app.gemini_scheduler.quota`,
+    # 2026-09-04) -- JSON object keyed by exact model name, same convention
+    # as the list fields above. Defaults to `quota.DEFAULT_RATE_LIMITS`
+    # (a best-effort synthesis of Gemini's free-tier limits — see that
+    # module's own docstring for sourcing/caveats: Google's own rate-limits
+    # page doesn't publish fixed numbers). Override here once you've
+    # checked the real numbers for your projects at
+    # aistudio.google.com/rate-limit, or when you change plans.
+    gemini_rate_limits: dict[str, RateLimitConfig] = Field(
+        default_factory=lambda: dict(DEFAULT_RATE_LIMITS)
+    )
     # data.gov.in resource key for the Agmarknet daily mandi-price feed
     # (app/pipeline/agmarknet.py). Required even when the Agmarknet job
     # isn't running, matching this file's existing "fails loudly at
